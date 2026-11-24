@@ -9,6 +9,7 @@ pub mod context;
 pub mod error;
 pub mod offscreen;
 pub mod pipeline;
+pub mod postprocess;
 pub mod shader;
 pub mod surface;
 pub mod texture;
@@ -26,12 +27,13 @@ use crate::context::VkContext;
 use crate::error::{Result, VkError};
 use crate::offscreen::{OffscreenTarget, write_rgba8_png};
 use crate::pipeline::PipelineCache;
-use crate::shader::ShaderKey;
+use crate::postprocess::{HDR_FORMAT, PostProcessPipeline};
+use crate::shader::{DepthCompare, DstBlend, ShaderKey, SrcBlend};
 use crate::surface::SwapchainState;
 use crate::texture::{GpuTexture, SamplerCache};
 use crate::types::{
-    BufferId, ClearState, DeviceInfo, DrawUniforms, FogState, GpuLight, RenderStats, SamplerDesc,
-    TextureFormat, TextureId, VertexWw3d, Viewport,
+    BufferId, ClearState, DeviceInfo, DrawUniforms, FogState, GpuLight, GraphicsMode,
+    GraphicsSettings, RenderStats, SamplerDesc, TextureFormat, TextureId, VertexWw3d, Viewport,
 };
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -85,6 +87,8 @@ struct ActiveFrame {
     swapchain_image_index: Option<u32>,
     target_image: vk::Image,
     target_view: vk::ImageView,
+    target_old_layout: vk::ImageLayout,
+    hdr_view: vk::ImageView,
     depth_view: vk::ImageView,
     color_format: vk::Format,
     depth_format: vk::Format,
@@ -99,6 +103,8 @@ struct ActiveFrame {
 pub struct VulkanRenderer {
     ctx: VkContext,
     target: Option<RenderTarget>,
+    postprocess: Option<PostProcessPipeline>,
+    hdr_initialized: bool,
     pipelines: PipelineCache,
     samplers: SamplerCache,
     uniform_pool: vk::DescriptorPool,
@@ -117,6 +123,8 @@ pub struct VulkanRenderer {
 
     // WW3D2-compatible render state
     uniforms: DrawUniforms,
+    view_matrix: Mat4,
+    graphics: GraphicsSettings,
     shader: ShaderKey,
     active_texture: TextureId,
     active_texture1: TextureId,
@@ -266,8 +274,22 @@ impl VulkanRenderer {
             });
         }
 
+        let (output_format, default_remastered) = match &target {
+            RenderTarget::Headless(t) => (t.color_format, false),
+            RenderTarget::Windowed(s) => (s.format, true),
+        };
+        let postprocess = PostProcessPipeline::new(
+            &mut ctx,
+            extent.width,
+            extent.height,
+            output_format,
+            FRAMES_IN_FLIGHT,
+        )?;
+        let graphics = GraphicsSettings::from_env(default_remastered);
+
         // Built-in 1x1 opaque white texture so untextured draws always have a valid descriptor.
-        let default_sampler = samplers.get_or_create(&ctx.device, SamplerDesc::default())?;
+        let default_sampler =
+            samplers.get_or_create(&ctx.device, SamplerDesc::default(), ctx.max_anisotropy)?;
         let white_tex = GpuTexture::new_2d(
             &mut ctx,
             "zhr_default_white",
@@ -286,6 +308,8 @@ impl VulkanRenderer {
         Ok(Self {
             ctx,
             target: Some(target),
+            postprocess: Some(postprocess),
+            hdr_initialized: false,
             pipelines,
             samplers,
             uniform_pool,
@@ -300,6 +324,8 @@ impl VulkanRenderer {
             textures,
             default_white_texture,
             uniforms: DrawUniforms::default(),
+            view_matrix: Mat4::IDENTITY,
+            graphics,
             shader: ShaderKey::OPAQUE_3D,
             active_texture: default_white_texture,
             active_texture1: default_white_texture,
@@ -355,19 +381,27 @@ impl VulkanRenderer {
         if self.active_frame.is_some() {
             return Err(VkError::State("cannot resize while a frame is active"));
         }
-        match self.target.as_mut().expect("render target alive") {
-            RenderTarget::Headless(old) => {
-                // SAFETY: Ensure GPU idle before replacing offscreen attachments.
-                unsafe { self.ctx.device.device_wait_idle()? };
-                let new_target = OffscreenTarget::new(&mut self.ctx, width, height)?;
-                let prev = std::mem::replace(old, new_target);
-                prev.destroy(&mut self.ctx);
-            }
-            RenderTarget::Windowed(sc) => {
-                sc.resize(&mut self.ctx, width, height)?;
-            }
+        let (actual_w, actual_h, output_format) =
+            match self.target.as_mut().expect("render target alive") {
+                RenderTarget::Headless(old) => {
+                    // SAFETY: Ensure GPU idle before replacing offscreen attachments.
+                    unsafe { self.ctx.device.device_wait_idle()? };
+                    let new_target = OffscreenTarget::new(&mut self.ctx, width, height)?;
+                    let res = (new_target.width, new_target.height, new_target.color_format);
+                    let prev = std::mem::replace(old, new_target);
+                    prev.destroy(&mut self.ctx);
+                    res
+                }
+                RenderTarget::Windowed(sc) => {
+                    sc.resize(&mut self.ctx, width, height)?;
+                    (sc.extent.width, sc.extent.height, sc.format)
+                }
+            };
+        if let Some(pp) = &mut self.postprocess {
+            pp.resize(&mut self.ctx, actual_w, actual_h, output_format)?;
+            self.hdr_initialized = false;
         }
-        self.viewport = Viewport::full(width.max(1), height.max(1));
+        self.viewport = Viewport::full(actual_w.max(1), actual_h.max(1));
         Ok(())
     }
 
@@ -422,9 +456,9 @@ impl VulkanRenderer {
         if pixels.len() < expected {
             return Err(VkError::State("texture pixel buffer smaller than expected"));
         }
-        let sampler = self
-            .samplers
-            .get_or_create(&self.ctx.device, sampler_desc)?;
+        let sampler =
+            self.samplers
+                .get_or_create(&self.ctx.device, sampler_desc, self.ctx.max_anisotropy)?;
         let id = TextureId(self.next_texture_id);
         self.next_texture_id += 1;
         let tex = GpuTexture::new_2d(
@@ -434,6 +468,41 @@ impl VulkanRenderer {
             height,
             format,
             &pixels[..expected],
+            sampler,
+            self.texture_pool,
+            self.pipelines.set1_texture_layout,
+        )?;
+        self.textures.insert(id, tex);
+        Ok(id)
+    }
+
+    /// Creates a 2D texture from a tightly-packed multi-mip pixel buffer (`mip_count` levels).
+    pub fn create_texture_2d_mips(
+        &mut self,
+        width: u32,
+        height: u32,
+        mip_count: u32,
+        format: TextureFormat,
+        pixels: &[u8],
+        sampler_desc: SamplerDesc,
+    ) -> Result<TextureId> {
+        let expected_base = format.expected_byte_size(width, height);
+        if pixels.len() < expected_base {
+            return Err(VkError::State("texture pixel buffer smaller than expected"));
+        }
+        let sampler =
+            self.samplers
+                .get_or_create(&self.ctx.device, sampler_desc, self.ctx.max_anisotropy)?;
+        let id = TextureId(self.next_texture_id);
+        self.next_texture_id += 1;
+        let tex = GpuTexture::new_2d_with_mips(
+            &mut self.ctx,
+            &format!("zhr_tex_{}", id.0),
+            width,
+            height,
+            mip_count,
+            format,
+            pixels,
             sampler,
             self.texture_pool,
             self.pipelines.set1_texture_layout,
@@ -487,6 +556,7 @@ impl VulkanRenderer {
     }
 
     pub fn set_view(&mut self, m: Mat4) {
+        self.view_matrix = m;
         self.uniforms.set_view(m);
     }
 
@@ -499,7 +569,16 @@ impl VulkanRenderer {
     }
 
     pub fn set_view_identity(&mut self) {
+        self.view_matrix = Mat4::IDENTITY;
         self.uniforms.set_view(Mat4::IDENTITY);
+    }
+
+    pub fn set_graphics_settings(&mut self, settings: GraphicsSettings) {
+        self.graphics = settings;
+    }
+
+    pub fn graphics_settings(&self) -> GraphicsSettings {
+        self.graphics
     }
 
     pub fn set_ambient(&mut self, color: Vec3) {
@@ -671,15 +750,33 @@ impl VulkanRenderer {
             self.ctx.device.begin_command_buffer(cmd, &begin)?;
         }
 
-        // Transition color attachment -> COLOR_ATTACHMENT_OPTIMAL.
+        // Transition HDR scene color target -> COLOR_ATTACHMENT_OPTIMAL.
+        let pp = self.postprocess.as_ref().expect("postprocess alive");
+        let hdr_image = pp.hdr_image();
+        let hdr_view = pp.hdr_view();
+        let hdr_old_layout = if self.hdr_initialized {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        } else {
+            vk::ImageLayout::UNDEFINED
+        };
+        let hdr_src_stage = if self.hdr_initialized {
+            vk::PipelineStageFlags2::FRAGMENT_SHADER
+        } else {
+            vk::PipelineStageFlags2::TOP_OF_PIPE
+        };
+        let hdr_src_access = if self.hdr_initialized {
+            vk::AccessFlags2::SHADER_SAMPLED_READ
+        } else {
+            vk::AccessFlags2::NONE
+        };
         let barrier = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .src_access_mask(vk::AccessFlags2::NONE)
+            .src_stage_mask(hdr_src_stage)
+            .src_access_mask(hdr_src_access)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .old_layout(old_layout)
+            .old_layout(hdr_old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(target_image)
+            .image(hdr_image)
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -692,16 +789,14 @@ impl VulkanRenderer {
         // SAFETY: Valid image barrier on recording command buffer.
         unsafe { self.ctx.device.cmd_pipeline_barrier2(cmd, &dep) };
 
-        if let Some(RenderTarget::Headless(t)) = &mut self.target {
-            t.color_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-        }
-
         self.pending_clear = None;
         self.active_frame = Some(ActiveFrame {
             slot_index,
             swapchain_image_index,
             target_image,
             target_view,
+            target_old_layout: old_layout,
+            hdr_view,
             depth_view,
             color_format,
             depth_format,
@@ -792,7 +887,7 @@ impl VulkanRenderer {
         });
 
         let color_att = [vk::RenderingAttachmentInfo::default()
-            .image_view(af.target_view)
+            .image_view(af.hdr_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(if clear.clear_color {
                 vk::AttachmentLoadOp::CLEAR
@@ -860,7 +955,7 @@ impl VulkanRenderer {
         let pso = self.pipelines.get_or_create(
             &self.ctx.device,
             self.shader,
-            af.color_format,
+            HDR_FORMAT,
             af.depth_format,
         )?;
         let cmd = self.frames[slot_index].cmd;
@@ -883,6 +978,46 @@ impl VulkanRenderer {
         if !self.shader.fog_enabled() {
             draw_uniforms.fog_color_and_enable[3] = 0.0;
         }
+
+        // Populate 3D PBR lighting & split-screen uniforms.
+        let pbr_mode = if !self.graphics.pbr_lighting || self.graphics.mode == GraphicsMode::Classic
+        {
+            0.0
+        } else if self.graphics.mode == GraphicsMode::SplitScreen {
+            2.0
+        } else {
+            1.0
+        };
+        let cam_pos = if self.view_matrix.determinant().abs() > 1e-6 {
+            self.view_matrix.inverse().w_axis.truncate()
+        } else {
+            Vec3::new(0.0, 0.0, 100.0)
+        };
+        draw_uniforms.camera_pos_and_pbr = [cam_pos.x, cam_pos.y, cam_pos.z, pbr_mode];
+
+        let is_3d_pass =
+            self.shader.depth_compare() != DepthCompare::Always || self.shader.depth_write();
+        let is_additive = self.shader.dst_blend() == DstBlend::One
+            && matches!(self.shader.src_blend(), SrcBlend::One | SrcBlend::SrcAlpha);
+        let is_multiplicative =
+            matches!(self.shader.src_blend(), SrcBlend::Zero | SrcBlend::DstColor)
+                || self.shader.dst_blend() == DstBlend::SrcColor;
+        let lighting_on = draw_uniforms.ambient_and_lighting[3] > 0.5;
+
+        let is_3d_lit = is_3d_pass && lighting_on && !is_additive && !is_multiplicative;
+        let is_hdr_emissive = is_3d_pass && is_additive;
+        let is_3d_unlit_surface = is_3d_pass
+            && !lighting_on
+            && !is_additive
+            && !is_multiplicative
+            && !self.shader.blend_enabled();
+        let split_x_pixels = (af.extent.width as f32) * 0.5;
+        draw_uniforms.render_flags = [
+            if is_3d_lit { 1.0 } else { 0.0 },
+            if is_hdr_emissive { 1.0 } else { 0.0 },
+            split_x_pixels,
+            if is_3d_unlit_surface { 1.0 } else { 0.0 },
+        ];
 
         let alignment = self.ctx.min_uniform_offset_alignment as usize;
         let dyn_offset = self.frames[slot_index]
@@ -1050,6 +1185,24 @@ impl VulkanRenderer {
         if af.rendering_begun {
             // SAFETY: `cmd_begin_rendering` was called for this frame.
             unsafe { self.ctx.device.cmd_end_rendering(cmd) };
+        }
+
+        // Execute HDR bloom + filmic tonemapping + CAS sharpening + A/B split-screen composite into target.
+        if let Some(pp) = &mut self.postprocess {
+            pp.execute(
+                &self.ctx.device,
+                cmd,
+                af.slot_index,
+                af.target_image,
+                af.target_view,
+                af.target_old_layout,
+                af.extent,
+                self.graphics,
+            )?;
+            self.hdr_initialized = true;
+        }
+        if let Some(RenderTarget::Headless(t)) = &mut self.target {
+            t.color_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         }
 
         self.frame_number += 1;
@@ -1306,6 +1459,9 @@ impl Drop for VulkanRenderer {
                     .device
                     .destroy_semaphore(frame.image_available, None);
             }
+        }
+        if let Some(pp) = self.postprocess.take() {
+            pp.destroy(&mut self.ctx);
         }
         self.pipelines.destroy_all(&self.ctx.device);
         self.samplers.destroy_all(&self.ctx.device);

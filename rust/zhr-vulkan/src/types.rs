@@ -169,6 +169,10 @@ pub struct DrawUniforms {
     pub stage0_ops: [u32; 4],
     /// Stage 1 combiner: `[color_op, color_args, alpha_op, alpha_args]` (color_op==0 -> stage 1 disabled).
     pub stage1_ops: [u32; 4],
+    /// xyz = world-space camera position; w = pbr_mode (0=classic, 1=remastered, 2=split-screen right half).
+    pub camera_pos_and_pbr: [f32; 4],
+    /// x = is_3d_lit, y = is_hdr_emissive (additive VFX), z = split_x_pixels, w = is_3d_unlit_surface.
+    pub render_flags: [f32; 4],
 }
 
 impl Default for DrawUniforms {
@@ -184,6 +188,86 @@ impl Default for DrawUniforms {
             tfactor: [1.0, 1.0, 1.0, 1.0],
             stage0_ops: [0, 0, 0, 0],
             stage1_ops: [0, 0, 0, 0],
+            camera_pos_and_pbr: [0.0, 0.0, 100.0, 0.0],
+            render_flags: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Visual presentation mode for live A/B comparison and player preference.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum GraphicsMode {
+    /// Authentic 2003 Zero Hour fixed-function Gouraud shading, no post-processing.
+    Classic = 0,
+    /// Full modern Vulkan 1.3 visual upgrade (PBR micro-normals, GGX specular, sky IBL, HDR bloom, filmic tonemap, CAS).
+    #[default]
+    Remastered = 1,
+    /// Live 50/50 split-screen comparison: Classic 2003 (left) vs. Remastered (right).
+    SplitScreen = 2,
+}
+
+impl GraphicsMode {
+    pub const fn from_u32(v: u32) -> Self {
+        match v {
+            0 => Self::Classic,
+            2 => Self::SplitScreen,
+            _ => Self::Remastered,
+        }
+    }
+}
+
+/// Live-toggleable graphics enhancement switches (F9/F10/F11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphicsSettings {
+    pub mode: GraphicsMode,
+    pub pbr_lighting: bool,
+    pub post_fx: bool,
+}
+
+impl GraphicsSettings {
+    pub const fn classic() -> Self {
+        Self {
+            mode: GraphicsMode::Classic,
+            pbr_lighting: false,
+            post_fx: false,
+        }
+    }
+
+    pub const fn remastered() -> Self {
+        Self {
+            mode: GraphicsMode::Remastered,
+            pbr_lighting: true,
+            post_fx: true,
+        }
+    }
+
+    pub const fn split_screen() -> Self {
+        Self {
+            mode: GraphicsMode::SplitScreen,
+            pbr_lighting: true,
+            post_fx: true,
+        }
+    }
+
+    pub fn from_env(default_remastered: bool) -> Self {
+        match std::env::var("ZHR_GRAPHICS_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("classic") | Some("0") => Self::classic(),
+            Some("split") | Some("splitscreen") | Some("2") => Self::split_screen(),
+            Some("remastered") | Some("1") => Self::remastered(),
+            _ => {
+                if default_remastered {
+                    Self::remastered()
+                } else {
+                    Self::classic()
+                }
+            }
         }
     }
 }
@@ -251,6 +335,10 @@ impl TextureFormat {
             Self::Bc2Unorm => ash::vk::Format::BC2_UNORM_BLOCK,
             Self::Bc3Unorm => ash::vk::Format::BC3_UNORM_BLOCK,
         }
+    }
+
+    pub fn is_compressed(self) -> bool {
+        matches!(self, Self::Bc1RgbaUnorm | Self::Bc2Unorm | Self::Bc3Unorm)
     }
 
     pub fn expected_byte_size(self, width: u32, height: u32) -> usize {

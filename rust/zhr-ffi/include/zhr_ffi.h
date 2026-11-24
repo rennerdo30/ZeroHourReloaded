@@ -100,6 +100,17 @@ uint32_t zhr_vk_create_texture_2d(
     size_t byte_len,
     bool linear_filter,
     bool clamp_edge);
+uint32_t zhr_vk_create_texture_2d_mips(
+    uint32_t width,
+    uint32_t height,
+    uint32_t mip_count,
+    uint32_t format,
+    const uint8_t* pixels,
+    size_t byte_len,
+    bool linear_filter,
+    bool clamp_edge);
+void zhr_vk_set_graphics_mode(uint32_t mode, bool pbr_lighting, bool post_fx);
+uint32_t zhr_vk_get_graphics_mode(void);
 uint32_t zhr_vk_create_texture_rgba8(
     uint32_t width,
     uint32_t height,

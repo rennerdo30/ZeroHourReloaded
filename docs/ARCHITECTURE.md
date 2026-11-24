@@ -55,11 +55,11 @@ We retain TSH's battle-tested C++20 simulation, INI/BIG/W3D/map loaders, AI, scr
 
 | Legacy Blocker | Replacement Crate | Status |
 |---|---|---|
-| DirectX 8 (`DX8Backend`, 32-bit Windows) | `rust/zhr-vulkan` (`ash` Vulkan 1.3 dynamic rendering + `gpu-allocator` + `naga` WGSL→SPIR-V) + `WW3D2/Backend/VulkanDX8Bridge.cpp` | **Working** — native 64-bit Zero Hour boots & renders Main Menu + live 3D Shell Map on Vulkan 1.3 with 0 Khronos validation errors (`ZHR-2`) |
+| DirectX 8 (`DX8Backend`, 32-bit Windows) | `rust/zhr-vulkan` (`ash` Vulkan 1.3 dynamic rendering + `gpu-allocator` + `naga` WGSL→SPIR-V) + `WW3D2/Backend/VulkanDX8Bridge.cpp` | **Working** — native 64-bit Zero Hour boots & renders Main Menu, 3D Shell Map, and Skirmish on Vulkan 1.3 with 0 Khronos validation errors (`ZHR-2`) |
 | Miles Sound System (`mss32.dll`, 32-bit) | `rust/zhr-audio` (cross-platform Rust 3D audio + WAV/MP3 decoding) | Planned (`ZHR-3`) |
 | Bink Video (`binkw32.dll`, 32-bit) | Existing TSH FFmpeg video backend (`RTS_BUILD_OPTION_FFMPEG`) | Planned (`ZHR-3`) |
 | Win32 Window + DirectInput (`Win32Device`) | `rust/zhr-platform` (SDL3 cross-platform window/input) | Planned (`ZHR-4`) |
-| 2003 Low-Res Textures & Flat Lighting | `rust/zhr-remaster` (local async AI upscale + PBR map synthesis + BLAKE3 BC7/BC5 cache) | Planned (`ZHR-5`, `ZHR-6`) |
+| 2003 Low-Res Textures & Flat Lighting | `rust/zhr-vulkan` Phase 1 Remaster Pipeline (16× AF + full mipmaps, 3D PBR micro-normals/GGX/IBL, `R16G16B16A16_SFLOAT` HDR + Bloom + Filmic Tonemap + CAS + `F9`/`F10`/`F11` live A/B Split-Screen) + planned `rust/zhr-remaster` AI texture/PBR synthesis | **Phase 1 Working (`ZHR-6`)** / AI Upscale Planned (`ZHR-5`) |
 
 ---
 

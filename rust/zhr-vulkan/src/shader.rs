@@ -328,6 +328,8 @@ struct DrawUniforms {
     tfactor: vec4<f32>,
     stage0_ops: vec4<u32>,
     stage1_ops: vec4<u32>,
+    camera_pos_and_pbr: vec4<f32>,
+    render_flags: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: DrawUniforms;
@@ -350,6 +352,9 @@ struct VsOut {
     @location(1) uv0: vec2<f32>,
     @location(2) view_dist: f32,
     @location(3) uv1: vec2<f32>,
+    @location(4) world_pos: vec3<f32>,
+    @location(5) world_normal: vec3<f32>,
+    @location(6) raw_color: vec4<f32>,
 };
 
 @vertex
@@ -358,9 +363,12 @@ fn vs_main(in: VsIn) -> VsOut {
     let view_pos = u.view * world_pos;
     let clip_pos = u.projection * view_pos;
 
+    let n_world_raw = (u.world * vec4<f32>(in.normal, 0.0)).xyz;
+    let n_len = length(n_world_raw);
+    let n_world = select(vec3<f32>(0.0, 0.0, 1.0), n_world_raw / max(n_len, 0.0001), n_len > 0.0001);
+
     var lit_rgb = in.color.rgb;
     if (u.ambient_and_lighting.w > 0.5) {
-        let n_world = normalize((u.world * vec4<f32>(in.normal, 0.0)).xyz);
         var accum = u.ambient_and_lighting.rgb;
         for (var i: u32 = 0u; i < 4u; i = i + 1u) {
             let light = u.lights[i];
@@ -392,6 +400,9 @@ fn vs_main(in: VsIn) -> VsOut {
     out.uv0 = in.uv0;
     out.view_dist = length(view_pos.xyz);
     out.uv1 = in.uv1;
+    out.world_pos = world_pos.xyz;
+    out.world_normal = n_world;
+    out.raw_color = in.color;
     return out;
 }
 
@@ -456,28 +467,166 @@ fn eval_alpha_op(op: u32, args: u32, diffuse: vec4<f32>, cur: vec4<f32>, tex: ve
     return cur.a;
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let tex0 = textureSample(t_diffuse, s_diffuse, in.uv0);
-    let tex1 = textureSample(t_diffuse1, s_diffuse1, in.uv1);
-
-    var col = in.color;
+fn eval_combiner(diffuse: vec4<f32>, tex0: vec4<f32>, tex1: vec4<f32>) -> vec4<f32> {
+    var col = diffuse;
     if (u.stage0_ops.x != 0u) {
-        let rgb0 = eval_rgb_op(u.stage0_ops.x, u.stage0_ops.y, in.color, col, tex0, u.tfactor);
-        let a0 = eval_alpha_op(u.stage0_ops.z, u.stage0_ops.w, in.color, col, tex0, u.tfactor);
+        let rgb0 = eval_rgb_op(u.stage0_ops.x, u.stage0_ops.y, diffuse, col, tex0, u.tfactor);
+        let a0 = eval_alpha_op(u.stage0_ops.z, u.stage0_ops.w, diffuse, col, tex0, u.tfactor);
         col = vec4<f32>(rgb0, a0);
         if (u.stage1_ops.x != 0u) {
-            let rgb1 = eval_rgb_op(u.stage1_ops.x, u.stage1_ops.y, in.color, col, tex1, u.tfactor);
-            let a1 = eval_alpha_op(u.stage1_ops.z, u.stage1_ops.w, in.color, col, tex1, u.tfactor);
+            let rgb1 = eval_rgb_op(u.stage1_ops.x, u.stage1_ops.y, diffuse, col, tex1, u.tfactor);
+            let a1 = eval_alpha_op(u.stage1_ops.z, u.stage1_ops.w, diffuse, col, tex1, u.tfactor);
             col = vec4<f32>(rgb1, a1);
         }
     } else if (u.fog_and_shader_params.w > 0.5) {
         col = col * tex0;
     }
+    return col;
+}
+
+fn ggx_specular(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, roughness: f32, f0: vec3<f32>) -> vec3<f32> {
+    let h_raw = v + l;
+    let h_len = length(h_raw);
+    if (h_len < 0.0001) {
+        return vec3<f32>(0.0);
+    }
+    let h = h_raw / h_len;
+    let ndoth = max(dot(n, h), 0.0);
+    let ndotv = max(dot(n, v), 0.001);
+    let ndotl = max(dot(n, l), 0.001);
+    let vdoth = max(dot(v, h), 0.0);
+
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let denom = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    let d = a2 / (3.14159265 * denom * denom + 0.0001);
+
+    let k = (roughness + 1.0) * (roughness + 1.0) * 0.125;
+    let gv = ndotv / (ndotv * (1.0 - k) + k);
+    let gl = ndotl / (ndotl * (1.0 - k) + k);
+    let g = gv * gl;
+
+    let f = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - vdoth, 5.0);
+    return (d * g * f) / (4.0 * ndotv * ndotl + 0.001);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let tex0 = textureSample(t_diffuse, s_diffuse, in.uv0);
+    let tex1 = textureSample(t_diffuse1, s_diffuse1, in.uv1);
+
+    // Compute screen-space derivatives in uniform control flow before any branches.
+    let dpos_dx = dpdx(in.world_pos);
+    let dpos_dy = dpdy(in.world_pos);
+    let tex_luma = dot(tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let dl_dx = dpdx(tex_luma);
+    let dl_dy = dpdy(tex_luma);
+
+    let pbr_mode = u.camera_pos_and_pbr.w;
+    let pbr_active = (pbr_mode > 0.5 && pbr_mode < 1.5) || (pbr_mode >= 1.5 && in.clip_pos.x >= u.render_flags.z);
+
+    var col = eval_combiner(in.color, tex0, tex1);
 
     let alpha_ref = u.fog_and_shader_params.z;
     if (alpha_ref > 0.0 && col.a < alpha_ref) {
         discard;
+    }
+
+    if (pbr_active && u.render_flags.x > 0.5) {
+        // 3D lit geometry: per-pixel micro-normal + Cook-Torrance GGX specular + hemisphere sky/ground IBL.
+        let albedo = eval_combiner(in.raw_color, tex0, tex1);
+        let n_geom = normalize(in.world_normal);
+
+        // Derivative-based procedural micro-normal relief (Mikkelsen unparametrized bump mapping).
+        let r1 = cross(dpos_dy, n_geom);
+        let r2 = cross(n_geom, dpos_dx);
+        let det = dot(dpos_dx, r1);
+        var n_bump = n_geom;
+        if (abs(det) > 0.00001) {
+            let surf_grad = sign(det) * (dl_dx * r1 + dl_dy * r2);
+            let grad_len = length(surf_grad);
+            let clamped_grad = surf_grad / max(1.0, grad_len * 0.45);
+            n_bump = normalize(abs(det) * n_geom - 0.34 * clamped_grad);
+        }
+
+        let to_cam = u.camera_pos_and_pbr.xyz - in.world_pos;
+        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, length(to_cam) > 0.0001));
+        let ndotv = max(dot(n_bump, v_dir), 0.001);
+
+        // Estimate military material roughness/F0 from albedo (painted steel/armor vs matte sand/cloth).
+        let max_c = max(albedo.r, max(albedo.g, albedo.b));
+        let min_c = min(albedo.r, min(albedo.g, albedo.b));
+        let sat = (max_c - min_c) / max(max_c, 0.001);
+        let metallic_hint = clamp((1.0 - sat * 1.4) * smoothstep(0.18, 0.72, max_c), 0.0, 0.55);
+        let roughness = clamp(0.68 - metallic_hint * 0.36, 0.28, 0.80);
+        let f0 = mix(vec3<f32>(0.045), albedo.rgb * 0.35 + vec3<f32>(0.06), metallic_hint);
+
+        // Hemisphere sky/ground IBL (Zero Hour uses +Z up).
+        let up_factor = clamp(n_bump.z * 0.5 + 0.5, 0.0, 1.0);
+        let sky_amb = u.ambient_and_lighting.rgb * vec3<f32>(0.90, 1.02, 1.18);
+        let ground_amb = u.ambient_and_lighting.rgb * vec3<f32>(1.04, 0.90, 0.78);
+        var diff_accum = mix(ground_amb, sky_amb, up_factor);
+        var spec_accum = vec3<f32>(0.0);
+
+        for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+            let light = u.lights[i];
+            let kind = light.pos_or_dir_and_kind.w;
+            if (kind > 0.5 && kind < 1.5) {
+                let l_dir = normalize(-light.pos_or_dir_and_kind.xyz);
+                let ndotl = max(dot(n_bump, l_dir), 0.0);
+                let wrapped = clamp((dot(n_bump, l_dir) + 0.10) / 1.10, 0.0, 1.0);
+                diff_accum = diff_accum + light.diffuse_and_range.rgb * mix(ndotl, wrapped, 0.25);
+                if (ndotl > 0.0) {
+                    let spec = ggx_specular(n_bump, v_dir, l_dir, roughness, f0);
+                    spec_accum = spec_accum + light.diffuse_and_range.rgb * spec * ndotl * 1.15;
+                }
+            } else if (kind >= 1.5) {
+                let to_light = light.pos_or_dir_and_kind.xyz - in.world_pos;
+                let dist = length(to_light);
+                let range = max(light.diffuse_and_range.w, 0.001);
+                if (dist < range) {
+                    let l_dir = to_light / max(dist, 0.0001);
+                    let ndotl = max(dot(n_bump, l_dir), 0.0);
+                    let atten = (1.0 - dist / range);
+                    let atten_smooth = atten * atten;
+                    diff_accum = diff_accum + light.diffuse_and_range.rgb * (ndotl * atten);
+                    if (ndotl > 0.0) {
+                        let spec = ggx_specular(n_bump, v_dir, l_dir, roughness, f0);
+                        spec_accum = spec_accum + light.diffuse_and_range.rgb * spec * (ndotl * atten_smooth * 1.4);
+                    }
+                }
+            }
+        }
+
+        // Crisp grazing sky rim for strong unit/building silhouette separation.
+        let fresnel_rim = pow(1.0 - ndotv, 4.0) * (0.12 + 0.14 * metallic_hint) * (0.4 + 0.6 * up_factor);
+        let pbr_rgb = albedo.rgb * clamp(diff_accum, vec3<f32>(0.0), vec3<f32>(2.1))
+            + spec_accum
+            + sky_amb * fresnel_rim;
+        col = vec4<f32>(pbr_rgb, col.a);
+    } else if (pbr_active && u.render_flags.w > 0.5) {
+        // 3D unlit opaque terrain/ground: subtle micro-relief lighting + grazing sheen.
+        let n_geom = normalize(in.world_normal);
+        let r1 = cross(dpos_dy, n_geom);
+        let r2 = cross(n_geom, dpos_dx);
+        let det = dot(dpos_dx, r1);
+        var relief = 0.0;
+        if (abs(det) > 0.00001) {
+            let surf_grad = sign(det) * (dl_dx * r1 + dl_dy * r2);
+            let grad_len = length(surf_grad);
+            let n_bump = normalize(abs(det) * n_geom - 0.24 * (surf_grad / max(1.0, grad_len * 0.5)));
+            var sun_dir = normalize(vec3<f32>(0.42, 0.28, 0.86));
+            if (u.lights[0].pos_or_dir_and_kind.w > 0.5 && u.lights[0].pos_or_dir_and_kind.w < 1.5) {
+                sun_dir = normalize(-u.lights[0].pos_or_dir_and_kind.xyz);
+            }
+            relief = clamp(dot(n_bump, sun_dir) - dot(n_geom, sun_dir), -0.25, 0.25);
+        }
+        col = vec4<f32>(col.rgb * (1.0 + relief * 0.65), col.a);
+    } else if (pbr_active && u.render_flags.y > 0.5) {
+        // 3D additive VFX (explosions, fireballs, lasers, muzzle flashes): push bright core into HDR for soft bloom.
+        let luma = max(col.r, max(col.g, col.b));
+        let hdr_boost = 1.0 + 0.95 * smoothstep(0.32, 0.95, luma);
+        col = vec4<f32>(col.rgb * hdr_boost, col.a);
     }
 
     if (u.fog_color_and_enable.w > 0.5) {

@@ -6,7 +6,8 @@ use std::sync::{Mutex, OnceLock};
 use glam::{Mat4, Vec3};
 use zhr_vulkan::shader::ShaderKey;
 use zhr_vulkan::types::{
-    ClearState, FogState, GpuLight, SamplerDesc, TextureFormat, TextureId, VertexWw3d, Viewport,
+    ClearState, FogState, GpuLight, GraphicsMode, GraphicsSettings, SamplerDesc, TextureFormat,
+    TextureId, VertexWw3d, Viewport,
 };
 use zhr_vulkan::{RendererConfig, VulkanRenderer};
 
@@ -491,6 +492,78 @@ pub unsafe extern "C" fn zhr_vk_create_texture_2d(
     )
     .map(|id| id.0)
     .unwrap_or(0)
+}
+
+/// Uploads a 2D texture with `mip_count` tightly-packed mip levels (for `.dds` BC1/BC2/BC3 mip chains).
+///
+/// # Safety
+/// `pixels` must point to `byte_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_vk_create_texture_2d_mips(
+    width: u32,
+    height: u32,
+    mip_count: u32,
+    format: u32,
+    pixels: *const u8,
+    byte_len: usize,
+    linear_filter: bool,
+    clamp_edge: bool,
+) -> u32 {
+    if pixels.is_null() {
+        return 0;
+    }
+    let tex_format = match format {
+        0 => TextureFormat::Rgba8Unorm,
+        1 => TextureFormat::Bgra8Unorm,
+        2 => TextureFormat::Bc1RgbaUnorm,
+        3 => TextureFormat::Bc2Unorm,
+        4 => TextureFormat::Bc3Unorm,
+        _ => return 0,
+    };
+    // SAFETY: Caller guarantees `pixels` is valid for `byte_len` bytes.
+    let data = unsafe { std::slice::from_raw_parts(pixels, byte_len) };
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    let Some(ren) = guard.renderer.as_mut() else {
+        return 0;
+    };
+    ren.create_texture_2d_mips(
+        width,
+        height,
+        mip_count,
+        tex_format,
+        data,
+        SamplerDesc {
+            linear_filter,
+            clamp_edge,
+        },
+    )
+    .map(|id| id.0)
+    .unwrap_or(0)
+}
+
+/// Sets the live graphics presentation mode (`mode`: 0=Classic, 1=Remastered, 2=SplitScreen)
+/// and individual PBR lighting / HDR post-FX toggles.
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_graphics_mode(mode: u32, pbr_lighting: bool, post_fx: bool) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_graphics_settings(GraphicsSettings {
+            mode: GraphicsMode::from_u32(mode),
+            pbr_lighting,
+            post_fx,
+        });
+    }
+}
+
+/// Returns packed graphics state: bits 0..1 = mode, bit 2 = pbr_lighting, bit 3 = post_fx.
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_get_graphics_mode() -> u32 {
+    let guard = vk_state().lock().expect("vk state poisoned");
+    let Some(ren) = guard.renderer.as_ref() else {
+        return 0;
+    };
+    let s = ren.graphics_settings();
+    (s.mode as u32 & 0x3) | (u32::from(s.pbr_lighting) << 2) | (u32::from(s.post_fx) << 3)
 }
 
 /// Uploads a 2D RGBA8 texture and returns its non-zero handle (0 on failure).

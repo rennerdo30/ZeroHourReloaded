@@ -439,6 +439,7 @@ public:
     const uint8_t* Data() const { return m_data.data(); }
     uint8_t* MutableData() { return m_data.data(); }
     size_t DataSize() const { return m_data.size(); }
+    bool WasWritten() const { return m_written; }
 
     void DetachOwner() { m_owner_texture = nullptr; }
 
@@ -453,6 +454,7 @@ private:
     DWORD m_usage;
     D3DPOOL m_pool;
     bool m_last_lock_readonly{false};
+    bool m_written{false};
     std::vector<uint8_t> m_data;
 };
 
@@ -529,20 +531,46 @@ public:
         const uint32_t w = base->Width();
         const uint32_t h = base->Height();
 
+        auto upload_compressed = [&](uint32_t vk_fmt) -> uint32_t {
+            // Collect all contiguous mip levels that were actually populated by the DDS/asset loader.
+            uint32_t mip_count = 1;
+            size_t total_bytes = base->DataSize();
+            for (size_t lvl = 1; lvl < m_surfaces.size(); ++lvl)
+            {
+                if (!m_surfaces[lvl]->WasWritten())
+                {
+                    break;
+                }
+                total_bytes += m_surfaces[lvl]->DataSize();
+                ++mip_count;
+            }
+            if (mip_count == 1)
+            {
+                return zhr_vk_create_texture_2d(
+                    w, h, vk_fmt, base->Data(), base->DataSize(), linear_filter, clamp_edge);
+            }
+            std::vector<uint8_t> packed;
+            packed.reserve(total_bytes);
+            for (uint32_t lvl = 0; lvl < mip_count; ++lvl)
+            {
+                const uint8_t* p = m_surfaces[lvl]->Data();
+                packed.insert(packed.end(), p, p + m_surfaces[lvl]->DataSize());
+            }
+            return zhr_vk_create_texture_2d_mips(
+                w, h, mip_count, vk_fmt, packed.data(), packed.size(), linear_filter, clamp_edge);
+        };
+
         if (m_format == D3DFMT_DXT1)
         {
-            m_vk_handle = zhr_vk_create_texture_2d(
-                w, h, 2, base->Data(), base->DataSize(), linear_filter, clamp_edge);
+            m_vk_handle = upload_compressed(2);
         }
         else if (m_format == D3DFMT_DXT2 || m_format == D3DFMT_DXT3)
         {
-            m_vk_handle = zhr_vk_create_texture_2d(
-                w, h, 3, base->Data(), base->DataSize(), linear_filter, clamp_edge);
+            m_vk_handle = upload_compressed(3);
         }
         else if (m_format == D3DFMT_DXT4 || m_format == D3DFMT_DXT5)
         {
-            m_vk_handle = zhr_vk_create_texture_2d(
-                w, h, 4, base->Data(), base->DataSize(), linear_filter, clamp_edge);
+            m_vk_handle = upload_compressed(4);
         }
         else if (m_format == D3DFMT_A8R8G8B8 && base->Pitch() == w * 4)
         {
@@ -671,9 +699,13 @@ ZhrVkSurface8::~ZhrVkSurface8() = default;
 
 HRESULT STDMETHODCALLTYPE ZhrVkSurface8::UnlockRect()
 {
-    if (!m_last_lock_readonly && m_owner_texture != nullptr)
+    if (!m_last_lock_readonly)
     {
-        m_owner_texture->MarkDirty();
+        m_written = true;
+        if (m_owner_texture != nullptr)
+        {
+            m_owner_texture->MarkDirty();
+        }
     }
     return D3D_OK;
 }
@@ -1136,6 +1168,7 @@ public:
     }
     STDMETHOD(Present)(CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*) override
     {
+        PollGraphicsHotkeys();
         if (zhr_vk_is_frame_active())
         {
             zhr_vk_end_frame();
@@ -2301,9 +2334,103 @@ private:
         return D3D_OK;
     }
 
+    void PollGraphicsHotkeys()
+    {
+        if (!m_hwnd || GetForegroundWindow() != m_hwnd)
+        {
+            return;
+        }
+        const bool f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        const bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        const bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+
+        bool changed = false;
+        const uint32_t packed = zhr_vk_get_graphics_mode();
+        uint32_t mode = packed & 0x3u;
+        bool pbr = ((packed >> 2) & 0x1u) != 0;
+        bool post_fx = ((packed >> 3) & 0x1u) != 0;
+
+        if (f9_down && !m_f9_was_down)
+        {
+            // Cycle Remastered (1) -> Split-Screen A/B (2) -> Classic 2003 (0) -> Remastered (1)
+            if (mode == 1u)
+            {
+                mode = 2u;
+                pbr = true;
+                post_fx = true;
+            }
+            else if (mode == 2u)
+            {
+                mode = 0u;
+                pbr = false;
+                post_fx = false;
+            }
+            else
+            {
+                mode = 1u;
+                pbr = true;
+                post_fx = true;
+            }
+            changed = true;
+        }
+        if (f10_down && !m_f10_was_down)
+        {
+            pbr = !pbr;
+            if (pbr && mode == 0u) mode = 1u;
+            changed = true;
+        }
+        if (f11_down && !m_f11_was_down)
+        {
+            post_fx = !post_fx;
+            if (post_fx && mode == 0u) mode = 1u;
+            changed = true;
+        }
+
+        m_f9_was_down = f9_down;
+        m_f10_was_down = f10_down;
+        m_f11_was_down = f11_down;
+
+        if (changed)
+        {
+            zhr_vk_set_graphics_mode(mode, pbr, post_fx);
+            UpdateGraphicsTitleBanner(mode, pbr, post_fx);
+        }
+    }
+
+    void UpdateGraphicsTitleBanner(uint32_t mode, bool pbr, bool post_fx)
+    {
+        if (!m_hwnd) return;
+        if (m_base_window_title[0] == '\0')
+        {
+            GetWindowTextA(m_hwnd, m_base_window_title, static_cast<int>(sizeof(m_base_window_title)));
+            if (m_base_window_title[0] == '\0')
+            {
+                std::snprintf(m_base_window_title, sizeof(m_base_window_title), "%s", "ZeroHourReloaded");
+            }
+        }
+        const char* mode_label =
+            (mode == 0u) ? "Classic 2003" :
+            (mode == 2u) ? "Split-Screen A/B (Classic | Remastered)" :
+                           "Remastered";
+        char title[384]{};
+        std::snprintf(
+            title,
+            sizeof(title),
+            "%s  [Vulkan 1.3 | %s | PBR:%s | PostFX:%s | F9/F10/F11]",
+            m_base_window_title,
+            mode_label,
+            pbr ? "ON" : "OFF",
+            post_fx ? "ON" : "OFF");
+        SetWindowTextA(m_hwnd, title);
+    }
+
     std::atomic<ULONG> m_ref_count{1};
     IDirect3D8* m_parent_d3d;
     HWND m_hwnd;
+    bool m_f9_was_down{false};
+    bool m_f10_was_down{false};
+    bool m_f11_was_down{false};
+    char m_base_window_title[256]{};
     D3DPRESENT_PARAMETERS m_pp;
     D3DCAPS8 m_caps;
     uint32_t m_width;

@@ -26,6 +26,7 @@ pub struct VkContext {
     pub graphics_queue: vk::Queue,
     pub command_pool: vk::CommandPool,
     pub min_uniform_offset_alignment: u64,
+    pub max_anisotropy: f32,
     pub depth_format: vk::Format,
     pub allocator: Option<Allocator>,
     /// All enumerated Vulkan 1.3 capable GPUs (for `Renderer::Get_Render_Device_*`).
@@ -204,7 +205,14 @@ impl VkContext {
 
         // SAFETY: `physical_device` is valid.
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let supported_features = unsafe { instance.get_physical_device_features(physical_device) };
         let min_uniform_offset_alignment = props.limits.min_uniform_buffer_offset_alignment.max(64);
+        let anisotropy_supported = supported_features.sampler_anisotropy != 0;
+        let max_anisotropy = if anisotropy_supported {
+            props.limits.max_sampler_anisotropy.clamp(1.0, 16.0)
+        } else {
+            1.0
+        };
         let depth_format = pick_depth_format(&instance, physical_device);
 
         let queue_priority = [1.0f32];
@@ -217,6 +225,9 @@ impl VkContext {
             device_exts.push(ash::khr::swapchain::NAME.as_ptr());
         }
 
+        let enabled_features =
+            vk::PhysicalDeviceFeatures::default().sampler_anisotropy(anisotropy_supported);
+
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
@@ -224,6 +235,7 @@ impl VkContext {
         let device_info_vk = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_exts)
+            .enabled_features(&enabled_features)
             .push_next(&mut features13);
 
         // SAFETY: `physical_device` supports Vulkan 1.3 dynamic rendering and sync2.
@@ -267,6 +279,7 @@ impl VkContext {
             graphics_queue,
             command_pool,
             min_uniform_offset_alignment,
+            max_anisotropy,
             depth_format,
             allocator: Some(allocator),
             available_devices,

@@ -3,8 +3,8 @@ use std::path::Path;
 use glam::{Mat4, Vec3};
 use zhr_vulkan::shader::ShaderKey;
 use zhr_vulkan::types::{
-    ClearState, FogState, GpuLight, SamplerDesc, TextureFormat, VertexWw3d, Viewport, look_at_lh,
-    ortho_2d, perspective_lh,
+    ClearState, FogState, GpuLight, GraphicsSettings, SamplerDesc, TextureFormat, VertexWw3d,
+    Viewport, look_at_lh, ortho_2d, perspective_lh,
 };
 use zhr_vulkan::{RendererConfig, VulkanRenderer};
 
@@ -405,6 +405,115 @@ fn two_stage_combiner_matches_grayscale_road_and_detail_alpha_shaders() {
         [qc[0], qc[1], qc[2]],
         [255, 255, 255],
         "road transparent edge must be white, got {qc:?}"
+    );
+
+    assert_eq!(r.validation_error_count(), 0);
+}
+
+#[test]
+fn remastered_pbr_hdr_bloom_mipmaps_and_split_screen_render_cleanly() {
+    let width = 256u32;
+    let height = 256u32;
+    let mut r = make_headless(width, height);
+
+    // 16x16 textured metallic panel (triggers automatic GPU-blitted full mipmaps + 16x AF).
+    let mut panel_pixels = vec![0u8; 16 * 16 * 4];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            let i = ((y * 16 + x) * 4) as usize;
+            let seam = x == 0 || y == 0 || x == 8 || y == 8;
+            let v = if seam { 70 } else { 180 };
+            panel_pixels[i] = v;
+            panel_pixels[i + 1] = v;
+            panel_pixels[i + 2] = v + 10;
+            panel_pixels[i + 3] = 255;
+        }
+    }
+    let panel_tex = r
+        .create_texture_2d(
+            16,
+            16,
+            TextureFormat::Rgba8Unorm,
+            &panel_pixels,
+            SamplerDesc {
+                linear_filter: true,
+                clamp_edge: false,
+            },
+        )
+        .unwrap();
+
+    // Multi-mip BC1 texture upload (8x8 + 4x4 + 2x2 + 1x1).
+    let bc1_mips = vec![0xFFu8; 32 + 8 + 8 + 8];
+    let _bc1_tex = r
+        .create_texture_2d_mips(
+            8,
+            8,
+            4,
+            TextureFormat::Bc1RgbaUnorm,
+            &bc1_mips,
+            SamplerDesc::default(),
+        )
+        .unwrap();
+
+    let (cube_verts, cube_indices) = build_unit_cube();
+    let vb = r.create_vertex_buffer(&cube_verts).unwrap();
+    let ib = r.create_index_buffer_u16(&cube_indices).unwrap();
+
+    let proj = perspective_lh(50.0f32.to_radians(), 1.0, 0.1, 100.0);
+    let view = look_at_lh(Vec3::new(0.0, 0.4, -2.3), Vec3::ZERO, Vec3::Y);
+
+    let render_with = |r: &mut VulkanRenderer, settings: GraphicsSettings| -> Vec<u8> {
+        r.set_graphics_settings(settings);
+        r.begin_frame().unwrap();
+        r.set_viewport(Viewport::full(width, height));
+        r.clear(ClearState {
+            clear_color: true,
+            clear_depth_stencil: true,
+            color: [0.05, 0.07, 0.10, 1.0],
+            depth: 1.0,
+            stencil: 0,
+        })
+        .unwrap();
+
+        r.set_world(Mat4::from_rotation_y(0.35));
+        r.set_view(view);
+        r.set_projection(proj);
+        r.set_ambient(Vec3::splat(0.25));
+        r.set_lighting_enabled(true);
+        r.set_light(
+            0,
+            GpuLight::directional(Vec3::new(-0.2, -0.3, 0.9), Vec3::new(1.0, 0.95, 0.85)),
+        );
+        r.set_shader(ShaderKey::OPAQUE_3D);
+        r.set_texture(Some(panel_tex));
+        r.draw_indexed(vb, ib, cube_indices.len() as u32, 0, 0)
+            .unwrap();
+        r.end_frame().unwrap();
+        r.readback_rgba8().unwrap()
+    };
+
+    let classic = render_with(&mut r, GraphicsSettings::classic());
+    let remastered = render_with(&mut r, GraphicsSettings::remastered());
+    let split = render_with(&mut r, GraphicsSettings::split_screen());
+
+    // Remastered PBR + PostFX must visibly differ from Classic 2003 on the lit cube.
+    let mut diff_sum: u64 = 0;
+    for (a, b) in classic.iter().zip(remastered.iter()) {
+        diff_sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+    }
+    assert!(
+        diff_sum > 50_000,
+        "expected Remastered PBR+PostFX to visually differ from Classic, diff_sum={diff_sum}"
+    );
+
+    // Split-Screen A/B divider line at center x = width / 2 must be warm amber-gold (~255, 209, 71).
+    let mid = ((height / 2) * width + (width / 2)) as usize * 4;
+    assert!(
+        split[mid] > 230 && split[mid + 1] > 180 && split[mid + 2] < 110,
+        "expected amber split-screen divider at center, got RGB=({}, {}, {})",
+        split[mid],
+        split[mid + 1],
+        split[mid + 2]
     );
 
     assert_eq!(r.validation_error_count(), 0);
