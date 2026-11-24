@@ -543,6 +543,43 @@ pub extern "C" fn zhr_vk_set_texture(texture_id: u32) {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_texture_stage(stage: u32, texture_id: u32) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_texture_stage(
+            stage,
+            if texture_id == 0 {
+                None
+            } else {
+                Some(TextureId(texture_id))
+            },
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_texture_factor(r: f32, g: f32, b: f32, a: f32) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_texture_factor([r, g, b, a]);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_stage_state(
+    stage: u32,
+    color_op: u32,
+    color_args: u32,
+    alpha_op: u32,
+    alpha_args: u32,
+) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_stage_state(stage, color_op, color_args, alpha_op, alpha_args);
+    }
+}
+
 /// Submits transient indexed vertices directly through the dynamic ring buffer.
 ///
 /// # Safety

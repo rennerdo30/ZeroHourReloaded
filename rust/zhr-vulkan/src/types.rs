@@ -163,6 +163,12 @@ pub struct DrawUniforms {
     /// x = fog_start, y = fog_end, z = alpha_test_ref (<=0 disables), w = texturing_enabled (0/1).
     pub fog_and_shader_params: [f32; 4],
     pub lights: [GpuLight; 4],
+    /// RGBA color from `D3DRS_TEXTUREFACTOR`.
+    pub tfactor: [f32; 4],
+    /// Stage 0 combiner: `[color_op, color_args, alpha_op, alpha_args]` (color_op==0 -> legacy single-tex).
+    pub stage0_ops: [u32; 4],
+    /// Stage 1 combiner: `[color_op, color_args, alpha_op, alpha_args]` (color_op==0 -> stage 1 disabled).
+    pub stage1_ops: [u32; 4],
 }
 
 impl Default for DrawUniforms {
@@ -175,6 +181,9 @@ impl Default for DrawUniforms {
             fog_color_and_enable: [0.0, 0.0, 0.0, 0.0],
             fog_and_shader_params: [0.0, 1000.0, -1.0, 0.0],
             lights: [GpuLight::DISABLED; 4],
+            tfactor: [1.0, 1.0, 1.0, 1.0],
+            stage0_ops: [0, 0, 0, 0],
+            stage1_ops: [0, 0, 0, 0],
         }
     }
 }

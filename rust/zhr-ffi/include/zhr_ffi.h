@@ -109,6 +109,14 @@ uint32_t zhr_vk_create_texture_rgba8(
     bool clamp_edge);
 void zhr_vk_destroy_texture(uint32_t texture_id);
 void zhr_vk_set_texture(uint32_t texture_id);
+void zhr_vk_set_texture_stage(uint32_t stage, uint32_t texture_id);
+void zhr_vk_set_texture_factor(float r, float g, float b, float a);
+void zhr_vk_set_stage_state(
+    uint32_t stage,
+    uint32_t color_op,
+    uint32_t color_args,
+    uint32_t alpha_op,
+    uint32_t alpha_args);
 
 int32_t zhr_vk_draw_dynamic(
     const ZhrVertexWw3d* vertices,

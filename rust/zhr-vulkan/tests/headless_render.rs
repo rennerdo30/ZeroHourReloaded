@@ -209,6 +209,207 @@ fn lit_3d_cube_depth_fog_and_textured_alpha_test_render_cleanly() {
     assert_eq!(r.validation_error_count(), 0);
 }
 
+#[test]
+fn two_stage_combiner_matches_grayscale_road_and_detail_alpha_shaders() {
+    let mut r = make_headless(64, 64);
+
+    // Helper: pack (arg1, arg2, arg0) into the same format as VulkanDX8Bridge::PackD3DTexArgs.
+    let pack = |a1: u32, a2: u32, a0: u32| (a1 & 0xFF) | ((a2 & 0xFF) << 8) | ((a0 & 0xFF) << 16);
+    const TA_DIFFUSE: u32 = 0;
+    const TA_CURRENT: u32 = 1;
+    const TA_TEXTURE: u32 = 2;
+    const TA_TFACTOR: u32 = 3;
+    const TA_ALPHAREPLICATE: u32 = 0x20;
+
+    let quad = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        [
+            VertexWw3d {
+                position: [x0, y0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                uv0: [0.0, 0.0],
+                uv1: [0.0, 0.0],
+            },
+            VertexWw3d {
+                position: [x1, y0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                uv0: [1.0, 0.0],
+                uv1: [1.0, 0.0],
+            },
+            VertexWw3d {
+                position: [x1, y1, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                uv0: [1.0, 1.0],
+                uv1: [1.0, 1.0],
+            },
+            VertexWw3d {
+                position: [x0, y1, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                uv0: [0.0, 1.0],
+                uv1: [0.0, 1.0],
+            },
+        ]
+    };
+    let nearest = SamplerDesc {
+        linear_filter: false,
+        clamp_edge: true,
+    };
+
+    // 1) Vivid green icon texture (0, 255, 0, 255) for DOTPRODUCT3 grayscale.
+    let green_tex = r
+        .create_texture_2d(1, 1, TextureFormat::Rgba8Unorm, &[0, 255, 0, 255], nearest)
+        .unwrap();
+    // 2) Stage 0 opaque black (0,0,0,255) + Stage 1 transparent mask (255,255,255,0) for LASER_LOGO DETAILALPHA_DETAIL.
+    let opaque_black = r
+        .create_texture_2d(1, 1, TextureFormat::Rgba8Unorm, &[0, 0, 0, 255], nearest)
+        .unwrap();
+    let transparent_mask = r
+        .create_texture_2d(
+            1,
+            1,
+            TextureFormat::Rgba8Unorm,
+            &[255, 255, 255, 0],
+            nearest,
+        )
+        .unwrap();
+    // 3) Stage 0 transparent road edge (120,60,20,0) + Stage 1 dark noise (40,40,40,255) for RoadShader2Stage pass 1.
+    let road_edge = r
+        .create_texture_2d(1, 1, TextureFormat::Rgba8Unorm, &[120, 60, 20, 0], nearest)
+        .unwrap();
+    let dark_noise = r
+        .create_texture_2d(1, 1, TextureFormat::Rgba8Unorm, &[40, 40, 40, 255], nearest)
+        .unwrap();
+
+    r.begin_frame().unwrap();
+    r.set_viewport(Viewport::full(64, 64));
+    r.clear(ClearState {
+        clear_color: true,
+        clear_depth_stencil: true,
+        color: [0.2, 0.4, 0.8, 1.0],
+        depth: 1.0,
+        stencil: 0,
+    })
+    .unwrap();
+    r.set_world_identity();
+    r.set_view_identity();
+    r.set_projection(ortho_2d(64.0, 64.0));
+    r.set_lighting_enabled(false);
+
+    // Quad A (x: 0..20): Render2DClass::IsGrayScale (MULTIPLYADD + DOTPRODUCT3 + TFACTOR=0x80A5CA8E).
+    r.set_shader(ShaderKey::OPAQUE_3D);
+    r.set_texture_factor([
+        0xA5 as f32 / 255.0,
+        0xCA as f32 / 255.0,
+        0x8E as f32 / 255.0,
+        0x80 as f32 / 255.0,
+    ]);
+    r.set_stage_state(
+        0,
+        10, // MULTIPLYADD
+        pack(
+            TA_TEXTURE,
+            TA_TFACTOR | TA_ALPHAREPLICATE,
+            TA_TFACTOR | TA_ALPHAREPLICATE,
+        ),
+        3, // MODULATE
+        pack(TA_TEXTURE, TA_DIFFUSE, TA_CURRENT),
+    );
+    r.set_stage_state(
+        1,
+        11, // DOTPRODUCT3
+        pack(TA_CURRENT, TA_TFACTOR, TA_CURRENT),
+        0, // DISABLE
+        0,
+    );
+    r.set_texture_stage(0, Some(green_tex));
+    r.set_texture_stage(1, None);
+    r.draw_dynamic(&quad(0.0, 0.0, 20.0, 64.0), &[0, 1, 2, 0, 2, 3])
+        .unwrap();
+
+    // Quad B (x: 22..42): LASER_LOGO DETAILALPHA_DETAIL (stage0 opaque black, stage1 alpha=0 -> background preserved!).
+    r.set_shader(ShaderKey::UI_2D);
+    r.set_stage_state(
+        0,
+        3, // MODULATE
+        pack(TA_TEXTURE, TA_DIFFUSE, TA_CURRENT),
+        3, // MODULATE
+        pack(TA_TEXTURE, TA_DIFFUSE, TA_CURRENT),
+    );
+    r.set_stage_state(
+        1,
+        2, // SELECTARG2 (CURRENT)
+        pack(TA_TEXTURE, TA_CURRENT, TA_CURRENT),
+        1, // SELECTARG1 (TEXTURE)
+        pack(TA_TEXTURE, TA_CURRENT, TA_CURRENT),
+    );
+    r.set_texture_stage(0, Some(opaque_black));
+    r.set_texture_stage(1, Some(transparent_mask));
+    r.draw_dynamic(&quad(22.0, 0.0, 42.0, 64.0), &[0, 1, 2, 0, 2, 3])
+        .unwrap();
+
+    // Quad C (x: 44..64): RoadShader2Stage pass 1 (BLENDCURRENTALPHA -> white where road_alpha == 0).
+    r.set_shader(ShaderKey::OPAQUE_3D);
+    r.set_stage_state(
+        0,
+        2, // SELECTARG2 (DIFFUSE | ALPHAREPLICATE -> white)
+        pack(TA_TEXTURE, TA_DIFFUSE | TA_ALPHAREPLICATE, TA_CURRENT),
+        1, // SELECTARG1 (TEXTURE alpha = 0)
+        pack(TA_TEXTURE, TA_DIFFUSE, TA_CURRENT),
+    );
+    r.set_stage_state(
+        1,
+        9, // BLENDCURRENTALPHA (mix(CURRENT=white, TEXTURE=noise, cur.a=0) = white)
+        pack(TA_TEXTURE, TA_CURRENT, TA_CURRENT),
+        0, // DISABLE
+        0,
+    );
+    r.set_texture_stage(0, Some(road_edge));
+    r.set_texture_stage(1, Some(dark_noise));
+    r.draw_dynamic(&quad(44.0, 0.0, 64.0, 64.0), &[0, 1, 2, 0, 2, 3])
+        .unwrap();
+
+    r.end_frame().unwrap();
+
+    let pixels = r.readback_rgba8().unwrap();
+    let sample = |x: u32, y: u32| {
+        let i = ((y * 64 + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    };
+
+    // Quad A: pure green (0,1,0) -> Rec.601 luminance ~0.586 -> ~149 gray (R==G==B).
+    let qa = sample(10, 32);
+    assert_eq!(qa[0], qa[1], "grayscale pixel must have R==G, got {qa:?}");
+    assert_eq!(qa[1], qa[2], "grayscale pixel must have G==B, got {qa:?}");
+    assert!(
+        (qa[0] as i32 - 149).abs() <= 4,
+        "expected ~149 luminance for green, got {qa:?}"
+    );
+
+    // Quad B: transparent stage-1 mask must leave clear color (51, 102, 204) untouched (not black!).
+    let qb = sample(32, 32);
+    assert!(
+        (qb[0] as i32 - 51).abs() <= 2,
+        "expected blue bg, got {qb:?}"
+    );
+    assert!(
+        (qb[2] as i32 - 204).abs() <= 2,
+        "expected blue bg, got {qb:?}"
+    );
+
+    // Quad C: road feathered edge (alpha=0) must output pure white (255,255,255) for multiplicative pass.
+    let qc = sample(54, 32);
+    assert_eq!(
+        [qc[0], qc[1], qc[2]],
+        [255, 255, 255],
+        "road transparent edge must be white, got {qc:?}"
+    );
+
+    assert_eq!(r.validation_error_count(), 0);
+}
+
 fn build_unit_cube() -> (Vec<VertexWw3d>, Vec<u16>) {
     let white = [1.0, 1.0, 1.0, 1.0];
     let faces: &[([f32; 3], [[f32; 3]; 4])] = &[

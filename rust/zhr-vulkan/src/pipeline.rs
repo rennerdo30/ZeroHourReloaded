@@ -51,7 +51,11 @@ impl PipelineCache {
         // SAFETY: `device` is valid.
         let set1_texture_layout = unsafe { device.create_descriptor_set_layout(&set1_info, None)? };
 
-        let set_layouts = [set0_uniform_layout, set1_texture_layout];
+        let set_layouts = [
+            set0_uniform_layout,
+            set1_texture_layout,
+            set1_texture_layout,
+        ];
         let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
         // SAFETY: Both descriptor set layouts belong to `device`.
         let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };

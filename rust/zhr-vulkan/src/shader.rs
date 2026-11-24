@@ -325,11 +325,16 @@ struct DrawUniforms {
     fog_color_and_enable: vec4<f32>,
     fog_and_shader_params: vec4<f32>,
     lights: array<Light, 4>,
+    tfactor: vec4<f32>,
+    stage0_ops: vec4<u32>,
+    stage1_ops: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> u: DrawUniforms;
 @group(1) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(1) @binding(1) var s_diffuse: sampler;
+@group(2) @binding(0) var t_diffuse1: texture_2d<f32>;
+@group(2) @binding(1) var s_diffuse1: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -344,6 +349,7 @@ struct VsOut {
     @location(0) color: vec4<f32>,
     @location(1) uv0: vec2<f32>,
     @location(2) view_dist: f32,
+    @location(3) uv1: vec2<f32>,
 };
 
 @vertex
@@ -385,15 +391,88 @@ fn vs_main(in: VsIn) -> VsOut {
     out.color = vec4<f32>(lit_rgb, in.color.a);
     out.uv0 = in.uv0;
     out.view_dist = length(view_pos.xyz);
+    out.uv1 = in.uv1;
     return out;
+}
+
+fn eval_arg(code: u32, diffuse: vec4<f32>, cur: vec4<f32>, tex: vec4<f32>, tfactor: vec4<f32>) -> vec4<f32> {
+    let sel = code & 0xFu;
+    var v = diffuse;
+    if (sel == 1u) {
+        v = cur;
+    } else if (sel == 2u) {
+        v = tex;
+    } else if (sel == 3u) {
+        v = tfactor;
+    }
+    if ((code & 0x20u) != 0u) {
+        v = vec4<f32>(v.a, v.a, v.a, v.a);
+    }
+    if ((code & 0x10u) != 0u) {
+        v = vec4<f32>(1.0) - v;
+    }
+    return v;
+}
+
+fn eval_rgb_op(op: u32, args: u32, diffuse: vec4<f32>, cur: vec4<f32>, tex: vec4<f32>, tfactor: vec4<f32>) -> vec3<f32> {
+    let a1 = eval_arg(args & 0xFFu, diffuse, cur, tex, tfactor);
+    let a2 = eval_arg((args >> 8u) & 0xFFu, diffuse, cur, tex, tfactor);
+    let a0 = eval_arg((args >> 16u) & 0xFFu, diffuse, cur, tex, tfactor);
+    if (op == 1u) { return a1.rgb; }
+    if (op == 2u) { return a2.rgb; }
+    if (op == 3u) { return a1.rgb * a2.rgb; }
+    if (op == 4u) { return clamp(a1.rgb * a2.rgb * 2.0, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if (op == 5u) { return clamp(a1.rgb + a2.rgb, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if (op == 6u) { return clamp(a1.rgb + a2.rgb - vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if (op == 7u) { return clamp(a1.rgb - a2.rgb, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if (op == 8u) { return mix(a2.rgb, a1.rgb, tex.a); }
+    if (op == 9u) { return mix(a2.rgb, a1.rgb, cur.a); }
+    if (op == 10u) { return clamp(a0.rgb + a1.rgb * a2.rgb, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if (op == 11u) {
+        let d = clamp(dot(a1.rgb * 2.0 - vec3<f32>(1.0), a2.rgb * 2.0 - vec3<f32>(1.0)), 0.0, 1.0);
+        return vec3<f32>(d, d, d);
+    }
+    if (op == 12u) { return clamp(a1.rgb + a1.a * a2.rgb, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if (op == 13u) { return clamp(a1.rgb + a2.rgb - a1.rgb * a2.rgb, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    if (op == 14u) { return mix(a2.rgb, a1.rgb, diffuse.a); }
+    if (op == 15u) { return clamp((a1.rgb + a2.rgb - vec3<f32>(0.5)) * 2.0, vec3<f32>(0.0), vec3<f32>(1.0)); }
+    return cur.rgb;
+}
+
+fn eval_alpha_op(op: u32, args: u32, diffuse: vec4<f32>, cur: vec4<f32>, tex: vec4<f32>, tfactor: vec4<f32>) -> f32 {
+    if (op == 0u) { return cur.a; }
+    let a1 = eval_arg(args & 0xFFu, diffuse, cur, tex, tfactor).a;
+    let a2 = eval_arg((args >> 8u) & 0xFFu, diffuse, cur, tex, tfactor).a;
+    if (op == 1u) { return a1; }
+    if (op == 2u) { return a2; }
+    if (op == 3u) { return a1 * a2; }
+    if (op == 4u) { return clamp(a1 * a2 * 2.0, 0.0, 1.0); }
+    if (op == 5u) { return clamp(a1 + a2, 0.0, 1.0); }
+    if (op == 6u) { return clamp(a1 + a2 - 0.5, 0.0, 1.0); }
+    if (op == 7u) { return clamp(a1 - a2, 0.0, 1.0); }
+    if (op == 13u) { return clamp(a1 + a2 - a1 * a2, 0.0, 1.0); }
+    if (op == 14u) { return mix(a2, a1, diffuse.a); }
+    if (op == 15u) { return clamp((a1 + a2 - 0.5) * 2.0, 0.0, 1.0); }
+    return cur.a;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let tex0 = textureSample(t_diffuse, s_diffuse, in.uv0);
+    let tex1 = textureSample(t_diffuse1, s_diffuse1, in.uv1);
+
     var col = in.color;
-    if (u.fog_and_shader_params.w > 0.5) {
-        let tex = textureSample(t_diffuse, s_diffuse, in.uv0);
-        col = col * tex;
+    if (u.stage0_ops.x != 0u) {
+        let rgb0 = eval_rgb_op(u.stage0_ops.x, u.stage0_ops.y, in.color, col, tex0, u.tfactor);
+        let a0 = eval_alpha_op(u.stage0_ops.z, u.stage0_ops.w, in.color, col, tex0, u.tfactor);
+        col = vec4<f32>(rgb0, a0);
+        if (u.stage1_ops.x != 0u) {
+            let rgb1 = eval_rgb_op(u.stage1_ops.x, u.stage1_ops.y, in.color, col, tex1, u.tfactor);
+            let a1 = eval_alpha_op(u.stage1_ops.z, u.stage1_ops.w, in.color, col, tex1, u.tfactor);
+            col = vec4<f32>(rgb1, a1);
+        }
+    } else if (u.fog_and_shader_params.w > 0.5) {
+        col = col * tex0;
     }
 
     let alpha_ref = u.fog_and_shader_params.z;

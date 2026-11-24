@@ -92,6 +92,7 @@ struct ActiveFrame {
     rendering_begun: bool,
     last_pipeline: Option<vk::Pipeline>,
     last_texture: Option<TextureId>,
+    last_texture1: Option<TextureId>,
 }
 
 /// Main Vulkan 1.3 renderer instance (stateful interface matching `WW3D2::Renderer`).
@@ -118,6 +119,7 @@ pub struct VulkanRenderer {
     uniforms: DrawUniforms,
     shader: ShaderKey,
     active_texture: TextureId,
+    active_texture1: TextureId,
     viewport: Viewport,
     pending_clear: Option<ClearState>,
     alpha_test_ref: f32,
@@ -300,6 +302,7 @@ impl VulkanRenderer {
             uniforms: DrawUniforms::default(),
             shader: ShaderKey::OPAQUE_3D,
             active_texture: default_white_texture,
+            active_texture1: default_white_texture,
             viewport: Viewport::full(extent.width, extent.height),
             pending_clear: None,
             alpha_test_ref: 0.5,
@@ -446,9 +449,15 @@ impl VulkanRenderer {
         if self.active_texture == id {
             self.active_texture = self.default_white_texture;
         }
+        if self.active_texture1 == id {
+            self.active_texture1 = self.default_white_texture;
+        }
         if let Some(af) = &mut self.active_frame {
             if af.last_texture == Some(id) {
                 af.last_texture = None;
+            }
+            if af.last_texture1 == Some(id) {
+                af.last_texture1 = None;
             }
             if let Some(tex) = self.textures.remove(&id) {
                 self.frames[af.slot_index].retired_textures.push(tex);
@@ -527,6 +536,35 @@ impl VulkanRenderer {
 
     pub fn set_texture(&mut self, tex: Option<TextureId>) {
         self.active_texture = tex.unwrap_or(self.default_white_texture);
+    }
+
+    pub fn set_texture_stage(&mut self, stage: u32, tex: Option<TextureId>) {
+        let id = tex.unwrap_or(self.default_white_texture);
+        match stage {
+            0 => self.active_texture = id,
+            1 => self.active_texture1 = id,
+            _ => {}
+        }
+    }
+
+    pub fn set_texture_factor(&mut self, rgba: [f32; 4]) {
+        self.uniforms.tfactor = rgba;
+    }
+
+    pub fn set_stage_state(
+        &mut self,
+        stage: u32,
+        color_op: u32,
+        color_args: u32,
+        alpha_op: u32,
+        alpha_args: u32,
+    ) {
+        let ops = [color_op, color_args, alpha_op, alpha_args];
+        match stage {
+            0 => self.uniforms.stage0_ops = ops,
+            1 => self.uniforms.stage1_ops = ops,
+            _ => {}
+        }
     }
 
     pub fn set_viewport(&mut self, viewport: Viewport) {
@@ -671,6 +709,7 @@ impl VulkanRenderer {
             rendering_begun: false,
             last_pipeline: None,
             last_texture: None,
+            last_texture1: None,
         });
         Ok(())
     }
@@ -864,7 +903,8 @@ impl VulkanRenderer {
             );
         }
 
-        let tex_id = if self.shader.texturing_enabled() {
+        let use_combiner = self.uniforms.stage0_ops[0] != 0;
+        let tex_id = if use_combiner || self.shader.texturing_enabled() {
             self.active_texture
         } else {
             self.default_white_texture
@@ -886,6 +926,31 @@ impl VulkanRenderer {
                 );
             }
             af.last_texture = Some(tex_id);
+            self.stats.texture_binds += 1;
+        }
+
+        let tex1_id = if self.uniforms.stage1_ops[0] != 0 {
+            self.active_texture1
+        } else {
+            self.default_white_texture
+        };
+        if af.last_texture1 != Some(tex1_id) {
+            let tex1 = self
+                .textures
+                .get(&tex1_id)
+                .ok_or(VkError::InvalidHandle("texture1"))?;
+            // SAFETY: Texture descriptor set is valid for this frame.
+            unsafe {
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.pipeline_layout,
+                    2,
+                    &[tex1.descriptor_set],
+                    &[],
+                );
+            }
+            af.last_texture1 = Some(tex1_id);
             self.stats.texture_binds += 1;
         }
 
