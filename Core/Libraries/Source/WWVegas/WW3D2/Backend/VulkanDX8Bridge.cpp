@@ -1834,6 +1834,14 @@ private:
         m_render_states[D3DRS_COLORVERTEX] = TRUE;
         m_render_states[D3DRS_COLORWRITEENABLE] = 0x0000000F;
         m_render_states[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFFu;
+        m_render_states[D3DRS_STENCILENABLE] = FALSE;
+        m_render_states[D3DRS_STENCILFAIL] = D3DSTENCILOP_KEEP;
+        m_render_states[D3DRS_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+        m_render_states[D3DRS_STENCILPASS] = D3DSTENCILOP_KEEP;
+        m_render_states[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
+        m_render_states[D3DRS_STENCILREF] = 0;
+        m_render_states[D3DRS_STENCILMASK] = 0xFFFFFFFFu;
+        m_render_states[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFFu;
 
         std::memset(m_tss, 0, sizeof(m_tss));
         for (int s = 0; s < 8; ++s)
@@ -2040,6 +2048,17 @@ private:
 
         zhr_vk_set_shader(shader_bits);
 
+        const bool stencil_enable = m_render_states[D3DRS_STENCILENABLE] != 0;
+        zhr_vk_set_stencil_state(
+            stencil_enable,
+            MapD3DCmpToShaderDepth(m_render_states[D3DRS_STENCILFUNC]),
+            m_render_states[D3DRS_STENCILFAIL],
+            m_render_states[D3DRS_STENCILZFAIL],
+            m_render_states[D3DRS_STENCILPASS],
+            m_render_states[D3DRS_STENCILMASK],
+            m_render_states[D3DRS_STENCILWRITEMASK],
+            m_render_states[D3DRS_STENCILREF]);
+
         if (alpha_test)
         {
             const float ref = static_cast<float>(m_render_states[D3DRS_ALPHAREF] & 0xFFu) / 255.0f;
@@ -2077,11 +2096,6 @@ private:
         uint32_t index_rebase)
     {
         if (vertex_count == 0 || prim_count == 0) return D3D_OK;
-        if (m_render_states[D3DRS_STENCILENABLE] != 0 &&
-            m_render_states[D3DRS_STENCILFUNC] == D3DCMP_NEVER)
-        {
-            return D3D_OK;
-        }
 
         EnsureFrameBegun();
 
@@ -2599,8 +2613,9 @@ public:
         {
             switch (CheckFormat)
             {
-            // Report depth-only formats until VkStencilOpState is wired in zhr-vulkan;
-            // prevents W3DScene/W3DVolumetricShadow from submitting stencil-masked overlay passes.
+            // Full hardware depth+stencil supported via Vulkan 1.3 VkStencilOpState
+            // (enables W3DVolumetricShadow volumes & occluded unit silhouettes).
+            case D3DFMT_D24S8:
             case D3DFMT_D24X8:
             case D3DFMT_D32:
             case D3DFMT_D16:

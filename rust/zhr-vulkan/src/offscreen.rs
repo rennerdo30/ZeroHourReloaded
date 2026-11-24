@@ -17,6 +17,7 @@ pub struct OffscreenTarget {
     color_alloc: Option<Allocation>,
     pub depth_image: vk::Image,
     pub depth_view: vk::ImageView,
+    pub depth_sample_view: vk::ImageView,
     depth_alloc: Option<Allocation>,
     pub color_layout: vk::ImageLayout,
 }
@@ -44,9 +45,10 @@ impl OffscreenTarget {
             w,
             h,
             depth_format,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             vk::ImageAspectFlags::DEPTH,
         )?;
+        let depth_sample_view = create_depth_sample_view(&ctx.device, depth_image, depth_format)?;
 
         Ok(Self {
             width: w,
@@ -58,6 +60,7 @@ impl OffscreenTarget {
             color_alloc: Some(color_alloc),
             depth_image,
             depth_view,
+            depth_sample_view,
             depth_alloc: Some(depth_alloc),
             color_layout: vk::ImageLayout::UNDEFINED,
         })
@@ -137,6 +140,7 @@ impl OffscreenTarget {
         unsafe {
             ctx.device.destroy_image_view(self.color_view, None);
             ctx.device.destroy_image(self.color_image, None);
+            ctx.device.destroy_image_view(self.depth_sample_view, None);
             ctx.device.destroy_image_view(self.depth_view, None);
             ctx.device.destroy_image(self.depth_image, None);
         }
@@ -251,6 +255,30 @@ pub fn create_attachment(
     }
 
     Ok((image, view, allocation))
+}
+
+/// Creates a `DEPTH`-only `VkImageView` suitable for fragment-shader depth sampling (SSAO),
+/// even when the underlying depth attachment also carries a stencil plane.
+pub fn create_depth_sample_view(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+) -> Result<vk::ImageView> {
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        );
+    // SAFETY: `image` is a valid depth(-stencil) image created with `SAMPLED` usage.
+    let view = unsafe { device.create_image_view(&view_info, None)? };
+    Ok(view)
 }
 
 /// Encodes RGBA8 pixels to a PNG file on disk.

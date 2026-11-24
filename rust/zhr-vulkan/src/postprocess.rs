@@ -1,5 +1,6 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
+use glam::Mat4;
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::Allocation;
 
@@ -12,24 +13,29 @@ use crate::types::{GraphicsMode, GraphicsSettings};
 
 pub const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+const SLOTS_PER_FRAME: usize = 8;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct PostParams {
-    /// x = post_fx_enable (0/1), y = split_x_uv (<=0 disabled), z = inv_width, w = inv_height.
+    /// x = enable (0/1), y = split_x_uv (<=0 disabled), z = inv_width, w = inv_height.
     params0: [f32; 4],
-    /// x = blur_dx, y = blur_dy, z = bloom_threshold, w = bloom_strength.
+    /// x = blur_dx, y = blur_dy, z = threshold / radius, w = strength.
     params1: [f32; 4],
+    /// SSAO projection unpack: x = inv_proj_x, y = inv_proj_y, z = proj_m22, w = proj_m32.
+    params2: [f32; 4],
 }
 
 const POSTPROCESS_WGSL: &str = r#"
 struct PostParams {
     params0: vec4<f32>,
     params1: vec4<f32>,
+    params2: vec4<f32>,
 };
 
 @group(0) @binding(0) var t_src0: texture_2d<f32>;
 @group(0) @binding(1) var t_src1: texture_2d<f32>;
-@group(0) @binding(2) var s_linear: sampler;
+@group(0) @binding(2) var s_samp: sampler;
 @group(0) @binding(3) var<uniform> u: PostParams;
 
 struct VsOut {
@@ -48,14 +54,171 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
+// ============================================================================
+// Depth-Based Screen-Space Ambient Occlusion (12-tap Golden-Angle + Bilateral)
+// ============================================================================
+
+fn depth_to_view_z(d: f32) -> f32 {
+    let m22 = u.params2.z;
+    let m32 = u.params2.w;
+    let denom = d - m22;
+    if (abs(denom) < 0.000001) {
+        return 10000.0;
+    }
+    return abs(m32 / denom);
+}
+
+fn reconstruct_view_pos(uv: vec2<f32>, z_view: f32) -> vec3<f32> {
+    let ndc_x = uv.x * 2.0 - 1.0;
+    let ndc_y = 1.0 - uv.y * 2.0;
+    return vec3<f32>(
+        ndc_x * z_view * u.params2.x,
+        ndc_y * z_view * u.params2.y,
+        z_view
+    );
+}
+
+@fragment
+fn fs_ssao_raw(in: VsOut) -> @location(0) vec4<f32> {
+    let d_center = textureSample(t_src0, s_samp, in.uv).r;
+    // Skip skybox/cleared depth or non-perspective projection.
+    if (d_center >= 0.9995 || d_center <= 0.00001 || abs(u.params2.w) < 0.00001) {
+        return vec4<f32>(1.0, 10000.0, 0.0, 1.0);
+    }
+
+    let z_c = depth_to_view_z(d_center);
+    let p_c = reconstruct_view_pos(in.uv, z_c);
+    let texel = vec2<f32>(u.params0.z, u.params0.w);
+
+    // Edge-aware neighbor depth finite differences for clean view-space normal without silhouette halos.
+    let uv_l = in.uv - vec2<f32>(texel.x, 0.0);
+    let uv_r = in.uv + vec2<f32>(texel.x, 0.0);
+    let uv_u = in.uv - vec2<f32>(0.0, texel.y);
+    let uv_d = in.uv + vec2<f32>(0.0, texel.y);
+
+    let z_l = depth_to_view_z(textureSample(t_src0, s_samp, uv_l).r);
+    let z_r = depth_to_view_z(textureSample(t_src0, s_samp, uv_r).r);
+    let z_u = depth_to_view_z(textureSample(t_src0, s_samp, uv_u).r);
+    let z_d = depth_to_view_z(textureSample(t_src0, s_samp, uv_d).r);
+
+    let p_l = reconstruct_view_pos(uv_l, z_l);
+    let p_r = reconstruct_view_pos(uv_r, z_r);
+    let p_u = reconstruct_view_pos(uv_u, z_u);
+    let p_d = reconstruct_view_pos(uv_d, z_d);
+
+    let dx = select(p_c - p_l, p_r - p_c, abs(z_r - z_c) < abs(z_l - z_c));
+    let dy = select(p_c - p_d, p_u - p_c, abs(z_u - z_c) < abs(z_d - z_c));
+    let n_raw = cross(dx, dy);
+    let n_len = length(n_raw);
+    if (n_len < 0.000001) {
+        return vec4<f32>(1.0, z_c, 0.0, 1.0);
+    }
+    var n_view = n_raw / n_len;
+    if (n_view.z > 0.0) {
+        n_view = -n_view;
+    }
+
+    // Distance-adaptive world-space radius (works seamlessly from close-up units to high RTS camera).
+    let world_radius = clamp(z_c * 0.020, 0.25, 11.0);
+    let screen_radius = clamp(
+        vec2<f32>(
+            world_radius / max(z_c * u.params2.x * 2.0, 0.001),
+            world_radius / max(z_c * u.params2.y * 2.0, 0.001)
+        ),
+        texel * 2.0,
+        vec2<f32>(0.045, 0.045)
+    );
+
+    // Interleaved Gradient Noise per-pixel rotation (zero grid banding).
+    let ign = fract(52.9829189 * fract(dot(in.pos.xy, vec2<f32>(0.06711056, 0.00583715))));
+    let base_angle = ign * 6.2831853;
+    let golden_step = 2.3999632;
+
+    var occ = 0.0;
+    let samples: u32 = 12u;
+    let bias = world_radius * 0.045;
+    for (var i: u32 = 0u; i < samples; i = i + 1u) {
+        let fi = (f32(i) + 0.5) / f32(samples);
+        let r = sqrt(fi);
+        let angle = base_angle + f32(i) * golden_step;
+        let offset = vec2<f32>(cos(angle), sin(angle)) * r * screen_radius;
+        let sample_uv = clamp(in.uv + offset, vec2<f32>(0.001), vec2<f32>(0.999));
+
+        let d_s = textureSample(t_src0, s_samp, sample_uv).r;
+        if (d_s < 0.9995) {
+            let z_s = depth_to_view_z(d_s);
+            let p_s = reconstruct_view_pos(sample_uv, z_s);
+            let diff = p_s - p_c;
+            let dist = length(diff);
+            if (dist > 0.0001 && dist < world_radius * 2.4) {
+                let dir = diff / dist;
+                let ndotd = max(dot(n_view, dir) - 0.14, 0.0);
+                let falloff = clamp(1.0 - dist / (world_radius * 2.2), 0.0, 1.0);
+                // Range check prevents foreground objects from haloing distant terrain behind them.
+                let dz_ok = smoothstep(world_radius * 2.4, world_radius * 0.4, abs(z_s - z_c));
+                let front_ok = select(0.0, 1.0, (z_c - z_s) > bias);
+                occ = occ + ndotd * falloff * dz_ok * front_ok;
+            }
+        }
+    }
+
+    let ao = clamp(1.0 - (occ / f32(samples)) * u.params1.w, 0.35, 1.0);
+    return vec4<f32>(ao, z_c, 0.0, 1.0);
+}
+
+@fragment
+fn fs_ssao_blur(in: VsOut) -> @location(0) vec4<f32> {
+    let center = textureSample(t_src0, s_samp, in.uv);
+    let z_c = center.g;
+    if (z_c >= 9000.0) {
+        return center;
+    }
+    let step = vec2<f32>(u.params1.x, u.params1.y);
+    let depth_sigma = max(z_c * 0.035, 0.08);
+
+    var ao_sum = center.r * 0.26;
+    var w_sum = 0.26;
+
+    for (var k: i32 = -3; k <= 3; k = k + 1) {
+        if (k == 0) {
+            continue;
+        }
+        let fk = f32(k);
+        let tap = textureSample(t_src0, s_samp, in.uv + step * fk);
+        let spatial_w = exp(-(fk * fk) / 6.0);
+        let dz = abs(tap.g - z_c) / depth_sigma;
+        let range_w = exp(-(dz * dz));
+        let w = spatial_w * range_w;
+        ao_sum = ao_sum + tap.r * w;
+        w_sum = w_sum + w;
+    }
+
+    return vec4<f32>(ao_sum / max(w_sum, 0.0001), z_c, 0.0, 1.0);
+}
+
+@fragment
+fn fs_ssao_apply(in: VsOut) -> @location(0) vec4<f32> {
+    let split_x = u.params0.y;
+    if (u.params0.x < 0.5 || (split_x > 0.0 && in.uv.x < split_x)) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    let ao = clamp(textureSample(t_src0, s_samp, in.uv).r, 0.40, 1.0);
+    // Subtle warm-neutral crevice tint so contact shadows feel rich, not cold grey.
+    let ao_rgb = mix(vec3<f32>(ao * 0.98, ao * 0.99, ao * 1.02), vec3<f32>(1.0), 0.12);
+    return vec4<f32>(clamp(ao_rgb, vec3<f32>(0.42), vec3<f32>(1.0)), 1.0);
+}
+
+// ============================================================================
+// Quarter-Res HDR Bloom + Normalized Filmic Tonemapping + CAS Sharpening
+// ============================================================================
+
 @fragment
 fn fs_bloom_extract(in: VsOut) -> @location(0) vec4<f32> {
     let texel = vec2<f32>(u.params0.z, u.params0.w);
-    // 4-tap box downsample from full-res HDR scene to quarter-res bloom buffer.
-    let c0 = textureSample(t_src0, s_linear, in.uv + texel * vec2<f32>(-1.0, -1.0)).rgb;
-    let c1 = textureSample(t_src0, s_linear, in.uv + texel * vec2<f32>( 1.0, -1.0)).rgb;
-    let c2 = textureSample(t_src0, s_linear, in.uv + texel * vec2<f32>(-1.0,  1.0)).rgb;
-    let c3 = textureSample(t_src0, s_linear, in.uv + texel * vec2<f32>( 1.0,  1.0)).rgb;
+    let c0 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>(-1.0, -1.0)).rgb;
+    let c1 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>( 1.0, -1.0)).rgb;
+    let c2 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>(-1.0,  1.0)).rgb;
+    let c3 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>( 1.0,  1.0)).rgb;
     let c = (c0 + c1 + c2 + c3) * 0.25;
 
     let luma = max(c.r, max(c.g, c.b));
@@ -71,16 +234,15 @@ fn fs_bloom_extract(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_bloom_blur(in: VsOut) -> @location(0) vec4<f32> {
     let step = vec2<f32>(u.params1.x, u.params1.y);
-    // 9-tap separable Gaussian kernel.
-    var sum = textureSample(t_src0, s_linear, in.uv).rgb * 0.227027;
-    sum = sum + textureSample(t_src0, s_linear, in.uv + step * 1.0).rgb * 0.1945946;
-    sum = sum + textureSample(t_src0, s_linear, in.uv - step * 1.0).rgb * 0.1945946;
-    sum = sum + textureSample(t_src0, s_linear, in.uv + step * 2.0).rgb * 0.1216216;
-    sum = sum + textureSample(t_src0, s_linear, in.uv - step * 2.0).rgb * 0.1216216;
-    sum = sum + textureSample(t_src0, s_linear, in.uv + step * 3.0).rgb * 0.054054;
-    sum = sum + textureSample(t_src0, s_linear, in.uv - step * 3.0).rgb * 0.054054;
-    sum = sum + textureSample(t_src0, s_linear, in.uv + step * 4.0).rgb * 0.016216;
-    sum = sum + textureSample(t_src0, s_linear, in.uv - step * 4.0).rgb * 0.016216;
+    var sum = textureSample(t_src0, s_samp, in.uv).rgb * 0.227027;
+    sum = sum + textureSample(t_src0, s_samp, in.uv + step * 1.0).rgb * 0.1945946;
+    sum = sum + textureSample(t_src0, s_samp, in.uv - step * 1.0).rgb * 0.1945946;
+    sum = sum + textureSample(t_src0, s_samp, in.uv + step * 2.0).rgb * 0.1216216;
+    sum = sum + textureSample(t_src0, s_samp, in.uv - step * 2.0).rgb * 0.1216216;
+    sum = sum + textureSample(t_src0, s_samp, in.uv + step * 3.0).rgb * 0.054054;
+    sum = sum + textureSample(t_src0, s_samp, in.uv - step * 3.0).rgb * 0.054054;
+    sum = sum + textureSample(t_src0, s_samp, in.uv + step * 4.0).rgb * 0.016216;
+    sum = sum + textureSample(t_src0, s_samp, in.uv - step * 4.0).rgb * 0.016216;
     return vec4<f32>(sum, 1.0);
 }
 
@@ -94,25 +256,21 @@ fn aces_curve(x: vec3<f32>) -> vec3<f32> {
 }
 
 fn filmic_tonemap_hdr(hdr: vec3<f32>) -> vec3<f32> {
-    // Convert sRGB-like scene values to linear, apply normalized ACES filmic shoulder for HDR > 1.0,
-    // and map back so UI whites (1.0) remain crisp pure white while HDR explosions & sun glints roll off smoothly.
     let lin = pow(max(hdr, vec3<f32>(0.0)), vec3<f32>(2.2));
     let mapped = aces_curve(lin * 1.12);
     let white_scale = vec3<f32>(1.0) / aces_curve(vec3<f32>(1.12));
     let srgb = pow(clamp(mapped * white_scale, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
-    // Blend 65% filmic with 35% soft Reinhard to preserve authentic Zero Hour UI & desert midtones.
     let soft = hdr / (vec3<f32>(1.0) + max(hdr - vec3<f32>(0.85), vec3<f32>(0.0)) * 0.55);
     return clamp(mix(soft, srgb, 0.65), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
-    let raw = textureSample(t_src0, s_linear, in.uv);
+    let raw = textureSample(t_src0, s_samp, in.uv);
     let post_enabled = u.params0.x > 0.5;
     let split_x = u.params0.y;
     let texel = vec2<f32>(u.params0.z, u.params0.w);
 
-    // Split-screen A/B divider line (warm tactical amber-gold).
     if (split_x > 0.0 && abs(in.uv.x - split_x) < texel.x * 1.5) {
         return vec4<f32>(1.0, 0.82, 0.28, 1.0);
     }
@@ -122,26 +280,23 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(clamp(raw.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), raw.a);
     }
 
-    // AMD FidelityFX-style Contrast-Adaptive Sharpening (5-tap cross, local min/max clamped to avoid ringing).
-    let n = textureSample(t_src0, s_linear, in.uv + vec2<f32>(0.0, -texel.y)).rgb;
-    let s = textureSample(t_src0, s_linear, in.uv + vec2<f32>(0.0,  texel.y)).rgb;
-    let e = textureSample(t_src0, s_linear, in.uv + vec2<f32>( texel.x, 0.0)).rgb;
-    let w = textureSample(t_src0, s_linear, in.uv + vec2<f32>(-texel.x, 0.0)).rgb;
+    // AMD FidelityFX-style Contrast-Adaptive Sharpening (5-tap cross, clamped to avoid halos).
+    let n = textureSample(t_src0, s_samp, in.uv + vec2<f32>(0.0, -texel.y)).rgb;
+    let s = textureSample(t_src0, s_samp, in.uv + vec2<f32>(0.0,  texel.y)).rgb;
+    let e = textureSample(t_src0, s_samp, in.uv + vec2<f32>( texel.x, 0.0)).rgb;
+    let w = textureSample(t_src0, s_samp, in.uv + vec2<f32>(-texel.x, 0.0)).rgb;
     let min_rgb = min(raw.rgb, min(min(n, s), min(e, w)));
     let max_rgb = max(raw.rgb, max(max(n, s), max(e, w)));
     let amp = clamp(min(min_rgb, vec3<f32>(2.0) - max_rgb) / max(max_rgb, vec3<f32>(0.001)), vec3<f32>(0.0), vec3<f32>(1.0));
-    let weight = sqrt(amp) * (-0.145); // moderate tactical sharpening (no haloing)
+    let weight = sqrt(amp) * (-0.145);
     let sharp = (raw.rgb + (n + s + e + w) * weight) / (vec3<f32>(1.0) + 4.0 * weight);
     let cas_rgb = clamp(sharp, min_rgb * 0.92, max_rgb * 1.08);
 
-    // Add quarter-res HDR bloom.
-    let bloom = textureSample(t_src1, s_linear, in.uv).rgb;
+    let bloom = textureSample(t_src1, s_samp, in.uv).rgb;
     let hdr = max(cas_rgb + bloom * u.params1.w, vec3<f32>(0.0));
 
-    // Normalized filmic HDR tonemapping.
     var col = filmic_tonemap_hdr(hdr);
 
-    // Subtle tactical vibrance (+8% on desaturated colors without clipping already-vivid colors).
     let luma = dot(col, vec3<f32>(0.299, 0.587, 0.114));
     let max_c = max(col.r, max(col.g, col.b));
     let min_c = min(col.r, min(col.g, col.b));
@@ -149,7 +304,6 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let vib = (1.0 - sat) * 0.08;
     col = clamp(mix(vec3<f32>(luma), col, 1.0 + vib), vec3<f32>(0.0), vec3<f32>(1.0));
 
-    // Subtle cinematic edge vignette (keeps center 100% untouched).
     let centered = in.uv * 2.0 - vec2<f32>(1.0);
     let vig = 1.0 - dot(centered, centered) * 0.055;
     col = col * clamp(vig, 0.88, 1.0);
@@ -202,13 +356,17 @@ impl ImageTarget {
     }
 }
 
-/// Manages the Vulkan 1.3 HDR scene target (`R16G16B16A16_SFLOAT`), quarter-res bloom ping-pong buffers,
-/// and fullscreen composite pass (filmic tonemapping + CAS sharpening + A/B split-screen).
+/// Manages the Vulkan 1.3 HDR scene target (`R16G16B16A16_SFLOAT`), half-res bilateral SSAO buffers,
+/// quarter-res bloom ping-pong buffers, and fullscreen composite pass.
 pub struct PostProcessPipeline {
     hdr_scene: ImageTarget,
     bloom_a: ImageTarget,
     bloom_b: ImageTarget,
-    sampler: vk::Sampler,
+    ssao_a: ImageTarget,
+    ssao_b: ImageTarget,
+    depth_sample_view: vk::ImageView,
+    linear_sampler: vk::Sampler,
+    nearest_sampler: vk::Sampler,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -216,15 +374,25 @@ pub struct PostProcessPipeline {
     set_blur_h: vk::DescriptorSet,
     set_blur_v: vk::DescriptorSet,
     set_composite: vk::DescriptorSet,
+    set_ssao_raw: vk::DescriptorSet,
+    set_ssao_blur_h: vk::DescriptorSet,
+    set_ssao_blur_v: vk::DescriptorSet,
+    set_ssao_apply: vk::DescriptorSet,
     params_ubo: GpuBuffer,
     slot_stride: usize,
     vs_module: vk::ShaderModule,
     fs_extract_module: vk::ShaderModule,
     fs_blur_module: vk::ShaderModule,
     fs_composite_module: vk::ShaderModule,
+    fs_ssao_raw_module: vk::ShaderModule,
+    fs_ssao_blur_module: vk::ShaderModule,
+    fs_ssao_apply_module: vk::ShaderModule,
     extract_pipeline: vk::Pipeline,
     blur_pipeline: vk::Pipeline,
     composite_pipeline: vk::Pipeline,
+    ssao_raw_pipeline: vk::Pipeline,
+    ssao_blur_pipeline: vk::Pipeline,
+    ssao_apply_pipeline: vk::Pipeline,
     output_format: vk::Format,
 }
 
@@ -234,29 +402,44 @@ impl PostProcessPipeline {
         width: u32,
         height: u32,
         output_format: vk::Format,
+        depth_sample_view: vk::ImageView,
         frames_in_flight: usize,
     ) -> Result<Self> {
         let w = width.max(1);
         let h = height.max(1);
         let bw = (w / 4).max(1);
         let bh = (h / 4).max(1);
+        let sw = (w / 2).max(1);
+        let sh = (h / 2).max(1);
 
         let hdr_scene = ImageTarget::new(ctx, "zhr_hdr_scene", w, h)?;
         let bloom_a = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let bloom_b = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
+        let ssao_a = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
+        let ssao_b = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
 
-        // Transition bloom buffers to SHADER_READ_ONLY_OPTIMAL initially so passthrough mode is always valid.
-        transition_images_to_shader_read(ctx, &[bloom_a.image, bloom_b.image])?;
+        transition_images_to_shader_read(
+            ctx,
+            &[bloom_a.image, bloom_b.image, ssao_a.image, ssao_b.image],
+        )?;
 
-        let sampler_info = vk::SamplerCreateInfo::default()
+        let linear_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
             .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let nearest_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         // SAFETY: `device` is valid.
-        let sampler = unsafe { ctx.device.create_sampler(&sampler_info, None)? };
+        let linear_sampler = unsafe { ctx.device.create_sampler(&linear_info, None)? };
+        let nearest_sampler = unsafe { ctx.device.create_sampler(&nearest_info, None)? };
 
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -295,37 +478,34 @@ impl PostProcessPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 8,
+                descriptor_count: 16,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: 4,
+                descriptor_count: 8,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                descriptor_count: 4,
+                descriptor_count: 8,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(4)
+            .max_sets(8)
             .pool_sizes(&pool_sizes);
         // SAFETY: `device` is valid.
         let descriptor_pool = unsafe { ctx.device.create_descriptor_pool(&pool_info, None)? };
 
-        let alloc_layouts = [set_layout; 4];
+        let alloc_layouts = [set_layout; 8];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&alloc_layouts);
-        // SAFETY: Pool has room for 4 sets.
+        // SAFETY: Pool has room for 8 sets.
         let sets = unsafe { ctx.device.allocate_descriptor_sets(&alloc_info)? };
-        let (set_extract, set_blur_h, set_blur_v, set_composite) =
-            (sets[0], sets[1], sets[2], sets[3]);
 
-        // 4 passes per frame * frames_in_flight, each aligned to `min_uniform_offset_alignment`.
         let align = ctx.min_uniform_offset_alignment as usize;
         let param_size = std::mem::size_of::<PostParams>();
         let slot_stride = param_size.div_ceil(align) * align;
-        let total_ubo_bytes = (slot_stride * 4 * frames_in_flight.max(1)) as u64;
+        let total_ubo_bytes = (slot_stride * SLOTS_PER_FRAME * frames_in_flight.max(1)) as u64;
         let params_ubo = GpuBuffer::new(
             ctx,
             "zhr_postprocess_ubo",
@@ -351,11 +531,26 @@ impl PostProcessPipeline {
             naga::ShaderStage::Fragment,
             "fs_composite",
         )?;
+        let fs_ssao_raw_spv =
+            compile_wgsl_to_spirv(POSTPROCESS_WGSL, naga::ShaderStage::Fragment, "fs_ssao_raw")?;
+        let fs_ssao_blur_spv = compile_wgsl_to_spirv(
+            POSTPROCESS_WGSL,
+            naga::ShaderStage::Fragment,
+            "fs_ssao_blur",
+        )?;
+        let fs_ssao_apply_spv = compile_wgsl_to_spirv(
+            POSTPROCESS_WGSL,
+            naga::ShaderStage::Fragment,
+            "fs_ssao_apply",
+        )?;
 
         let vs_module = create_shader_module(&ctx.device, &vs_spv)?;
         let fs_extract_module = create_shader_module(&ctx.device, &fs_extract_spv)?;
         let fs_blur_module = create_shader_module(&ctx.device, &fs_blur_spv)?;
         let fs_composite_module = create_shader_module(&ctx.device, &fs_comp_spv)?;
+        let fs_ssao_raw_module = create_shader_module(&ctx.device, &fs_ssao_raw_spv)?;
+        let fs_ssao_blur_module = create_shader_module(&ctx.device, &fs_ssao_blur_spv)?;
+        let fs_ssao_apply_module = create_shader_module(&ctx.device, &fs_ssao_apply_spv)?;
 
         let extract_pipeline = create_fullscreen_pipeline(
             &ctx.device,
@@ -364,6 +559,7 @@ impl PostProcessPipeline {
             fs_extract_module,
             c"fs_bloom_extract",
             HDR_FORMAT,
+            false,
         )?;
         let blur_pipeline = create_fullscreen_pipeline(
             &ctx.device,
@@ -372,6 +568,7 @@ impl PostProcessPipeline {
             fs_blur_module,
             c"fs_bloom_blur",
             HDR_FORMAT,
+            false,
         )?;
         let composite_pipeline = create_fullscreen_pipeline(
             &ctx.device,
@@ -380,29 +577,71 @@ impl PostProcessPipeline {
             fs_composite_module,
             c"fs_composite",
             output_format,
+            false,
+        )?;
+        let ssao_raw_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_ssao_raw_module,
+            c"fs_ssao_raw",
+            HDR_FORMAT,
+            false,
+        )?;
+        let ssao_blur_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_ssao_blur_module,
+            c"fs_ssao_blur",
+            HDR_FORMAT,
+            false,
+        )?;
+        let ssao_apply_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_ssao_apply_module,
+            c"fs_ssao_apply",
+            HDR_FORMAT,
+            true,
         )?;
 
         let me = Self {
             hdr_scene,
             bloom_a,
             bloom_b,
-            sampler,
+            ssao_a,
+            ssao_b,
+            depth_sample_view,
+            linear_sampler,
+            nearest_sampler,
             set_layout,
             pipeline_layout,
             descriptor_pool,
-            set_extract,
-            set_blur_h,
-            set_blur_v,
-            set_composite,
+            set_extract: sets[0],
+            set_blur_h: sets[1],
+            set_blur_v: sets[2],
+            set_composite: sets[3],
+            set_ssao_raw: sets[4],
+            set_ssao_blur_h: sets[5],
+            set_ssao_blur_v: sets[6],
+            set_ssao_apply: sets[7],
             params_ubo,
             slot_stride,
             vs_module,
             fs_extract_module,
             fs_blur_module,
             fs_composite_module,
+            fs_ssao_raw_module,
+            fs_ssao_blur_module,
+            fs_ssao_apply_module,
             extract_pipeline,
             blur_pipeline,
             composite_pipeline,
+            ssao_raw_pipeline,
+            ssao_blur_pipeline,
+            ssao_apply_pipeline,
             output_format,
         };
         me.update_descriptors(&ctx.device);
@@ -423,23 +662,37 @@ impl PostProcessPipeline {
         width: u32,
         height: u32,
         output_format: vk::Format,
+        depth_sample_view: vk::ImageView,
     ) -> Result<()> {
         let w = width.max(1);
         let h = height.max(1);
         let bw = (w / 4).max(1);
         let bh = (h / 4).max(1);
+        let sw = (w / 2).max(1);
+        let sh = (h / 2).max(1);
 
         let new_hdr = ImageTarget::new(ctx, "zhr_hdr_scene", w, h)?;
         let new_ba = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let new_bb = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
-        transition_images_to_shader_read(ctx, &[new_ba.image, new_bb.image])?;
+        let new_sa = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
+        let new_sb = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
+        transition_images_to_shader_read(
+            ctx,
+            &[new_ba.image, new_bb.image, new_sa.image, new_sb.image],
+        )?;
 
         let old_hdr = std::mem::replace(&mut self.hdr_scene, new_hdr);
         let old_ba = std::mem::replace(&mut self.bloom_a, new_ba);
         let old_bb = std::mem::replace(&mut self.bloom_b, new_bb);
+        let old_sa = std::mem::replace(&mut self.ssao_a, new_sa);
+        let old_sb = std::mem::replace(&mut self.ssao_b, new_sb);
         old_hdr.destroy(ctx);
         old_ba.destroy(ctx);
         old_bb.destroy(ctx);
+        old_sa.destroy(ctx);
+        old_sb.destroy(ctx);
+
+        self.depth_sample_view = depth_sample_view;
 
         if output_format != self.output_format {
             let new_comp = create_fullscreen_pipeline(
@@ -449,6 +702,7 @@ impl PostProcessPipeline {
                 self.fs_composite_module,
                 c"fs_composite",
                 output_format,
+                false,
             )?;
             // SAFETY: Device is idle during resize.
             unsafe { ctx.device.destroy_pipeline(self.composite_pipeline, None) };
@@ -461,14 +715,18 @@ impl PostProcessPipeline {
     }
 
     fn update_descriptors(&self, device: &ash::Device) {
-        let write_set = |set: vk::DescriptorSet, view0: vk::ImageView, view1: vk::ImageView| {
+        let write_set = |set: vk::DescriptorSet,
+                         view0: vk::ImageView,
+                         layout0: vk::ImageLayout,
+                         view1: vk::ImageView,
+                         sampler: vk::Sampler| {
             let img0 = [vk::DescriptorImageInfo::default()
                 .image_view(view0)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                .image_layout(layout0)];
             let img1 = [vk::DescriptorImageInfo::default()
                 .image_view(view1)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let samp = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+            let samp = [vk::DescriptorImageInfo::default().sampler(sampler)];
             let ubo = [vk::DescriptorBufferInfo::default()
                 .buffer(self.params_ubo.buffer)
                 .offset(0)
@@ -499,10 +757,302 @@ impl PostProcessPipeline {
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         };
 
-        write_set(self.set_extract, self.hdr_scene.view, self.hdr_scene.view);
-        write_set(self.set_blur_h, self.bloom_a.view, self.bloom_a.view);
-        write_set(self.set_blur_v, self.bloom_b.view, self.bloom_b.view);
-        write_set(self.set_composite, self.hdr_scene.view, self.bloom_a.view);
+        let sro = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let dsro = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+        write_set(
+            self.set_extract,
+            self.hdr_scene.view,
+            sro,
+            self.bloom_a.view,
+            self.linear_sampler,
+        );
+        write_set(
+            self.set_blur_h,
+            self.bloom_a.view,
+            sro,
+            self.bloom_a.view,
+            self.linear_sampler,
+        );
+        write_set(
+            self.set_blur_v,
+            self.bloom_b.view,
+            sro,
+            self.bloom_b.view,
+            self.linear_sampler,
+        );
+        write_set(
+            self.set_composite,
+            self.hdr_scene.view,
+            sro,
+            self.bloom_a.view,
+            self.linear_sampler,
+        );
+
+        // SSAO passes: bind bloom_a (always in SHADER_READ_ONLY_OPTIMAL during SSAO) as dummy t_src1.
+        write_set(
+            self.set_ssao_raw,
+            self.depth_sample_view,
+            dsro,
+            self.bloom_a.view,
+            self.nearest_sampler,
+        );
+        write_set(
+            self.set_ssao_blur_h,
+            self.ssao_a.view,
+            sro,
+            self.bloom_a.view,
+            self.linear_sampler,
+        );
+        write_set(
+            self.set_ssao_blur_v,
+            self.ssao_b.view,
+            sro,
+            self.bloom_a.view,
+            self.linear_sampler,
+        );
+        write_set(
+            self.set_ssao_apply,
+            self.ssao_a.view,
+            sro,
+            self.bloom_a.view,
+            self.linear_sampler,
+        );
+    }
+
+    /// Computes half-res depth-based bilateral SSAO and multiplies it directly into `hdr_scene`.
+    /// Must be called outside dynamic rendering while `hdr_scene` is in `COLOR_ATTACHMENT_OPTIMAL`
+    /// and `depth_image` is in `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`. Leaves both images in those same layouts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_ssao(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+        depth_image: vk::Image,
+        depth_format: vk::Format,
+        proj: Mat4,
+        settings: GraphicsSettings,
+    ) -> Result<()> {
+        if settings.mode == GraphicsMode::Classic || !settings.pbr_lighting {
+            return Ok(());
+        }
+        // Only run SSAO for perspective 3D projections (m32 != 0).
+        let cols = proj.to_cols_array_2d();
+        let m00 = cols[0][0];
+        let m11 = cols[1][1];
+        let m22 = cols[2][2];
+        let m32 = cols[3][2];
+        if m00.abs() < 1e-4 || m11.abs() < 1e-4 || m32.abs() < 1e-5 {
+            return Ok(());
+        }
+
+        let split_x_uv = if settings.mode == GraphicsMode::SplitScreen {
+            0.5
+        } else {
+            -1.0
+        };
+        let base_slot = frame_slot * SLOTS_PER_FRAME + 4;
+        let off_raw = (base_slot * self.slot_stride) as u32;
+        let off_bh = ((base_slot + 1) * self.slot_stride) as u32;
+        let off_bv = ((base_slot + 2) * self.slot_stride) as u32;
+        let off_apply = ((base_slot + 3) * self.slot_stride) as u32;
+
+        let inv_sw = 1.0 / (self.ssao_a.width.max(1) as f32);
+        let inv_sh = 1.0 / (self.ssao_a.height.max(1) as f32);
+        let proj_unpack = [1.0 / m00.abs(), 1.0 / m11.abs(), m22, m32];
+
+        let p_raw = PostParams {
+            params0: [1.0, split_x_uv, inv_sw, inv_sh],
+            params1: [0.0, 0.0, 0.0, 1.85],
+            params2: proj_unpack,
+        };
+        let p_bh = PostParams {
+            params0: [1.0, split_x_uv, inv_sw, inv_sh],
+            params1: [inv_sw, 0.0, 0.0, 0.0],
+            params2: proj_unpack,
+        };
+        let p_bv = PostParams {
+            params0: [1.0, split_x_uv, inv_sw, inv_sh],
+            params1: [0.0, inv_sh, 0.0, 0.0],
+            params2: proj_unpack,
+        };
+        let p_apply = PostParams {
+            params0: [1.0, split_x_uv, inv_sw, inv_sh],
+            params1: [0.0, 0.0, 0.0, 1.0],
+            params2: proj_unpack,
+        };
+
+        self.params_ubo
+            .write_bytes(off_raw as usize, bytemuck::bytes_of(&p_raw))?;
+        self.params_ubo
+            .write_bytes(off_bh as usize, bytemuck::bytes_of(&p_bh))?;
+        self.params_ubo
+            .write_bytes(off_bv as usize, bytemuck::bytes_of(&p_bv))?;
+        self.params_ubo
+            .write_bytes(off_apply as usize, bytemuck::bytes_of(&p_apply))?;
+
+        let depth_aspect = depth_barrier_aspect(depth_format);
+
+        // Transition depth attachment -> DEPTH_STENCIL_READ_ONLY_OPTIMAL for SSAO sampling.
+        cmd_depth_barrier(
+            device,
+            cmd,
+            depth_image,
+            depth_aspect,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        );
+
+        let ssao_extent = vk::Extent2D {
+            width: self.ssao_a.width,
+            height: self.ssao_a.height,
+        };
+
+        // Pass 1: Raw 12-tap spiral SSAO -> ssao_a.
+        cmd_barrier(
+            device,
+            cmd,
+            self.ssao_a.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.ssao_a.view,
+            ssao_extent,
+            self.ssao_raw_pipeline,
+            self.pipeline_layout,
+            self.set_ssao_raw,
+            off_raw,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.ssao_a.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // Pass 2: Bilateral horizontal blur -> ssao_b.
+        cmd_barrier(
+            device,
+            cmd,
+            self.ssao_b.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.ssao_b.view,
+            ssao_extent,
+            self.ssao_blur_pipeline,
+            self.pipeline_layout,
+            self.set_ssao_blur_h,
+            off_bh,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.ssao_b.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // Pass 3: Bilateral vertical blur -> ssao_a.
+        cmd_barrier(
+            device,
+            cmd,
+            self.ssao_a.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.ssao_a.view,
+            ssao_extent,
+            self.ssao_blur_pipeline,
+            self.pipeline_layout,
+            self.set_ssao_blur_v,
+            off_bv,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.ssao_a.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // Pass 4: Multiply smooth SSAO directly into hdr_scene (load_op = LOAD, DST_COLOR * ZERO).
+        let hdr_extent = vk::Extent2D {
+            width: self.hdr_scene.width,
+            height: self.hdr_scene.height,
+        };
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.hdr_scene.view,
+            hdr_extent,
+            self.ssao_apply_pipeline,
+            self.pipeline_layout,
+            self.set_ssao_apply,
+            off_apply,
+            true,
+        );
+
+        // Transition depth back -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL for remaining passes / next frame.
+        cmd_depth_barrier(
+            device,
+            cmd,
+            depth_image,
+            depth_aspect,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        );
+
+        Ok(())
     }
 
     /// Runs HDR bloom (if enabled) and composites the HDR scene into `target_image`/`target_view`.
@@ -526,7 +1076,7 @@ impl PostProcessPipeline {
             -1.0
         };
 
-        let base_slot = frame_slot * 4;
+        let base_slot = frame_slot * SLOTS_PER_FRAME;
         let off_extract = (base_slot * self.slot_stride) as u32;
         let off_blur_h = ((base_slot + 1) * self.slot_stride) as u32;
         let off_blur_v = ((base_slot + 2) * self.slot_stride) as u32;
@@ -540,14 +1090,17 @@ impl PostProcessPipeline {
         let p_extract = PostParams {
             params0: [1.0, split_x_uv, inv_w, inv_h],
             params1: [0.0, 0.0, 1.02, 0.0],
+            params2: [0.0; 4],
         };
         let p_blur_h = PostParams {
             params0: [1.0, split_x_uv, inv_bw, inv_bh],
             params1: [inv_bw, 0.0, 0.0, 0.0],
+            params2: [0.0; 4],
         };
         let p_blur_v = PostParams {
             params0: [1.0, split_x_uv, inv_bw, inv_bh],
             params1: [0.0, inv_bh, 0.0, 0.0],
+            params2: [0.0; 4],
         };
         let p_comp = PostParams {
             params0: [
@@ -557,6 +1110,7 @@ impl PostProcessPipeline {
                 inv_h,
             ],
             params1: [0.0, 0.0, 1.02, 0.34],
+            params2: [0.0; 4],
         };
 
         self.params_ubo
@@ -588,7 +1142,6 @@ impl PostProcessPipeline {
                 height: self.bloom_a.height,
             };
 
-            // Extract HDR brights -> bloom_a.
             cmd_barrier(
                 device,
                 cmd,
@@ -609,6 +1162,7 @@ impl PostProcessPipeline {
                 self.pipeline_layout,
                 self.set_extract,
                 off_extract,
+                false,
             );
             cmd_barrier(
                 device,
@@ -622,7 +1176,6 @@ impl PostProcessPipeline {
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             );
 
-            // Blur horizontal: bloom_a -> bloom_b.
             cmd_barrier(
                 device,
                 cmd,
@@ -643,6 +1196,7 @@ impl PostProcessPipeline {
                 self.pipeline_layout,
                 self.set_blur_h,
                 off_blur_h,
+                false,
             );
             cmd_barrier(
                 device,
@@ -656,7 +1210,6 @@ impl PostProcessPipeline {
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             );
 
-            // Blur vertical: bloom_b -> bloom_a.
             cmd_barrier(
                 device,
                 cmd,
@@ -677,6 +1230,7 @@ impl PostProcessPipeline {
                 self.pipeline_layout,
                 self.set_blur_v,
                 off_blur_v,
+                false,
             );
             cmd_barrier(
                 device,
@@ -712,6 +1266,7 @@ impl PostProcessPipeline {
             self.pipeline_layout,
             self.set_composite,
             off_comp,
+            false,
         );
 
         Ok(())
@@ -721,12 +1276,17 @@ impl PostProcessPipeline {
         self.hdr_scene.destroy(ctx);
         self.bloom_a.destroy(ctx);
         self.bloom_b.destroy(ctx);
+        self.ssao_a.destroy(ctx);
+        self.ssao_b.destroy(ctx);
         self.params_ubo.destroy(ctx);
         // SAFETY: Caller ensures GPU is idle.
         unsafe {
             ctx.device.destroy_pipeline(self.extract_pipeline, None);
             ctx.device.destroy_pipeline(self.blur_pipeline, None);
             ctx.device.destroy_pipeline(self.composite_pipeline, None);
+            ctx.device.destroy_pipeline(self.ssao_raw_pipeline, None);
+            ctx.device.destroy_pipeline(self.ssao_blur_pipeline, None);
+            ctx.device.destroy_pipeline(self.ssao_apply_pipeline, None);
             ctx.device.destroy_shader_module(self.vs_module, None);
             ctx.device
                 .destroy_shader_module(self.fs_extract_module, None);
@@ -734,13 +1294,31 @@ impl PostProcessPipeline {
             ctx.device
                 .destroy_shader_module(self.fs_composite_module, None);
             ctx.device
+                .destroy_shader_module(self.fs_ssao_raw_module, None);
+            ctx.device
+                .destroy_shader_module(self.fs_ssao_blur_module, None);
+            ctx.device
+                .destroy_shader_module(self.fs_ssao_apply_module, None);
+            ctx.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             ctx.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             ctx.device
                 .destroy_descriptor_set_layout(self.set_layout, None);
-            ctx.device.destroy_sampler(self.sampler, None);
+            ctx.device.destroy_sampler(self.linear_sampler, None);
+            ctx.device.destroy_sampler(self.nearest_sampler, None);
         }
+    }
+}
+
+fn depth_barrier_aspect(format: vk::Format) -> vk::ImageAspectFlags {
+    if matches!(
+        format,
+        vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D24_UNORM_S8_UINT
+    ) {
+        vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+    } else {
+        vk::ImageAspectFlags::DEPTH
     }
 }
 
@@ -754,11 +1332,16 @@ fn draw_fullscreen_pass(
     layout: vk::PipelineLayout,
     set: vk::DescriptorSet,
     dyn_offset: u32,
+    preserve_dst: bool,
 ) {
     let color_att = [vk::RenderingAttachmentInfo::default()
         .image_view(view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .load_op(if preserve_dst {
+            vk::AttachmentLoadOp::LOAD
+        } else {
+            vk::AttachmentLoadOp::DONT_CARE
+        })
         .store_op(vk::AttachmentStoreOp::STORE)];
     let info = vk::RenderingInfo::default()
         .render_area(vk::Rect2D {
@@ -833,6 +1416,40 @@ fn cmd_barrier(
     unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cmd_depth_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    aspect: vk::ImageAspectFlags,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+) {
+    let barrier = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(aspect)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        )];
+    let dep = vk::DependencyInfo::default().image_memory_barriers(&barrier);
+    // SAFETY: Valid image barrier on recording command buffer.
+    unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
+}
+
 fn transition_images_to_shader_read(ctx: &VkContext, images: &[vk::Image]) -> Result<()> {
     ctx.submit_immediate(|device, cmd| {
         for &img in images {
@@ -888,6 +1505,7 @@ fn create_fullscreen_pipeline(
     fs: vk::ShaderModule,
     fs_entry: &std::ffi::CStr,
     color_format: vk::Format,
+    multiply_blend: bool,
 ) -> Result<vk::Pipeline> {
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -915,9 +1533,25 @@ fn create_fullscreen_pipeline(
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(false)
         .depth_write_enable(false);
-    let blend_att = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)
-        .blend_enable(false)];
+    let blend_att = [if multiply_blend {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B,
+            )
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::DST_COLOR)
+            .dst_color_blend_factor(vk::BlendFactor::ZERO)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+            .alpha_blend_op(vk::BlendOp::ADD)
+    } else {
+        vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false)
+    }];
     let color_blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_att);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state =

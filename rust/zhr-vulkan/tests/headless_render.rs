@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
-use zhr_vulkan::shader::ShaderKey;
+use zhr_vulkan::shader::{DepthCompare, DstBlend, ShaderKey, SrcBlend, StencilOp, StencilState};
 use zhr_vulkan::types::{
     ClearState, FogState, GpuLight, GraphicsSettings, SamplerDesc, TextureFormat, VertexWw3d,
     Viewport, look_at_lh, ortho_2d, perspective_lh,
@@ -516,6 +516,166 @@ fn remastered_pbr_hdr_bloom_mipmaps_and_split_screen_render_cleanly() {
         split[mid + 2]
     );
 
+    assert_eq!(r.validation_error_count(), 0);
+}
+
+#[test]
+fn hardware_stencil_shadow_volume_and_pre_ui_ssao_work_with_zero_validation_errors() {
+    let width = 128u32;
+    let height = 128u32;
+    let mut r = make_headless(width, height);
+    r.set_graphics_settings(GraphicsSettings::classic());
+
+    r.begin_frame().unwrap();
+    r.set_viewport(Viewport::full(width, height));
+    r.clear(ClearState {
+        clear_color: true,
+        clear_depth_stencil: true,
+        color: [0.8, 0.8, 0.8, 1.0],
+        depth: 1.0,
+        stencil: 0,
+    })
+    .unwrap();
+    r.set_world_identity();
+    r.set_view_identity();
+    r.set_projection(ortho_2d(width as f32, height as f32));
+    r.set_lighting_enabled(false);
+    r.set_texture(None);
+
+    // Pass 1: Write stencil = 1 inside center 64x64 box with color_write = false (like W3DVolumetricShadow).
+    let mask_shader = ShaderKey::build(
+        DepthCompare::Always,
+        false,
+        false, // color_write OFF
+        SrcBlend::One,
+        DstBlend::Zero,
+        false,
+        false,
+        false,
+        false,
+    );
+    r.set_shader(mask_shader);
+    r.set_stencil(StencilState {
+        enabled: true,
+        func: DepthCompare::Always,
+        fail_op: StencilOp::Keep,
+        depth_fail_op: StencilOp::Keep,
+        pass_op: StencilOp::IncrWrap,
+        compare_mask: 0xFF,
+        write_mask: 0xFF,
+        reference: 1,
+    });
+    let center_box = [
+        VertexWw3d::colored([32.0, 32.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+        VertexWw3d::colored([96.0, 32.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+        VertexWw3d::colored([96.0, 96.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+        VertexWw3d::colored([32.0, 96.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+    ];
+    r.draw_dynamic(&center_box, &[0, 1, 2, 0, 2, 3]).unwrap();
+
+    // Pass 2: Fullscreen multiplicative shadow quad matching W3DVolumetricShadowManager::renderStencilShadows
+    // (SRCBLEND=DESTCOLOR, DESTBLEND=ZERO, STENCILFUNC=LESSEQUAL, STENCILREF=1 -> passes where stencil >= 1).
+    let shadow_quad_shader = ShaderKey::build(
+        DepthCompare::Always,
+        false,
+        true,
+        SrcBlend::DstColor,
+        DstBlend::Zero,
+        false,
+        false,
+        false,
+        false,
+    );
+    r.set_shader(shadow_quad_shader);
+    r.set_stencil(StencilState {
+        enabled: true,
+        func: DepthCompare::LessEqual,
+        fail_op: StencilOp::Keep,
+        depth_fail_op: StencilOp::Keep,
+        pass_op: StencilOp::Keep,
+        compare_mask: 0x7F,
+        write_mask: 0xFF,
+        reference: 1,
+    });
+    let full_quad = [
+        VertexWw3d::colored([0.0, 0.0, 0.0], [0.5, 0.5, 0.5, 1.0]),
+        VertexWw3d::colored([128.0, 0.0, 0.0], [0.5, 0.5, 0.5, 1.0]),
+        VertexWw3d::colored([128.0, 128.0, 0.0], [0.5, 0.5, 0.5, 1.0]),
+        VertexWw3d::colored([0.0, 128.0, 0.0], [0.5, 0.5, 0.5, 1.0]),
+    ];
+    r.draw_dynamic(&full_quad, &[0, 1, 2, 0, 2, 3]).unwrap();
+    r.set_stencil(StencilState::default());
+    r.end_frame().unwrap();
+
+    let pixels = r.readback_rgba8().unwrap();
+    let sample = |x: u32, y: u32| pixels[((y * width + x) * 4) as usize];
+    // Outside center box: untouched (~204 = 0.8 * 255).
+    assert!(
+        (sample(8, 8) as i32 - 204).abs() <= 3,
+        "outside stencil must stay ~204, got {}",
+        sample(8, 8)
+    );
+    // Inside center box: darkened by 0.5x (~102 = 0.4 * 255).
+    assert!(
+        (sample(64, 64) as i32 - 102).abs() <= 3,
+        "inside stencil must darken to ~102, got {}",
+        sample(64, 64)
+    );
+
+    // Also exercise 3D + pre-UI SSAO + 2D HUD overlay transition in Remastered mode.
+    r.set_graphics_settings(GraphicsSettings::remastered());
+    let (cube_verts, cube_indices) = build_unit_cube();
+    let vb = r.create_vertex_buffer(&cube_verts).unwrap();
+    let ib = r.create_index_buffer_u16(&cube_indices).unwrap();
+
+    r.begin_frame().unwrap();
+    r.set_viewport(Viewport::full(width, height));
+    r.clear(ClearState {
+        clear_color: true,
+        clear_depth_stencil: true,
+        color: [0.1, 0.1, 0.12, 1.0],
+        depth: 1.0,
+        stencil: 0,
+    })
+    .unwrap();
+    r.set_world(Mat4::from_rotation_y(0.5));
+    r.set_view(look_at_lh(Vec3::new(1.8, 1.4, -2.5), Vec3::ZERO, Vec3::Y));
+    r.set_projection(perspective_lh(50.0f32.to_radians(), 1.0, 0.1, 100.0));
+    r.set_ambient(Vec3::splat(0.3));
+    r.set_lighting_enabled(true);
+    r.set_light(
+        0,
+        GpuLight::directional(Vec3::new(-0.3, -1.0, 0.5), Vec3::ONE),
+    );
+    r.set_shader(ShaderKey::OPAQUE_3D_UNTEXTURED);
+    r.draw_indexed(vb, ib, cube_indices.len() as u32, 0, 0)
+        .unwrap();
+
+    // 2D UI draw triggers pre-UI SSAO flush before drawing crisp white HUD quad on top!
+    r.set_world_identity();
+    r.set_view_identity();
+    r.set_projection(ortho_2d(width as f32, height as f32));
+    r.set_lighting_enabled(false);
+    r.set_shader(ShaderKey::UI_2D);
+    r.set_texture(None);
+    let ui_quad = [
+        VertexWw3d::colored([4.0, 4.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+        VertexWw3d::colored([28.0, 4.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+        VertexWw3d::colored([28.0, 28.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+        VertexWw3d::colored([4.0, 28.0, 0.0], [1.0, 1.0, 1.0, 1.0]),
+    ];
+    r.draw_dynamic(&ui_quad, &[0, 1, 2, 0, 2, 3]).unwrap();
+    r.end_frame().unwrap();
+
+    let hud_px = r.readback_rgba8().unwrap();
+    let ui_idx = ((16 * width + 16) * 4) as usize;
+    assert!(
+        hud_px[ui_idx] > 225 && hud_px[ui_idx + 1] > 225 && hud_px[ui_idx + 2] > 225,
+        "2D UI drawn after SSAO must stay crisp white, got RGB=({}, {}, {})",
+        hud_px[ui_idx],
+        hud_px[ui_idx + 1],
+        hud_px[ui_idx + 2]
+    );
     assert_eq!(r.validation_error_count(), 0);
 }
 

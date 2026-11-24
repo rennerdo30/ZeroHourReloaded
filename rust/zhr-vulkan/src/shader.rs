@@ -304,6 +304,121 @@ impl DstBlend {
     }
 }
 
+/// Hardware stencil operation matching D3D8 `D3DSTENCILOP` values (1..=8).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum StencilOp {
+    #[default]
+    Keep = 1,
+    Zero = 2,
+    Replace = 3,
+    IncrSat = 4,
+    DecrSat = 5,
+    Invert = 6,
+    IncrWrap = 7,
+    DecrWrap = 8,
+}
+
+impl StencilOp {
+    pub const fn from_d3d(v: u32) -> Self {
+        match v {
+            2 => Self::Zero,
+            3 => Self::Replace,
+            4 => Self::IncrSat,
+            5 => Self::DecrSat,
+            6 => Self::Invert,
+            7 => Self::IncrWrap,
+            8 => Self::DecrWrap,
+            _ => Self::Keep,
+        }
+    }
+
+    pub const fn to_vk(self) -> vk::StencilOp {
+        match self {
+            Self::Keep => vk::StencilOp::KEEP,
+            Self::Zero => vk::StencilOp::ZERO,
+            Self::Replace => vk::StencilOp::REPLACE,
+            Self::IncrSat => vk::StencilOp::INCREMENT_AND_CLAMP,
+            Self::DecrSat => vk::StencilOp::DECREMENT_AND_CLAMP,
+            Self::Invert => vk::StencilOp::INVERT,
+            Self::IncrWrap => vk::StencilOp::INCREMENT_AND_WRAP,
+            Self::DecrWrap => vk::StencilOp::DECREMENT_AND_WRAP,
+        }
+    }
+}
+
+/// Static PSO-cached portion of stencil state (masks & reference are dynamic in Vulkan).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StencilPipelineKey {
+    pub enabled: bool,
+    pub func: DepthCompare,
+    pub fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
+}
+
+impl Default for StencilPipelineKey {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            func: DepthCompare::Always,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            pass_op: StencilOp::Keep,
+        }
+    }
+}
+
+/// Full D3D8-compatible stencil state (static ops + dynamic masks/reference).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StencilState {
+    pub enabled: bool,
+    pub func: DepthCompare,
+    pub fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
+    pub compare_mask: u32,
+    pub write_mask: u32,
+    pub reference: u32,
+}
+
+impl Default for StencilState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            func: DepthCompare::Always,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            pass_op: StencilOp::Keep,
+            compare_mask: 0xFF,
+            write_mask: 0xFF,
+            reference: 0,
+        }
+    }
+}
+
+impl StencilState {
+    pub const fn pipeline_key(self) -> StencilPipelineKey {
+        if !self.enabled {
+            StencilPipelineKey {
+                enabled: false,
+                func: DepthCompare::Always,
+                fail_op: StencilOp::Keep,
+                depth_fail_op: StencilOp::Keep,
+                pass_op: StencilOp::Keep,
+            }
+        } else {
+            StencilPipelineKey {
+                enabled: true,
+                func: self.func,
+                fail_op: self.fail_op,
+                depth_fail_op: self.depth_fail_op,
+                pass_op: self.pass_op,
+            }
+        }
+    }
+}
+
 /// Built-in WW3D2 uber-shader (WGSL -> SPIR-V via naga) supporting:
 /// - World / View / Projection transforms
 /// - Ambient + up to 4 directional/point lights

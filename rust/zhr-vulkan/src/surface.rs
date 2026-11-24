@@ -4,7 +4,7 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use crate::context::VkContext;
 use crate::error::{Result, VkError};
-use crate::offscreen::create_attachment;
+use crate::offscreen::{create_attachment, create_depth_sample_view};
 
 /// Cross-platform Vulkan surface + swapchain + depth attachment.
 pub struct SwapchainState {
@@ -19,6 +19,7 @@ pub struct SwapchainState {
     pub render_finished: Vec<vk::Semaphore>,
     pub depth_image: vk::Image,
     pub depth_view: vk::ImageView,
+    pub depth_sample_view: vk::ImageView,
     depth_alloc: Option<Allocation>,
     pub vsync: bool,
 }
@@ -67,9 +68,11 @@ impl SwapchainState {
             built.extent.width,
             built.extent.height,
             ctx.depth_format,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             vk::ImageAspectFlags::DEPTH,
         )?;
+        let depth_sample_view =
+            create_depth_sample_view(&ctx.device, depth_image, ctx.depth_format)?;
 
         let mut render_finished = Vec::with_capacity(built.images.len());
         let sem_info = vk::SemaphoreCreateInfo::default();
@@ -90,6 +93,7 @@ impl SwapchainState {
             render_finished,
             depth_image,
             depth_view,
+            depth_sample_view,
             depth_alloc: Some(depth_alloc),
             vsync,
         })
@@ -123,6 +127,7 @@ impl SwapchainState {
                 ctx.device.destroy_semaphore(sem, None);
             }
             self.swapchain_loader.destroy_swapchain(old_swapchain, None);
+            ctx.device.destroy_image_view(self.depth_sample_view, None);
             ctx.device.destroy_image_view(self.depth_view, None);
             ctx.device.destroy_image(self.depth_image, None);
         }
@@ -136,9 +141,11 @@ impl SwapchainState {
             built.extent.width,
             built.extent.height,
             ctx.depth_format,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             vk::ImageAspectFlags::DEPTH,
         )?;
+        let depth_sample_view =
+            create_depth_sample_view(&ctx.device, depth_image, ctx.depth_format)?;
 
         let sem_info = vk::SemaphoreCreateInfo::default();
         for _ in 0..built.images.len() {
@@ -154,6 +161,7 @@ impl SwapchainState {
         self.views = built.views;
         self.depth_image = depth_image;
         self.depth_view = depth_view;
+        self.depth_sample_view = depth_sample_view;
         self.depth_alloc = Some(depth_alloc);
         Ok(())
     }
@@ -169,6 +177,7 @@ impl SwapchainState {
             }
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
+            ctx.device.destroy_image_view(self.depth_sample_view, None);
             ctx.device.destroy_image_view(self.depth_view, None);
             ctx.device.destroy_image(self.depth_image, None);
             self.surface_loader.destroy_surface(self.surface, None);

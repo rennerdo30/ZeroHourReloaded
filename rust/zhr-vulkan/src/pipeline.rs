@@ -4,12 +4,15 @@ use std::mem::offset_of;
 use ash::vk;
 
 use crate::error::Result;
-use crate::shader::{ShaderKey, WW3D2_UBER_WGSL, compile_wgsl_to_spirv, create_shader_module};
+use crate::shader::{
+    ShaderKey, StencilPipelineKey, WW3D2_UBER_WGSL, compile_wgsl_to_spirv, create_shader_module,
+};
 use crate::types::VertexWw3d;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PipelineLookupKey {
     shader: ShaderKey,
+    stencil: StencilPipelineKey,
     color_format: vk::Format,
     depth_format: vk::Format,
 }
@@ -80,11 +83,13 @@ impl PipelineCache {
         &mut self,
         device: &ash::Device,
         shader: ShaderKey,
+        stencil: StencilPipelineKey,
         color_format: vk::Format,
         depth_format: vk::Format,
     ) -> Result<vk::Pipeline> {
         let key = PipelineLookupKey {
             shader: shader.pipeline_state_key(),
+            stencil,
             color_format,
             depth_format,
         };
@@ -166,10 +171,21 @@ impl PipelineCache {
 
         let depth_test = key.shader.depth_compare() != crate::shader::DepthCompare::Always
             || key.shader.depth_write();
+        let stencil_op_state = vk::StencilOpState::default()
+            .fail_op(key.stencil.fail_op.to_vk())
+            .pass_op(key.stencil.pass_op.to_vk())
+            .depth_fail_op(key.stencil.depth_fail_op.to_vk())
+            .compare_op(key.stencil.func.to_vk())
+            .compare_mask(0xFF)
+            .write_mask(0xFF)
+            .reference(0);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(depth_test)
             .depth_write_enable(key.shader.depth_write())
-            .depth_compare_op(key.shader.depth_compare().to_vk());
+            .depth_compare_op(key.shader.depth_compare().to_vk())
+            .stencil_test_enable(key.stencil.enabled)
+            .front(stencil_op_state)
+            .back(stencil_op_state);
 
         let write_mask = if key.shader.color_write() {
             vk::ColorComponentFlags::RGBA
@@ -188,7 +204,13 @@ impl PipelineCache {
         let color_blending =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
 
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::STENCIL_COMPARE_MASK,
+            vk::DynamicState::STENCIL_WRITE_MASK,
+            vk::DynamicState::STENCIL_REFERENCE,
+        ];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 

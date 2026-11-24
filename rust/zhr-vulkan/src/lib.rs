@@ -28,7 +28,7 @@ use crate::error::{Result, VkError};
 use crate::offscreen::{OffscreenTarget, write_rgba8_png};
 use crate::pipeline::PipelineCache;
 use crate::postprocess::{HDR_FORMAT, PostProcessPipeline};
-use crate::shader::{DepthCompare, DstBlend, ShaderKey, SrcBlend};
+use crate::shader::{DepthCompare, DstBlend, ShaderKey, SrcBlend, StencilState};
 use crate::surface::SwapchainState;
 use crate::texture::{GpuTexture, SamplerCache};
 use crate::types::{
@@ -89,11 +89,15 @@ struct ActiveFrame {
     target_view: vk::ImageView,
     target_old_layout: vk::ImageLayout,
     hdr_view: vk::ImageView,
+    depth_image: vk::Image,
     depth_view: vk::ImageView,
     color_format: vk::Format,
     depth_format: vk::Format,
     extent: vk::Extent2D,
     rendering_begun: bool,
+    has_3d_depth_writes: bool,
+    ssao_applied: bool,
+    last_3d_proj: Mat4,
     last_pipeline: Option<vk::Pipeline>,
     last_texture: Option<TextureId>,
     last_texture1: Option<TextureId>,
@@ -124,8 +128,10 @@ pub struct VulkanRenderer {
     // WW3D2-compatible render state
     uniforms: DrawUniforms,
     view_matrix: Mat4,
+    proj_matrix: Mat4,
     graphics: GraphicsSettings,
     shader: ShaderKey,
+    stencil: StencilState,
     active_texture: TextureId,
     active_texture1: TextureId,
     viewport: Viewport,
@@ -274,15 +280,16 @@ impl VulkanRenderer {
             });
         }
 
-        let (output_format, default_remastered) = match &target {
-            RenderTarget::Headless(t) => (t.color_format, false),
-            RenderTarget::Windowed(s) => (s.format, true),
+        let (output_format, depth_sample_view, default_remastered) = match &target {
+            RenderTarget::Headless(t) => (t.color_format, t.depth_sample_view, false),
+            RenderTarget::Windowed(s) => (s.format, s.depth_sample_view, true),
         };
         let postprocess = PostProcessPipeline::new(
             &mut ctx,
             extent.width,
             extent.height,
             output_format,
+            depth_sample_view,
             FRAMES_IN_FLIGHT,
         )?;
         let graphics = GraphicsSettings::from_env(default_remastered);
@@ -325,8 +332,10 @@ impl VulkanRenderer {
             default_white_texture,
             uniforms: DrawUniforms::default(),
             view_matrix: Mat4::IDENTITY,
+            proj_matrix: Mat4::IDENTITY,
             graphics,
             shader: ShaderKey::OPAQUE_3D,
+            stencil: StencilState::default(),
             active_texture: default_white_texture,
             active_texture1: default_white_texture,
             viewport: Viewport::full(extent.width, extent.height),
@@ -381,24 +390,40 @@ impl VulkanRenderer {
         if self.active_frame.is_some() {
             return Err(VkError::State("cannot resize while a frame is active"));
         }
-        let (actual_w, actual_h, output_format) =
+        let (actual_w, actual_h, output_format, depth_sample_view) =
             match self.target.as_mut().expect("render target alive") {
                 RenderTarget::Headless(old) => {
                     // SAFETY: Ensure GPU idle before replacing offscreen attachments.
                     unsafe { self.ctx.device.device_wait_idle()? };
                     let new_target = OffscreenTarget::new(&mut self.ctx, width, height)?;
-                    let res = (new_target.width, new_target.height, new_target.color_format);
+                    let res = (
+                        new_target.width,
+                        new_target.height,
+                        new_target.color_format,
+                        new_target.depth_sample_view,
+                    );
                     let prev = std::mem::replace(old, new_target);
                     prev.destroy(&mut self.ctx);
                     res
                 }
                 RenderTarget::Windowed(sc) => {
                     sc.resize(&mut self.ctx, width, height)?;
-                    (sc.extent.width, sc.extent.height, sc.format)
+                    (
+                        sc.extent.width,
+                        sc.extent.height,
+                        sc.format,
+                        sc.depth_sample_view,
+                    )
                 }
             };
         if let Some(pp) = &mut self.postprocess {
-            pp.resize(&mut self.ctx, actual_w, actual_h, output_format)?;
+            pp.resize(
+                &mut self.ctx,
+                actual_w,
+                actual_h,
+                output_format,
+                depth_sample_view,
+            )?;
             self.hdr_initialized = false;
         }
         self.viewport = Viewport::full(actual_w.max(1), actual_h.max(1));
@@ -561,7 +586,12 @@ impl VulkanRenderer {
     }
 
     pub fn set_projection(&mut self, m: Mat4) {
+        self.proj_matrix = m;
         self.uniforms.set_projection(m);
+    }
+
+    pub fn set_stencil(&mut self, stencil: StencilState) {
+        self.stencil = stencil;
     }
 
     pub fn set_world_identity(&mut self) {
@@ -681,6 +711,7 @@ impl VulkanRenderer {
             swapchain_image_index,
             target_image,
             target_view,
+            depth_image,
             depth_view,
             color_format,
             depth_format,
@@ -691,6 +722,7 @@ impl VulkanRenderer {
                 None,
                 t.color_image,
                 t.color_view,
+                t.depth_image,
                 t.depth_view,
                 t.color_format,
                 t.depth_format,
@@ -714,6 +746,7 @@ impl VulkanRenderer {
                     Some(idx),
                     sc.images[idx as usize],
                     sc.views[idx as usize],
+                    sc.depth_image,
                     sc.depth_view,
                     sc.format,
                     self.ctx.depth_format,
@@ -797,11 +830,15 @@ impl VulkanRenderer {
             target_view,
             target_old_layout: old_layout,
             hdr_view,
+            depth_image,
             depth_view,
             color_format,
             depth_format,
             extent,
             rendering_begun: false,
+            has_3d_depth_writes: false,
+            ssao_applied: false,
+            last_3d_proj: Mat4::IDENTITY,
             last_pipeline: None,
             last_texture: None,
             last_texture1: None,
@@ -944,17 +981,72 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    fn flush_ssao_if_ready(&mut self) -> Result<()> {
+        let should_run = self.active_frame.as_ref().is_some_and(|af| {
+            af.rendering_begun
+                && af.has_3d_depth_writes
+                && !af.ssao_applied
+                && self.graphics.mode != GraphicsMode::Classic
+                && self.graphics.pbr_lighting
+        });
+        if !should_run {
+            return Ok(());
+        }
+        let (slot_index, depth_image, depth_format, last_3d_proj) = {
+            let af = self.active_frame.as_mut().expect("active frame");
+            af.ssao_applied = true;
+            af.rendering_begun = false;
+            af.last_pipeline = None;
+            af.last_texture = None;
+            af.last_texture1 = None;
+            (
+                af.slot_index,
+                af.depth_image,
+                af.depth_format,
+                af.last_3d_proj,
+            )
+        };
+        let cmd = self.frames[slot_index].cmd;
+        // SAFETY: `cmd_begin_rendering` was active for the 3D scene pass.
+        unsafe { self.ctx.device.cmd_end_rendering(cmd) };
+        if let Some(pp) = &mut self.postprocess {
+            pp.apply_ssao(
+                &self.ctx.device,
+                cmd,
+                slot_index,
+                depth_image,
+                depth_format,
+                last_3d_proj,
+                self.graphics,
+            )?;
+        }
+        Ok(())
+    }
+
     fn bind_draw_state(&mut self) -> Result<(vk::CommandBuffer, usize)> {
+        let is_3d_pass =
+            self.shader.depth_compare() != DepthCompare::Always || self.shader.depth_write();
+        // When transitioning from 3D world (including stencil shadows) to 2D HUD/UI,
+        // apply depth-based bilateral SSAO to the finished 3D scene before UI draws on top.
+        if !is_3d_pass && !self.stencil.enabled {
+            self.flush_ssao_if_ready()?;
+        }
+
         self.ensure_rendering_begun()?;
         let af = self
             .active_frame
             .as_mut()
             .ok_or(VkError::State("no active frame"))?;
+        if is_3d_pass && self.shader.depth_write() && self.proj_matrix.col(3).z.abs() > 1e-5 {
+            af.has_3d_depth_writes = true;
+            af.last_3d_proj = self.proj_matrix;
+        }
         let slot_index = af.slot_index;
 
         let pso = self.pipelines.get_or_create(
             &self.ctx.device,
             self.shader,
+            self.stencil.pipeline_key(),
             HDR_FORMAT,
             af.depth_format,
         )?;
@@ -969,6 +1061,21 @@ impl VulkanRenderer {
             }
             af.last_pipeline = Some(pso);
             self.stats.pipeline_binds += 1;
+        }
+
+        // Dynamic stencil masks & reference (zero PSO churn across shadow/occluder passes).
+        // SAFETY: All pipelines enable STENCIL_COMPARE_MASK, STENCIL_WRITE_MASK, STENCIL_REFERENCE.
+        unsafe {
+            let face = vk::StencilFaceFlags::FRONT_AND_BACK;
+            self.ctx
+                .device
+                .cmd_set_stencil_compare_mask(cmd, face, self.stencil.compare_mask);
+            self.ctx
+                .device
+                .cmd_set_stencil_write_mask(cmd, face, self.stencil.write_mask);
+            self.ctx
+                .device
+                .cmd_set_stencil_reference(cmd, face, self.stencil.reference);
         }
 
         // Sync dynamic shader flags into the per-draw uniform snapshot.
@@ -995,8 +1102,6 @@ impl VulkanRenderer {
         };
         draw_uniforms.camera_pos_and_pbr = [cam_pos.x, cam_pos.y, cam_pos.z, pbr_mode];
 
-        let is_3d_pass =
-            self.shader.depth_compare() != DepthCompare::Always || self.shader.depth_write();
         let is_additive = self.shader.dst_blend() == DstBlend::One
             && matches!(self.shader.src_blend(), SrcBlend::One | SrcBlend::SrcAlpha);
         let is_multiplicative =
@@ -1175,6 +1280,9 @@ impl VulkanRenderer {
         {
             self.ensure_rendering_begun()?;
         }
+
+        // For pure-3D frames with no 2D UI draws, apply SSAO before bloom + composite.
+        self.flush_ssao_if_ready()?;
 
         let af = self.active_frame.take().ok_or(VkError::State(
             "end_frame called without matching begin_frame",

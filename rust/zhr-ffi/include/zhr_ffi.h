@@ -90,6 +90,15 @@ void zhr_vk_set_lighting_enabled(bool enabled);
 void zhr_vk_set_alpha_test_ref(float alpha_ref);
 void zhr_vk_set_fog(bool enable, float r, float g, float b, float start, float end);
 void zhr_vk_set_shader(uint32_t ww3d_shader_bits);
+void zhr_vk_set_stencil_state(
+    bool enabled,
+    uint32_t func,
+    uint32_t fail_op,
+    uint32_t depth_fail_op,
+    uint32_t pass_op,
+    uint32_t compare_mask,
+    uint32_t write_mask,
+    uint32_t reference);
 
 // format: 0=RGBA8, 1=BGRA8, 2=BC1(DXT1), 3=BC2(DXT3), 4=BC3(DXT5)
 uint32_t zhr_vk_create_texture_2d(

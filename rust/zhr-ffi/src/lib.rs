@@ -4,7 +4,7 @@ use std::ffi::{CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
 use glam::{Mat4, Vec3};
-use zhr_vulkan::shader::ShaderKey;
+use zhr_vulkan::shader::{DepthCompare, ShaderKey, StencilOp, StencilState};
 use zhr_vulkan::types::{
     ClearState, FogState, GpuLight, GraphicsMode, GraphicsSettings, SamplerDesc, TextureFormat,
     TextureId, VertexWw3d, Viewport,
@@ -445,6 +445,43 @@ pub extern "C" fn zhr_vk_set_shader(ww3d_shader_bits: u32) {
     let mut guard = vk_state().lock().expect("vk state poisoned");
     if let Some(ren) = guard.renderer.as_mut() {
         ren.set_shader(ShaderKey::from_raw(ww3d_shader_bits));
+    }
+}
+
+/// Sets hardware stencil test/op state (`func`: 0=Never..7=Always; ops: D3DSTENCILOP 1..8).
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_stencil_state(
+    enabled: bool,
+    func: u32,
+    fail_op: u32,
+    depth_fail_op: u32,
+    pass_op: u32,
+    compare_mask: u32,
+    write_mask: u32,
+    reference: u32,
+) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        let cmp = match func {
+            0 => DepthCompare::Never,
+            1 => DepthCompare::Less,
+            2 => DepthCompare::Equal,
+            3 => DepthCompare::LessEqual,
+            4 => DepthCompare::Greater,
+            5 => DepthCompare::NotEqual,
+            6 => DepthCompare::GreaterEqual,
+            _ => DepthCompare::Always,
+        };
+        ren.set_stencil(StencilState {
+            enabled,
+            func: cmp,
+            fail_op: StencilOp::from_d3d(fail_op),
+            depth_fail_op: StencilOp::from_d3d(depth_fail_op),
+            pass_op: StencilOp::from_d3d(pass_op),
+            compare_mask: compare_mask & 0xFF,
+            write_mask: write_mask & 0xFF,
+            reference: reference & 0xFF,
+        });
     }
 }
 

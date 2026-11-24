@@ -59,7 +59,7 @@ We retain TSH's battle-tested C++20 simulation, INI/BIG/W3D/map loaders, AI, scr
 | Miles Sound System (`mss32.dll`, 32-bit) | `rust/zhr-audio` (cross-platform Rust 3D audio + WAV/MP3 decoding) | Planned (`ZHR-3`) |
 | Bink Video (`binkw32.dll`, 32-bit) | Existing TSH FFmpeg video backend (`RTS_BUILD_OPTION_FFMPEG`) | Planned (`ZHR-3`) |
 | Win32 Window + DirectInput (`Win32Device`) | `rust/zhr-platform` (SDL3 cross-platform window/input) | Planned (`ZHR-4`) |
-| 2003 Low-Res Textures & Flat Lighting | `rust/zhr-vulkan` Phase 1 Remaster Pipeline (16× AF + full mipmaps, 3D PBR micro-normals/GGX/IBL, `R16G16B16A16_SFLOAT` HDR + Bloom + Filmic Tonemap + CAS + `F9`/`F10`/`F11` live A/B Split-Screen) + planned `rust/zhr-remaster` AI texture/PBR synthesis | **Phase 1 Working (`ZHR-6`)** / AI Upscale Planned (`ZHR-5`) |
+| 2003 Low-Res Textures & Flat Lighting | `rust/zhr-vulkan` Remaster Pipeline (Phase 1: 16× AF + full mipmaps, 3D PBR micro-normals/GGX/IBL, HDR Bloom + Filmic Tonemap + CAS + `F9`/`F10`/`F11` A/B Split-Screen; Phase 2: hardware `VkStencilOpState` volumetric shadows & occluded unit silhouettes + half-res depth-based bilateral SSAO) + planned `rust/zhr-remaster` AI texture/PBR synthesis | **Phase 1 & 2 Working (`ZHR-6`, `ZHR-8`)** / AI Upscale Planned (`ZHR-5`) |
 
 ---
 
