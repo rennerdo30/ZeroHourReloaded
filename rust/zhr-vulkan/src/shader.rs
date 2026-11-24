@@ -24,6 +24,8 @@ impl ShaderKey {
     /// Optional extension bit (outside WW3D2's 24-bit shader mask): when set with `SHIFT_CULL_MODE`,
     /// culls clockwise triangles (`D3DCULL_CW` -> front face is counter-clockwise).
     pub const SHIFT_CULL_CW: u32 = 28;
+    /// Optional extension bits (29..30) for extended `SrcBlend` factors (e.g. `DstColor`).
+    pub const SHIFT_SRC_BLEND_EXT: u32 = 29;
 
     pub const fn from_raw(bits: u32) -> Self {
         Self(bits)
@@ -119,15 +121,17 @@ impl ShaderKey {
         alpha_test: bool,
         cull_back: bool,
     ) -> Self {
+        let src_bits = src_blend as u32;
         let bits = ((depth_compare as u32) << Self::SHIFT_DEPTH_COMPARE)
             | ((depth_write as u32) << Self::SHIFT_DEPTH_MASK)
             | ((color_write as u32) << Self::SHIFT_COLOR_MASK)
             | ((dst_blend as u32) << Self::SHIFT_DST_BLEND)
             | ((if fog { 1 } else { 0 }) << Self::SHIFT_FOG)
-            | ((src_blend as u32) << Self::SHIFT_SRC_BLEND)
+            | ((src_bits & 0x3) << Self::SHIFT_SRC_BLEND)
             | ((texturing as u32) << Self::SHIFT_TEXTURING)
             | ((alpha_test as u32) << Self::SHIFT_ALPHA_TEST)
-            | ((cull_back as u32) << Self::SHIFT_CULL_MODE);
+            | ((cull_back as u32) << Self::SHIFT_CULL_MODE)
+            | (((src_bits >> 2) & 0x3) << Self::SHIFT_SRC_BLEND_EXT);
         Self(bits)
     }
 
@@ -164,10 +168,16 @@ impl ShaderKey {
     }
 
     pub const fn src_blend(self) -> SrcBlend {
-        match (self.0 >> Self::SHIFT_SRC_BLEND) & 0x3 {
+        let low = (self.0 >> Self::SHIFT_SRC_BLEND) & 0x3;
+        let high = (self.0 >> Self::SHIFT_SRC_BLEND_EXT) & 0x3;
+        match low | (high << 2) {
             1 => SrcBlend::One,
             2 => SrcBlend::SrcAlpha,
             3 => SrcBlend::OneMinusSrcAlpha,
+            4 => SrcBlend::DstColor,
+            5 => SrcBlend::OneMinusDstColor,
+            6 => SrcBlend::SrcColor,
+            7 => SrcBlend::OneMinusSrcColor,
             _ => SrcBlend::Zero,
         }
     }
@@ -208,7 +218,8 @@ impl ShaderKey {
             | (0x7 << ShaderKey::SHIFT_DST_BLEND)
             | (0x3 << ShaderKey::SHIFT_SRC_BLEND)
             | (0x1 << ShaderKey::SHIFT_CULL_MODE)
-            | (0x1 << ShaderKey::SHIFT_CULL_CW);
+            | (0x1 << ShaderKey::SHIFT_CULL_CW)
+            | (0x3 << ShaderKey::SHIFT_SRC_BLEND_EXT);
         Self(self.0 & PIPELINE_MASK)
     }
 }
@@ -248,6 +259,10 @@ pub enum SrcBlend {
     One = 1,
     SrcAlpha = 2,
     OneMinusSrcAlpha = 3,
+    DstColor = 4,
+    OneMinusDstColor = 5,
+    SrcColor = 6,
+    OneMinusSrcColor = 7,
 }
 
 impl SrcBlend {
@@ -257,6 +272,10 @@ impl SrcBlend {
             Self::One => vk::BlendFactor::ONE,
             Self::SrcAlpha => vk::BlendFactor::SRC_ALPHA,
             Self::OneMinusSrcAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            Self::DstColor => vk::BlendFactor::DST_COLOR,
+            Self::OneMinusDstColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
+            Self::SrcColor => vk::BlendFactor::SRC_COLOR,
+            Self::OneMinusSrcColor => vk::BlendFactor::ONE_MINUS_SRC_COLOR,
         }
     }
 }

@@ -278,8 +278,20 @@ uint32_t MapD3DBlendToSrc(DWORD blend)
     case D3DBLEND_ONE:          return 1;
     case D3DBLEND_SRCALPHA:     return 2;
     case D3DBLEND_INVSRCALPHA:  return 3;
+    case D3DBLEND_DESTCOLOR:    return 4;
+    case D3DBLEND_INVDESTCOLOR: return 5;
+    case D3DBLEND_SRCCOLOR:     return 6;
+    case D3DBLEND_INVSRCCOLOR:  return 7;
     default:                    return 1;
     }
+}
+
+void TransformPointRowMajor(const D3DMATRIX& m, float x, float y, float z, float w, float out[4])
+{
+    out[0] = x * m._11 + y * m._21 + z * m._31 + w * m._41;
+    out[1] = x * m._12 + y * m._22 + z * m._32 + w * m._42;
+    out[2] = x * m._13 + y * m._23 + z * m._33 + w * m._43;
+    out[3] = x * m._14 + y * m._24 + z * m._34 + w * m._44;
 }
 
 uint32_t MapD3DBlendToDst(DWORD blend)
@@ -955,6 +967,10 @@ public:
         MakeIdentityMatrix(m_world);
         MakeIdentityMatrix(m_view);
         MakeIdentityMatrix(m_proj);
+        for (int i = 0; i < 4; ++i)
+        {
+            MakeIdentityMatrix(m_tex_matrix[i]);
+        }
 
         m_viewport.X = 0;
         m_viewport.Y = 0;
@@ -1302,6 +1318,10 @@ public:
             m_proj = *pMatrix;
             zhr_vk_set_transform(2, &m_proj.m[0][0]);
         }
+        else if (State >= D3DTS_TEXTURE0 && State <= D3DTS_TEXTURE3)
+        {
+            m_tex_matrix[State - D3DTS_TEXTURE0] = *pMatrix;
+        }
         return D3D_OK;
     }
     STDMETHOD(GetTransform)(D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix) override
@@ -1310,6 +1330,7 @@ public:
         if (State == D3DTS_WORLD) *pMatrix = m_world;
         else if (State == D3DTS_VIEW) *pMatrix = m_view;
         else if (State == D3DTS_PROJECTION) *pMatrix = m_proj;
+        else if (State >= D3DTS_TEXTURE0 && State <= D3DTS_TEXTURE3) *pMatrix = m_tex_matrix[State - D3DTS_TEXTURE0];
         else MakeIdentityMatrix(*pMatrix);
         return D3D_OK;
     }
@@ -1746,6 +1767,8 @@ private:
             m_tss[s][D3DTSS_ADDRESSV] = D3DTADDRESS_WRAP;
             m_tss[s][D3DTSS_MAGFILTER] = D3DTEXF_LINEAR;
             m_tss[s][D3DTSS_MINFILTER] = D3DTEXF_LINEAR;
+            m_tss[s][D3DTSS_TEXCOORDINDEX] = static_cast<DWORD>(s);
+            m_tss[s][D3DTSS_TEXTURETRANSFORMFLAGS] = D3DTTFF_DISABLE;
         }
     }
 
@@ -1816,7 +1839,33 @@ private:
         return stride;
     }
 
-    void SyncDrawState(bool is_rhw)
+    int PickActiveTextureStage() const
+    {
+        auto stage_uses_tex = [&](int s) -> bool {
+            if (m_textures[s] == nullptr || m_textures[s]->GetType() != D3DRTYPE_TEXTURE)
+            {
+                return false;
+            }
+            const DWORD cop = m_tss[s][D3DTSS_COLOROP];
+            const DWORD carg1 = m_tss[s][D3DTSS_COLORARG1] & D3DTA_SELECTMASK;
+            const DWORD carg2 = m_tss[s][D3DTSS_COLORARG2] & D3DTA_SELECTMASK;
+            const DWORD aop = m_tss[s][D3DTSS_ALPHAOP];
+            const DWORD aarg1 = m_tss[s][D3DTSS_ALPHAARG1] & D3DTA_SELECTMASK;
+            const DWORD aarg2 = m_tss[s][D3DTSS_ALPHAARG2] & D3DTA_SELECTMASK;
+            auto uses = [](DWORD op, DWORD a1, DWORD a2) -> bool {
+                if (op == D3DTOP_DISABLE) return false;
+                if (op == D3DTOP_SELECTARG1) return a1 == D3DTA_TEXTURE;
+                if (op == D3DTOP_SELECTARG2) return a2 == D3DTA_TEXTURE;
+                return (a1 == D3DTA_TEXTURE) || (a2 == D3DTA_TEXTURE);
+            };
+            return uses(cop, carg1, carg2) || uses(aop, aarg1, aarg2);
+        };
+        if (stage_uses_tex(0)) return 0;
+        if (stage_uses_tex(1)) return 1;
+        return -1;
+    }
+
+    void SyncDrawState(bool is_rhw, int active_tex_stage)
     {
         const bool z_enable = m_render_states[D3DRS_ZENABLE] != D3DZB_FALSE;
         const uint32_t depth_cmp = z_enable ? MapD3DCmpToShaderDepth(m_render_states[D3DRS_ZFUNC]) : 7u;
@@ -1844,21 +1893,7 @@ private:
             (fend > 1.0f);
         const bool alpha_test = m_render_states[D3DRS_ALPHATESTENABLE] != 0;
 
-        const DWORD cop = m_tss[0][D3DTSS_COLOROP];
-        const DWORD carg1 = m_tss[0][D3DTSS_COLORARG1] & D3DTA_SELECTMASK;
-        const DWORD carg2 = m_tss[0][D3DTSS_COLORARG2] & D3DTA_SELECTMASK;
-        const DWORD aop = m_tss[0][D3DTSS_ALPHAOP];
-        const DWORD aarg1 = m_tss[0][D3DTSS_ALPHAARG1] & D3DTA_SELECTMASK;
-        const DWORD aarg2 = m_tss[0][D3DTSS_ALPHAARG2] & D3DTA_SELECTMASK;
-        auto stage_uses_tex = [](DWORD op, DWORD a1, DWORD a2) -> bool {
-            if (op == D3DTOP_DISABLE) return false;
-            if (op == D3DTOP_SELECTARG1) return a1 == D3DTA_TEXTURE;
-            if (op == D3DTOP_SELECTARG2) return a2 == D3DTA_TEXTURE;
-            return (a1 == D3DTA_TEXTURE) || (a2 == D3DTA_TEXTURE);
-        };
-        const bool texturing = (m_textures[0] != nullptr) &&
-                               (m_textures[0]->GetType() == D3DRTYPE_TEXTURE) &&
-                               (stage_uses_tex(cop, carg1, carg2) || stage_uses_tex(aop, aarg1, aarg2));
+        const bool texturing = (active_tex_stage >= 0);
 
         const DWORD cull = m_render_states[D3DRS_CULLMODE];
         const bool cull_enabled = !is_rhw && (cull != D3DCULL_NONE);
@@ -1870,11 +1905,12 @@ private:
             (static_cast<uint32_t>(color_write) << 4) |
             (dst_blend << 5) |
             (static_cast<uint32_t>(fog_enable) << 8) |
-            (src_blend << 14) |
+            ((src_blend & 0x3u) << 14) |
             (static_cast<uint32_t>(texturing) << 16) |
             (static_cast<uint32_t>(alpha_test) << 18) |
             (static_cast<uint32_t>(cull_enabled) << 19) |
-            (static_cast<uint32_t>(cull_cw) << 28);
+            (static_cast<uint32_t>(cull_cw) << 28) |
+            (((src_blend >> 2) & 0x3u) << 29);
 
         zhr_vk_set_shader(shader_bits);
 
@@ -1905,10 +1941,10 @@ private:
 
         if (texturing)
         {
-            auto* tex2d = static_cast<ZhrVkTexture8*>(m_textures[0]);
-            const bool linear = m_tss[0][D3DTSS_MAGFILTER] != D3DTEXF_POINT;
-            const bool clamp = (m_tss[0][D3DTSS_ADDRESSU] == D3DTADDRESS_CLAMP) ||
-                               (m_tss[0][D3DTSS_ADDRESSV] == D3DTADDRESS_CLAMP);
+            auto* tex2d = static_cast<ZhrVkTexture8*>(m_textures[active_tex_stage]);
+            const bool linear = m_tss[active_tex_stage][D3DTSS_MAGFILTER] != D3DTEXF_POINT;
+            const bool clamp = (m_tss[active_tex_stage][D3DTSS_ADDRESSU] == D3DTADDRESS_CLAMP) ||
+                               (m_tss[active_tex_stage][D3DTSS_ADDRESSV] == D3DTADDRESS_CLAMP);
             const uint32_t handle = tex2d->EnsureUploaded(linear, clamp);
             zhr_vk_set_texture(handle);
         }
@@ -1966,6 +2002,22 @@ private:
             !is_rhw &&
             (m_render_states[D3DRS_LIGHTING] != 0) &&
             (!has_diffuse || m_render_states[D3DRS_COLORVERTEX] == 0);
+
+        const int active_tex_stage = PickActiveTextureStage();
+        const int uv_stage = active_tex_stage >= 0 ? active_tex_stage : 0;
+        const DWORD tci = m_tss[uv_stage][D3DTSS_TEXCOORDINDEX];
+        const DWORD tci_mode = tci & 0xFFFF0000u;
+        const DWORD tci_index = tci & 0x7u;
+        const bool use_tex_xform = (m_tss[uv_stage][D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFFu) != D3DTTFF_DISABLE;
+        const bool ignore_diffuse_rgb =
+            (active_tex_stage >= 0) &&
+            (m_tss[active_tex_stage][D3DTSS_COLOROP] == D3DTOP_SELECTARG1) &&
+            ((m_tss[active_tex_stage][D3DTSS_COLORARG1] & D3DTA_SELECTMASK) == D3DTA_TEXTURE);
+        const bool ignore_diffuse_alpha =
+            (active_tex_stage >= 0) &&
+            (m_tss[active_tex_stage][D3DTSS_ALPHAOP] == D3DTOP_DISABLE ||
+             (m_tss[active_tex_stage][D3DTSS_ALPHAOP] == D3DTOP_SELECTARG1 &&
+              (m_tss[active_tex_stage][D3DTSS_ALPHAARG1] & D3DTA_SELECTMASK) == D3DTA_TEXTURE));
 
         const float vp_x = static_cast<float>(m_viewport.X);
         const float vp_y = static_cast<float>(m_viewport.Y);
@@ -2029,29 +2081,65 @@ private:
                 dst.color[3] = 1.0f;
             }
 
+            if (ignore_diffuse_rgb)
+            {
+                dst.color[0] = 1.0f;
+                dst.color[1] = 1.0f;
+                dst.color[2] = 1.0f;
+            }
+            if (ignore_diffuse_alpha)
+            {
+                dst.color[3] = 1.0f;
+            }
+
+            float raw_u0 = 0.0f, raw_v0 = 0.0f;
+            float raw_u1 = 0.0f, raw_v1 = 0.0f;
             if (tex_count >= 1 && uv0_off + 8 <= stride)
             {
                 const float* uv = reinterpret_cast<const float*>(vptr + uv0_off);
-                dst.uv0[0] = uv[0];
-                dst.uv0[1] = uv[1];
+                raw_u0 = uv[0];
+                raw_v0 = uv[1];
             }
-            else
-            {
-                dst.uv0[0] = 0.0f;
-                dst.uv0[1] = 0.0f;
-            }
-
             if (tex_count >= 2 && uv1_off + 8 <= stride)
             {
                 const float* uv = reinterpret_cast<const float*>(vptr + uv1_off);
-                dst.uv1[0] = uv[0];
-                dst.uv1[1] = uv[1];
+                raw_u1 = uv[0];
+                raw_v1 = uv[1];
+            }
+
+            if (!is_rhw && tci_mode == D3DTSS_TCI_CAMERASPACEPOSITION)
+            {
+                float wp[4], cp[4], tc[4];
+                TransformPointRowMajor(m_world, p[0], p[1], p[2], 1.0f, wp);
+                TransformPointRowMajor(m_view, wp[0], wp[1], wp[2], 1.0f, cp);
+                if (use_tex_xform)
+                {
+                    TransformPointRowMajor(m_tex_matrix[uv_stage], cp[0], cp[1], cp[2], 1.0f, tc);
+                    dst.uv0[0] = tc[0];
+                    dst.uv0[1] = tc[1];
+                }
+                else
+                {
+                    dst.uv0[0] = cp[0];
+                    dst.uv0[1] = cp[1];
+                }
             }
             else
             {
-                dst.uv1[0] = 0.0f;
-                dst.uv1[1] = 0.0f;
+                float u = (tci_index == 1 && tex_count >= 2) ? raw_u1 : raw_u0;
+                float v = (tci_index == 1 && tex_count >= 2) ? raw_v1 : raw_v0;
+                if (use_tex_xform)
+                {
+                    float tc[4];
+                    TransformPointRowMajor(m_tex_matrix[uv_stage], u, v, 1.0f, 1.0f, tc);
+                    u = tc[0];
+                    v = tc[1];
+                }
+                dst.uv0[0] = u;
+                dst.uv0[1] = v;
             }
+            dst.uv1[0] = raw_u1;
+            dst.uv1[1] = raw_v1;
         }
 
         // Build triangle list indices.
@@ -2109,7 +2197,7 @@ private:
             return D3D_OK;
         }
 
-        SyncDrawState(is_rhw);
+        SyncDrawState(is_rhw, active_tex_stage);
 
         if (is_rhw)
         {
@@ -2147,6 +2235,7 @@ private:
     D3DMATRIX m_world{};
     D3DMATRIX m_view{};
     D3DMATRIX m_proj{};
+    D3DMATRIX m_tex_matrix[4]{};
     D3DVIEWPORT8 m_viewport{};
 
     DWORD m_render_states[256]{};
