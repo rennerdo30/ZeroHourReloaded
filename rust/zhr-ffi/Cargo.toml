@@ -1,0 +1,22 @@
+[package]
+name = "zhr-ffi"
+description = "C-ABI bridge linking ZeroHourReloaded Rust subsystems into the C++ engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "zhr_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+glam.workspace = true
+log.workspace = true
+raw-window-handle.workspace = true
+zhr-core.workspace = true
+zhr-vulkan.workspace = true
+
+[lints]
+workspace = true

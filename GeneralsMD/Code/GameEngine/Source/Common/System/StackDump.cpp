@@ -67,6 +67,9 @@ void StackDump(void (*callback)(const char*))
 	if (!InitSymbolInfo())
 		return;
 
+#if defined(_M_X64) || defined(__x86_64__)
+	MakeStackTrace(0, 0, 0, 2, callback);
+#else
 	DWORD myeip,myesp,myebp;
 
 #if defined(_MSC_VER)
@@ -97,6 +100,7 @@ MYEIP1:
 
 
 	MakeStackTrace(myeip,myesp,myebp, 2, callback);
+#endif
 }
 
 
@@ -172,6 +176,18 @@ BOOL InitSymbolInfo()
 //*****************************************************************************
 void MakeStackTrace(DWORD myeip,DWORD myesp,DWORD myebp, int skipFrames, void (*callback)(const char*))
 {
+#if defined(_M_X64) || defined(__x86_64__)
+	(void)myeip;
+	(void)myesp;
+	(void)myebp;
+	callback("Call Stack\n**********\n");
+	void *frames[32];
+	USHORT captured = RtlCaptureStackBackTrace(static_cast<DWORD>(skipFrames + 1), 30, frames, nullptr);
+	for (USHORT i = 0; i < captured; ++i)
+	{
+		WriteStackLine(frames[i], callback);
+	}
+#else
 STACKFRAME      stack_frame;
 BOOL            b_ret = TRUE;
 
@@ -240,6 +256,7 @@ stack_frame.AddrFrame.Offset = myebp;
 					skip--;
 			}
 	}
+#endif
 }
 
 
@@ -316,6 +333,14 @@ void GetFunctionDetails(void *pointer, char*name, char*filename, unsigned int* l
 //*****************************************************************************
 void FillStackAddresses(void**addresses, unsigned int count, unsigned int skip)
 {
+#if defined(_M_X64) || defined(__x86_64__)
+	USHORT captured = RtlCaptureStackBackTrace(static_cast<DWORD>(skip + 1), static_cast<DWORD>(count), addresses, nullptr);
+	for (unsigned int i = captured; i < count; ++i)
+	{
+		addresses[i] = nullptr;
+	}
+	return;
+#else
 	if (!InitSymbolInfo())
 		return;
 
@@ -423,6 +448,7 @@ stack_frame.AddrFrame.Offset = myebp;
 		}
 
 	}
+#endif
 /*
 	else
 	{
@@ -589,7 +615,11 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	}
 
 	DOUBLE_DEBUG (("\nStack Dump:"));
+#if defined(_M_X64) || defined(__x86_64__)
+	StackDumpFromContext(0, 0, 0, nullptr);
+#else
 	StackDumpFromContext(context->Eip, context->Esp, context->Ebp, nullptr);
+#endif
 
 	DOUBLE_DEBUG (("\nDetails:"));
 
@@ -598,20 +628,41 @@ void DumpExceptionInfo( unsigned int u, EXCEPTION_POINTERS* e_info )
 	/*
 	** Dump the registers.
 	*/
+#if defined(_M_X64) || defined(__x86_64__)
+	DOUBLE_DEBUG ( ( "Rip:%016llX\tRsp:%016llX\tRbp:%016llX",
+		static_cast<unsigned long long>(context->Rip),
+		static_cast<unsigned long long>(context->Rsp),
+		static_cast<unsigned long long>(context->Rbp)));
+	DOUBLE_DEBUG ( ( "Rax:%016llX\tRbx:%016llX\tRcx:%016llX",
+		static_cast<unsigned long long>(context->Rax),
+		static_cast<unsigned long long>(context->Rbx),
+		static_cast<unsigned long long>(context->Rcx)));
+	DOUBLE_DEBUG ( ( "Rdx:%016llX\tRsi:%016llX\tRdi:%016llX",
+		static_cast<unsigned long long>(context->Rdx),
+		static_cast<unsigned long long>(context->Rsi),
+		static_cast<unsigned long long>(context->Rdi)));
+#else
 	DOUBLE_DEBUG ( ( "Eip:%08X\tEsp:%08X\tEbp:%08X", context->Eip, context->Esp, context->Ebp));
 	DOUBLE_DEBUG ( ( "Eax:%08X\tEbx:%08X\tEcx:%08X", context->Eax, context->Ebx, context->Ecx));
 	DOUBLE_DEBUG ( ( "Edx:%08X\tEsi:%08X\tEdi:%08X", context->Edx, context->Esi, context->Edi));
+#endif
 	DOUBLE_DEBUG ( ( "EFlags:%08X ", context->EFlags));
 	DOUBLE_DEBUG ( ( "CS:%04x  SS:%04x  DS:%04x  ES:%04x  FS:%04x  GS:%04x", context->SegCs, context->SegSs, context->SegDs, context->SegEs, context->SegFs, context->SegGs));
 
 	/*
-	** Dump the bytes at EIP. This will make it easier to match the crash address with later versions of the game.
+	** Dump the bytes at EIP/RIP. This will make it easier to match the crash address with later versions of the game.
 	*/
 	char scrap[512];
+#if defined(_M_X64) || defined(__x86_64__)
+	DOUBLE_DEBUG ( ("RIP bytes dump..."));
+	snprintf (scrap, ARRAY_SIZE(scrap), "\nBytes at CS:RIP (%016llX)  : ", static_cast<unsigned long long>(context->Rip));
+	unsigned char *eip_ptr = reinterpret_cast<unsigned char *>(context->Rip);
+#else
 	DOUBLE_DEBUG ( ("EIP bytes dump..."));
 	wsprintf (scrap, "\nBytes at CS:EIP (%08X)  : ", context->Eip);
 
 	unsigned char *eip_ptr = (unsigned char *) (context->Eip);
+#endif
 	char bytestr[32];
 
 	for (int c = 0 ; c < 32 ; c++)

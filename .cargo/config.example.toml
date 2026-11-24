@@ -1,0 +1,29 @@
+# Machine-local Cargo configuration template.
+# Run `pwsh -File scripts/setup-rust.ps1` (Windows) or `./scripts/setup-rust.sh` (Linux/macOS)
+# to generate `.cargo/config.toml` (gitignored) with detected paths for sccache and fast linkers.
+# Plain `cargo build` also works without this file.
+
+[build]
+# Shared sccache caches dependencies across clean builds, branches, and worktrees.
+# Workspace crates stay incremental (passed through by sccache for fast local iteration).
+rustc-wrapper = "sccache"
+# Optional: keep build artifacts outside the git repository.
+# target-dir = "E:/Development/_cache/cargo-target/zerohour-reloaded"
+
+[env]
+# SCCACHE_DIR = { value = "E:/sccache", force = true }
+# SCCACHE_CACHE_SIZE = { value = "50G", force = true }
+
+# Fast linkers (3-5x faster than default link.exe / ld).
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+[target.aarch64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+[target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[net]
+retry = 2

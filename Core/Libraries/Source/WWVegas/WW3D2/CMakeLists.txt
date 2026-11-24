@@ -13,7 +13,6 @@ set(WW3D2_SRC
     #assetmgr.h
     assetstatus.cpp
     assetstatus.h
-    Backend/DX8Backend.cpp
     bitmaphandler.cpp
     bitmaphandler.h
     bmp2d.cpp
@@ -233,6 +232,15 @@ set(WW3D2_SRC
     ww3dtrig.h
 )
 
+if(ZHR_USE_VULKAN)
+    list(APPEND WW3D2_SRC
+        Backend/VulkanBackend.cpp
+        Backend/VulkanD3DXCompat.cpp
+    )
+else()
+    list(APPEND WW3D2_SRC Backend/DX8Backend.cpp)
+endif()
+
 add_library(corei_ww3d2 INTERFACE)
 
 target_sources(corei_ww3d2 INTERFACE ${WW3D2_SRC})
@@ -245,3 +253,8 @@ target_link_libraries(corei_ww3d2 INTERFACE
     core_wwlib
     core_wwmath
 )
+
+if(ZHR_USE_VULKAN)
+    target_link_libraries(corei_ww3d2 INTERFACE zhr_ffi)
+    target_compile_definitions(corei_ww3d2 INTERFACE ZHR_USE_VULKAN=1)
+endif()

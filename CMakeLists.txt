@@ -50,9 +50,25 @@ if(MINGW)
     include(cmake/mingw.cmake)
 endif()
 
+# ZeroHourReloaded renderer backend selection:
+# Default to native Rust Vulkan 1.3 on 64-bit / non-Windows; DX8 remains selectable on 32-bit Windows.
+if(NOT WIN32 OR ${CMAKE_SIZEOF_VOID_P} EQUAL 8)
+    set(_zhr_default_vulkan ON)
+else()
+    set(_zhr_default_vulkan OFF)
+endif()
+option(ZHR_USE_VULKAN "Use the Rust Vulkan 1.3 renderer backend instead of DX8" ${_zhr_default_vulkan})
+add_feature_info(VulkanBackend ZHR_USE_VULKAN "Build with Rust Vulkan 1.3 renderer backend (zhr-vulkan)")
+
 # Find/Add build dependencies and stubs shared by all projects
-if((WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows") AND ${CMAKE_SIZEOF_VOID_P} EQUAL 4)
+if((WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows") AND ${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT ZHR_USE_VULKAN)
     include(cmake/dx8.cmake)
+elseif(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
+    # 64-bit / Vulkan builds do not link 32-bit d3d8.lib / d3dx8.lib.
+    # Provide Windows SDK dinput8/dxguid + header-only d3d8 struct definitions during DX8Wrapper migration.
+    include(cmake/dx8-headers-only.cmake)
+else()
+    add_library(d3d8lib INTERFACE)
 endif()
 
 if (IS_VS6_BUILD)
@@ -70,6 +86,10 @@ else()
 endif()
 include(cmake/lzhl.cmake)
 include(cmake/stb.cmake)
+
+if(NOT IS_VS6_BUILD)
+    include(cmake/rust.cmake)
+endif()
 
 if(RTS_BUILD_OPTION_PROFILE_TRACY)
     include(cmake/tracy.cmake)

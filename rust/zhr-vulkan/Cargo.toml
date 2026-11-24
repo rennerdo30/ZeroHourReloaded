@@ -1,0 +1,24 @@
+[package]
+name = "zhr-vulkan"
+description = "Cross-platform Vulkan 1.3 renderer for ZeroHourReloaded (WW3D2-compatible)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash.workspace = true
+bitflags.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+gpu-allocator.workspace = true
+log.workspace = true
+naga.workspace = true
+png.workspace = true
+raw-window-handle.workspace = true
+thiserror.workspace = true
+zhr-core.workspace = true
+
+[lints]
+workspace = true

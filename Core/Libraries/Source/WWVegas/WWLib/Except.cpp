@@ -405,6 +405,15 @@ void Dump_Exception_Info(EXCEPTION_POINTERS *e_info)
 	symptr->SizeOfStruct = sizeof (IMAGEHLP_SYMBOL);
 	symptr->MaxNameLength = 256-sizeof (IMAGEHLP_SYMBOL);
 	symptr->Size = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+	symptr->Address = static_cast<DWORD64>(context->Rip);
+	if (!IsBadCodePtr(reinterpret_cast<FARPROC>(context->Rip))) {
+		snprintf(scrap, ARRAY_SIZE(scrap), "Exception occurred at %016llX\r\n",
+			static_cast<unsigned long long>(context->Rip));
+	} else {
+		DebugString ("Exception Handler: context->Rip is bad code pointer\n");
+	}
+#else
 	symptr->Address = context->Eip;
 
 	if (!IsBadCodePtr((FARPROC)context->Eip)) {
@@ -421,6 +430,7 @@ void Dump_Exception_Info(EXCEPTION_POINTERS *e_info)
 	} else {
 		DebugString ("Exception Handler: context->Eip is bad code pointer\n");
 	}
+#endif
 
 	Add_Txt (scrap);
 
@@ -525,6 +535,31 @@ void Dump_Exception_Info(EXCEPTION_POINTERS *e_info)
 	/*
 	** Dump the registers.
 	*/
+#if defined(_M_X64) || defined(__x86_64__)
+	snprintf(scrap, ARRAY_SIZE(scrap), "Rip:%016llX\tRsp:%016llX\tRbp:%016llX\r\n",
+		static_cast<unsigned long long>(context->Rip),
+		static_cast<unsigned long long>(context->Rsp),
+		static_cast<unsigned long long>(context->Rbp));
+	Add_Txt(scrap);
+	snprintf(scrap, ARRAY_SIZE(scrap), "Rax:%016llX\tRbx:%016llX\tRcx:%016llX\r\n",
+		static_cast<unsigned long long>(context->Rax),
+		static_cast<unsigned long long>(context->Rbx),
+		static_cast<unsigned long long>(context->Rcx));
+	Add_Txt(scrap);
+	snprintf(scrap, ARRAY_SIZE(scrap), "Rdx:%016llX\tRsi:%016llX\tRdi:%016llX\r\n",
+		static_cast<unsigned long long>(context->Rdx),
+		static_cast<unsigned long long>(context->Rsi),
+		static_cast<unsigned long long>(context->Rdi));
+	Add_Txt(scrap);
+	sprintf(scrap, "EFlags:%08X \r\n", context->EFlags);
+	Add_Txt(scrap);
+	sprintf(scrap, "CS:%04x  SS:%04x  DS:%04x  ES:%04x  FS:%04x  GS:%04x\r\n", context->SegCs, context->SegSs, context->SegDs, context->SegEs, context->SegFs, context->SegGs);
+	Add_Txt(scrap);
+
+	DebugString("RIP bytes dump...\n");
+	snprintf(scrap, ARRAY_SIZE(scrap), "\r\nBytes at CS:RIP (%016llX)  : ", static_cast<unsigned long long>(context->Rip));
+	unsigned char *eip_ptr = reinterpret_cast<unsigned char *>(context->Rip);
+#else
 	sprintf(scrap, "Eip:%08X\tEsp:%08X\tEbp:%08X\r\n", context->Eip, context->Esp, context->Ebp);
 	Add_Txt(scrap);
 	sprintf(scrap, "Eax:%08X\tEbx:%08X\tEcx:%08X\r\n", context->Eax, context->Ebx, context->Ecx);
@@ -587,6 +622,7 @@ void Dump_Exception_Info(EXCEPTION_POINTERS *e_info)
 	sprintf(scrap, "\r\nBytes at CS:EIP (%08X)  : ", context->Eip);
 
 	unsigned char *eip_ptr = (unsigned char *) (context->Eip);
+#endif
 	char bytestr[32];
 
 	for (int c = 0 ; c < 32 ; c++) {
@@ -607,7 +643,11 @@ void Dump_Exception_Info(EXCEPTION_POINTERS *e_info)
 	*/
 	DebugString("Stack dump...\n");
 	Add_Txt("Stack dump (* indicates possible code address) :\r\n");
+#if defined(_M_X64) || defined(__x86_64__)
+	unsigned long *stackptr = reinterpret_cast<unsigned long*>(context->Rsp);
+#else
 	unsigned long *stackptr = (unsigned long*) context->Esp;
+#endif
 
 	for (int j=0 ; j<2048 ; j++) {
 		if (IsBadReadPtr(stackptr, 4)) {
@@ -1017,6 +1057,16 @@ int Stack_Walk(unsigned long *return_addresses, int num_addresses, CONTEXT *cont
 		return(0);
 	}
 
+#if defined(_M_X64) || defined(__x86_64__)
+	(void)context;
+	void *frames[256];
+	int max_frames = num_addresses < 256 ? num_addresses : 256;
+	USHORT captured = RtlCaptureStackBackTrace(1, static_cast<DWORD>(max_frames), frames, nullptr);
+	for (USHORT i = 0; i < captured; ++i) {
+		return_addresses[i] = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(frames[i]));
+	}
+	return static_cast<int>(captured);
+#else
 	/*
 	** Set up the stack frame structure for the start point of the stack walk (i.e. here).
 	*/
@@ -1083,6 +1133,7 @@ here:
 	}
 
 	return(pointer_index);
+#endif
 }
 
 

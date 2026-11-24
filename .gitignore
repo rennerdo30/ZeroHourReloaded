@@ -5,6 +5,10 @@
 !.gitattributes
 !.github
 !.gitmodules
+!.cargo/
+.cargo/*
+!.cargo/config.example.toml
+/target/
 
 *.user
 *.ncb

@@ -33,6 +33,10 @@
 #include "Utility/stringex.h"
 #include <imagehlp.h>
 
+#ifdef StackWalk
+#undef StackWalk
+#endif
+
 // Definitions to allow run-time linking to the dbghelp.dll functions.
 
 #define DBGHELP(name,ret,par) typedef ret (WINAPI *name##Type) par;
@@ -341,6 +345,16 @@ int DebugStackwalk::StackWalk(Signature &sig, struct _CONTEXT *ctx)
 
   sig.m_numAddr=0;
 
+#if defined(_M_X64) || defined(__x86_64__)
+  (void)ctx;
+  void *frames[Signature::MAX_ADDR];
+  USHORT captured = RtlCaptureStackBackTrace(1, Signature::MAX_ADDR, frames, nullptr);
+  for (USHORT i = 0; i < captured && sig.m_numAddr < Signature::MAX_ADDR; ++i)
+  {
+    sig.m_addr[sig.m_numAddr++] = static_cast<unsigned>(reinterpret_cast<uintptr_t>(frames[i]));
+  }
+  return sig.m_numAddr;
+#else
   // bail out if no stack walk available
   if (!gDbg._StackWalk)
     return 0;
@@ -402,4 +416,5 @@ int DebugStackwalk::StackWalk(Signature &sig, struct _CONTEXT *ctx)
   }
 
 	return sig.m_numAddr;
+#endif
 }

@@ -33,6 +33,9 @@
 #include "internal_io.h"
 #include <stdlib.h>
 #include <windows.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include <Utility/stdio_adapter.h>
 #include <Utility/stringex.h>
 #include <new>      // needed for placement new prototype
@@ -307,7 +310,9 @@ bool Debug::SkipNext()
   // do not implement this function inline, we do need
   // a valid frame pointer here!
   unsigned help;
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+  help = static_cast<unsigned>(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+#elif defined(_MSC_VER)
   __asm
   {
     mov eax,[ebp+4]   // return address
@@ -321,6 +326,8 @@ bool Debug::SkipNext()
     :
     : "memory"
   );
+#elif defined(__GNUC__) || defined(__clang__)
+  help = static_cast<unsigned>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 #else
   #error "Unsupported compiler or architecture for inline assembly"
 #endif
@@ -436,10 +443,7 @@ bool Debug::AssertDone()
           break;
         case IDRETRY:
 #if defined(_MSC_VER)
-          __asm
-          {
-            int 0x03
-          }
+          __debugbreak();
 #elif defined(__GNUC__)
           __builtin_trap();
 #else
