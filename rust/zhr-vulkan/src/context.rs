@@ -404,6 +404,14 @@ unsafe extern "system" fn vulkan_debug_callback(
         }
         log::error!("[Vulkan Validation ERROR] {msg}");
         eprintln!("[Vulkan Validation ERROR] {msg}");
+        if let Ok(p) = std::env::var("ZHR_VK_TRACE_LOG") {
+            let line = format!("[VALIDATION ERROR] {msg}\n");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        }
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
         log::warn!("[Vulkan Validation WARN] {msg}");
     }

@@ -235,6 +235,8 @@ set(WW3D2_SRC
 if(ZHR_USE_VULKAN)
     list(APPEND WW3D2_SRC
         Backend/VulkanBackend.cpp
+        Backend/VulkanDX8Bridge.cpp
+        Backend/VulkanDX8Bridge.h
         Backend/VulkanD3DXCompat.cpp
     )
 else()

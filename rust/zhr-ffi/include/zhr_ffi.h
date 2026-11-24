@@ -41,6 +41,8 @@ int32_t zhr_vk_selected_device(void);
 const char* zhr_vk_device_name(int32_t index);
 void zhr_vk_get_resolution(uint32_t* out_width, uint32_t* out_height);
 bool zhr_vk_is_windowed(void);
+bool zhr_vk_is_frame_active(void);
+int32_t zhr_vk_resize(uint32_t width, uint32_t height);
 
 int32_t zhr_vk_begin_frame(void);
 int32_t zhr_vk_end_frame(void);
@@ -84,9 +86,20 @@ void zhr_vk_set_point_light(
     float b,
     float range);
 void zhr_vk_clear_light(uint32_t index);
+void zhr_vk_set_lighting_enabled(bool enabled);
+void zhr_vk_set_alpha_test_ref(float alpha_ref);
 void zhr_vk_set_fog(bool enable, float r, float g, float b, float start, float end);
 void zhr_vk_set_shader(uint32_t ww3d_shader_bits);
 
+// format: 0=RGBA8, 1=BGRA8, 2=BC1(DXT1), 3=BC2(DXT3), 4=BC3(DXT5)
+uint32_t zhr_vk_create_texture_2d(
+    uint32_t width,
+    uint32_t height,
+    uint32_t format,
+    const uint8_t* pixels,
+    size_t byte_len,
+    bool linear_filter,
+    bool clamp_edge);
 uint32_t zhr_vk_create_texture_rgba8(
     uint32_t width,
     uint32_t height,
@@ -94,6 +107,7 @@ uint32_t zhr_vk_create_texture_rgba8(
     size_t byte_len,
     bool linear_filter,
     bool clamp_edge);
+void zhr_vk_destroy_texture(uint32_t texture_id);
 void zhr_vk_set_texture(uint32_t texture_id);
 
 int32_t zhr_vk_draw_dynamic(

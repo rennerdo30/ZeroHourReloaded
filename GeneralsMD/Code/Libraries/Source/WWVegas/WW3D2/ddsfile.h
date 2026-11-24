@@ -138,7 +138,7 @@ struct LegacyDDSURFACEDESC2 {
 	};
 	unsigned AlphaBitDepth;
 	unsigned Reserved;
-	void* Surface;
+	unsigned Surface; // 32-bit on-disk DDS_HEADER field (must stay 4 bytes on 64-bit)
 	union
 	{
 		LegacyDDCOLORKEY CKDestOverlay;
@@ -151,6 +151,7 @@ struct LegacyDDSURFACEDESC2 {
 	LegacyDDSCAPS2 Caps;
 	unsigned TextureStage;
 };
+static_assert(sizeof(LegacyDDSURFACEDESC2) == 124, "LegacyDDSURFACEDESC2 must match 124-byte DDS on-disk header");
 
 
 enum DDSType

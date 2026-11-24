@@ -446,6 +446,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zhr-play"
+version = "0.1.0"
+
+[[package]]
 name = "zhr-vulkan"
 version = "0.1.0"
 dependencies = [

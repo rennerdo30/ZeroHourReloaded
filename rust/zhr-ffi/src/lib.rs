@@ -115,11 +115,36 @@ pub extern "C" fn zhr_vk_init_win32(
     };
     match VulkanRenderer::new_windowed(config, display, window) {
         Ok(r) => {
+            if let Ok(p) = std::env::var("ZHR_VK_TRACE_LOG") {
+                let (rw, rh) = r.resolution();
+                let msg = format!(
+                    "init_win32 OK device='{}' req={}x{} actual={}x{} val={}\n",
+                    r.device_info().name,
+                    width,
+                    height,
+                    rw,
+                    rh,
+                    r.validation_active()
+                );
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+            }
             guard.renderer = Some(r);
             cache_device_names(&mut guard);
             1
         }
         Err(e) => {
+            if let Ok(p) = std::env::var("ZHR_VK_TRACE_LOG") {
+                let msg = format!("init_win32 ERR ({width}x{height}): {e}\n");
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+            }
             log::error!("zhr_vk_init_win32 failed: {e}");
             0
         }
@@ -169,7 +194,20 @@ pub extern "C" fn zhr_vk_begin_frame() -> i32 {
     let Some(r) = guard.renderer.as_mut() else {
         return 0;
     };
-    i32::from(r.begin_frame().is_ok())
+    match r.begin_frame() {
+        Ok(()) => 1,
+        Err(e) => {
+            if let Ok(p) = std::env::var("ZHR_VK_TRACE_LOG") {
+                let msg = format!("begin_frame ERR: {e}\n");
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+            }
+            0
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -178,7 +216,20 @@ pub extern "C" fn zhr_vk_end_frame() -> i32 {
     let Some(r) = guard.renderer.as_mut() else {
         return 0;
     };
-    i32::from(r.end_frame().is_ok())
+    match r.end_frame() {
+        Ok(()) => 1,
+        Err(e) => {
+            if let Ok(p) = std::env::var("ZHR_VK_TRACE_LOG") {
+                let msg = format!("end_frame ERR: {e}\n");
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+            }
+            0
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -300,8 +351,12 @@ pub extern "C" fn zhr_vk_set_point_light(
     }
 }
 
+/// Queries the active renderer resolution into optional output pointers.
+///
+/// # Safety
+/// Non-null `out_width` and `out_height` must point to valid writable `u32` locations.
 #[unsafe(no_mangle)]
-pub extern "C" fn zhr_vk_get_resolution(out_width: *mut u32, out_height: *mut u32) {
+pub unsafe extern "C" fn zhr_vk_get_resolution(out_width: *mut u32, out_height: *mut u32) {
     let guard = vk_state().lock().expect("vk state poisoned");
     let (w, h) = guard
         .renderer
@@ -326,6 +381,41 @@ pub extern "C" fn zhr_vk_is_windowed() -> bool {
         .as_ref()
         .map(|r| r.is_windowed())
         .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_is_frame_active() -> bool {
+    let guard = vk_state().lock().expect("vk state poisoned");
+    guard
+        .renderer
+        .as_ref()
+        .map(|r| r.is_frame_active())
+        .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_resize(width: u32, height: u32) -> i32 {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    let Some(ren) = guard.renderer.as_mut() else {
+        return 0;
+    };
+    i32::from(ren.resize(width, height).is_ok())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_lighting_enabled(enabled: bool) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_lighting_enabled(enabled);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_alpha_test_ref(alpha_ref: f32) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_alpha_test_ref(alpha_ref);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -357,6 +447,52 @@ pub extern "C" fn zhr_vk_set_shader(ww3d_shader_bits: u32) {
     }
 }
 
+/// Uploads a 2D texture in any supported `TextureFormat` and returns its non-zero handle (0 on failure).
+/// `format`: 0=RGBA8, 1=BGRA8, 2=BC1(DXT1), 3=BC2(DXT3), 4=BC3(DXT5).
+///
+/// # Safety
+/// `pixels` must point to `byte_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_vk_create_texture_2d(
+    width: u32,
+    height: u32,
+    format: u32,
+    pixels: *const u8,
+    byte_len: usize,
+    linear_filter: bool,
+    clamp_edge: bool,
+) -> u32 {
+    if pixels.is_null() {
+        return 0;
+    }
+    let tex_format = match format {
+        0 => TextureFormat::Rgba8Unorm,
+        1 => TextureFormat::Bgra8Unorm,
+        2 => TextureFormat::Bc1RgbaUnorm,
+        3 => TextureFormat::Bc2Unorm,
+        4 => TextureFormat::Bc3Unorm,
+        _ => return 0,
+    };
+    // SAFETY: Caller guarantees `pixels` is valid for `byte_len` bytes.
+    let data = unsafe { std::slice::from_raw_parts(pixels, byte_len) };
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    let Some(ren) = guard.renderer.as_mut() else {
+        return 0;
+    };
+    ren.create_texture_2d(
+        width,
+        height,
+        tex_format,
+        data,
+        SamplerDesc {
+            linear_filter,
+            clamp_edge,
+        },
+    )
+    .map(|id| id.0)
+    .unwrap_or(0)
+}
+
 /// Uploads a 2D RGBA8 texture and returns its non-zero handle (0 on failure).
 ///
 /// # Safety
@@ -370,27 +506,29 @@ pub unsafe extern "C" fn zhr_vk_create_texture_rgba8(
     linear_filter: bool,
     clamp_edge: bool,
 ) -> u32 {
-    if pixels.is_null() {
-        return 0;
-    }
-    // SAFETY: Caller guarantees `pixels` is valid for `byte_len` bytes.
-    let data = unsafe { std::slice::from_raw_parts(pixels, byte_len) };
-    let mut guard = vk_state().lock().expect("vk state poisoned");
-    let Some(ren) = guard.renderer.as_mut() else {
-        return 0;
-    };
-    ren.create_texture_2d(
-        width,
-        height,
-        TextureFormat::Rgba8Unorm,
-        data,
-        SamplerDesc {
+    // SAFETY: Forwarded with identical pointer/length preconditions.
+    unsafe {
+        zhr_vk_create_texture_2d(
+            width,
+            height,
+            0,
+            pixels,
+            byte_len,
             linear_filter,
             clamp_edge,
-        },
-    )
-    .map(|id| id.0)
-    .unwrap_or(0)
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_destroy_texture(texture_id: u32) {
+    if texture_id == 0 {
+        return;
+    }
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        let _ = ren.destroy_texture(TextureId(texture_id));
+    }
 }
 
 #[unsafe(no_mangle)]

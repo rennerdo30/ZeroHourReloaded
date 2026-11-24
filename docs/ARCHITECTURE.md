@@ -23,11 +23,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p zhr-ffi --profile release-fast
 ```
 
+### Build & Play (One Command / Double-Click)
+ZeroHourReloaded auto-discovers your locally installed Zero Hour assets (`INIZH.big`) from `ZHR_ASSETS_DIR`, sibling/local folders, Steam (`libraryfolders.vdf` across all drives), or EA App/Origin Registry keys — zero copyrighted assets are shipped in this repo.
+
+```powershell
+# Always incrementally rebuilds latest Rust + C++20 and launches 64-bit Vulkan 1.3:
+cargo run
+
+# Or double-click `play.bat` in the repository root, or run PowerShell directly:
+pwsh -File scripts/run-win64-vulkan.ps1
+pwsh -File scripts/run-win64-vulkan.ps1 -NoShellMap -Validation
+pwsh -File scripts/run-win64-vulkan.ps1 -AssetsDir "C:\Path\To\Zero Hour"
+```
+
 ### Full Native 64-bit (`x64`) Vulkan Build (C++20 + Rust via Ninja + `sccache`)
 ```powershell
 pwsh -File scripts/build-win64-vulkan.ps1 -Config RelWithDebInfo -Target z_generals
 ```
-Output: `build/win64-vulkan/GeneralsMD/RelWithDebInfo/generalszh.exe` (`PE32+` x64, zero `d3d8.dll`/`d3dx8` imports, linked against `zhr_ffi.lib`).
+Output: `build/win64-vulkan/GeneralsMD/RelWithDebInfo/generalszh.exe` (`PE32+` x64, zero `d3d8.dll`/`d3dx8` imports, linked against `zhr_ffi.lib`). The launcher copies it alongside your assets as `generalszh-vulkan64.exe` so any existing 32-bit `generalszh.exe` stays untouched.
 
 ### Build-Speed Conventions
 - **`sccache`** wraps both Rust (`rustc-wrapper`) and C/C++ (`CMAKE_C/CXX_COMPILER_LAUNCHER` with `/Z7` embedded debug info).
@@ -42,7 +55,7 @@ We retain TSH's battle-tested C++20 simulation, INI/BIG/W3D/map loaders, AI, scr
 
 | Legacy Blocker | Replacement Crate | Status |
 |---|---|---|
-| DirectX 8 (`DX8Backend`, 32-bit Windows) | `rust/zhr-vulkan` (`ash` Vulkan 1.3 dynamic rendering + `gpu-allocator` + `naga` WGSL→SPIR-V) + `WW3D2/Backend/VulkanBackend.cpp` | Core Vulkan 1.3 renderer & C-ABI built + GPU-tested (0 validation errors); `DX8Wrapper` draw/buffer/texture routing in progress |
+| DirectX 8 (`DX8Backend`, 32-bit Windows) | `rust/zhr-vulkan` (`ash` Vulkan 1.3 dynamic rendering + `gpu-allocator` + `naga` WGSL→SPIR-V) + `WW3D2/Backend/VulkanDX8Bridge.cpp` | **Working** — native 64-bit Zero Hour boots & renders Main Menu + live 3D Shell Map on Vulkan 1.3 with 0 Khronos validation errors (`ZHR-2`) |
 | Miles Sound System (`mss32.dll`, 32-bit) | `rust/zhr-audio` (cross-platform Rust 3D audio + WAV/MP3 decoding) | Planned (`ZHR-3`) |
 | Bink Video (`binkw32.dll`, 32-bit) | Existing TSH FFmpeg video backend (`RTS_BUILD_OPTION_FFMPEG`) | Planned (`ZHR-3`) |
 | Win32 Window + DirectInput (`Win32Device`) | `rust/zhr-platform` (SDL3 cross-platform window/input) | Planned (`ZHR-4`) |
@@ -62,7 +75,8 @@ Because copyrighted `.big` assets stay strictly on the player's machine, visual 
   1. **Isolate Alpha / House-Color Channels:** Run AI super-resolution on **RGB only**; process alpha/team-color masks separately so dynamic player faction colors never bleed or wash out.
   2. **Modern GPU Compression:** Cache outputs as **`BC7`** (albedo), **`BC5`** (normals), **`BC4`** (roughness/height) instead of lossy 2003 `DXT1`/`DXT5`.
   3. **Zero-Stall Async Hot-Swap:** Show original texture on frame 1, run FP16 ONNX / Vulkan compute asynchronously, hot-swap the Vulkan descriptor in-place, and persist to `%LOCALAPPDATA%/ZeroHourReloaded/cache/`.
-  4. **License Discipline:** Do **not** use non-commercial/research-only weights (e.g., Ubisoft CHORD).
+  4. **Instant Runtime A/B Testing Toggles:** Built-in hotkeys (planned: `F9` for AI Textures/PBR, `F10` for Mesh Subdivision + Modern Lighting, plus a master Original ↔ Remastered toggle and optional split-screen wipe) to compare original vs. remastered visuals live in-game without restarting.
+  5. **License Discipline:** Do **not** use non-commercial/research-only weights (e.g., Ubisoft CHORD).
 
 ### Geometry-Preserving `.W3D` Mesh & Renderer Upgrades
 - **Never** use generative 3D mesh-replacement AI on-the-fly (breaks W3D bone hierarchies `TURRET01`/`MUZZLEFX01`, animations, damage states, and RTS readability).

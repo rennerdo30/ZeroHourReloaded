@@ -21,6 +21,9 @@ impl ShaderKey {
     pub const SHIFT_TEXTURING: u32 = 16;
     pub const SHIFT_ALPHA_TEST: u32 = 18;
     pub const SHIFT_CULL_MODE: u32 = 19;
+    /// Optional extension bit (outside WW3D2's 24-bit shader mask): when set with `SHIFT_CULL_MODE`,
+    /// culls clockwise triangles (`D3DCULL_CW` -> front face is counter-clockwise).
+    pub const SHIFT_CULL_CW: u32 = 28;
 
     pub const fn from_raw(bits: u32) -> Self {
         Self(bits)
@@ -185,6 +188,10 @@ impl ShaderKey {
         ((self.0 >> Self::SHIFT_CULL_MODE) & 0x1) != 0
     }
 
+    pub const fn cull_cw(self) -> bool {
+        ((self.0 >> Self::SHIFT_CULL_CW) & 0x1) != 0
+    }
+
     pub const fn blend_enabled(self) -> bool {
         !matches!(
             (self.src_blend(), self.dst_blend()),
@@ -200,7 +207,8 @@ impl ShaderKey {
             | (0x1 << ShaderKey::SHIFT_COLOR_MASK)
             | (0x7 << ShaderKey::SHIFT_DST_BLEND)
             | (0x3 << ShaderKey::SHIFT_SRC_BLEND)
-            | (0x1 << ShaderKey::SHIFT_CULL_MODE);
+            | (0x1 << ShaderKey::SHIFT_CULL_MODE)
+            | (0x1 << ShaderKey::SHIFT_CULL_CW);
         Self(self.0 & PIPELINE_MASK)
     }
 }

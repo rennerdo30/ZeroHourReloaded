@@ -150,7 +150,11 @@ impl PipelineCache {
             } else {
                 vk::CullModeFlags::NONE
             })
-            .front_face(vk::FrontFace::CLOCKWISE)
+            .front_face(if key.shader.cull_cw() {
+                vk::FrontFace::COUNTER_CLOCKWISE
+            } else {
+                vk::FrontFace::CLOCKWISE
+            })
             .line_width(1.0);
 
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()

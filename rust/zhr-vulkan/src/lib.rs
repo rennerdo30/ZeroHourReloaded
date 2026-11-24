@@ -35,10 +35,10 @@ use crate::types::{
 };
 
 const FRAMES_IN_FLIGHT: usize = 2;
-const DYNAMIC_UNIFORM_BYTES: usize = 4 * 1024 * 1024; // 4 MiB / frame (>10k draws)
-const DYNAMIC_VERTEX_BYTES: usize = 16 * 1024 * 1024; // 16 MiB / frame
-const DYNAMIC_INDEX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB / frame
-const MAX_TEXTURES: u32 = 4096;
+const DYNAMIC_UNIFORM_BYTES: usize = 8 * 1024 * 1024; // 8 MiB / frame (>20k draws)
+const DYNAMIC_VERTEX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB / frame
+const DYNAMIC_INDEX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB / frame
+const MAX_TEXTURES: u32 = 16384;
 
 /// Renderer configuration.
 #[derive(Clone, Debug)]
@@ -73,11 +73,11 @@ struct FrameSlot {
     cmd: vk::CommandBuffer,
     in_flight_fence: vk::Fence,
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
     uniform_ring: DynamicRingBuffer,
     uniform_set: vk::DescriptorSet,
     dynamic_vb: DynamicRingBuffer,
     dynamic_ib: DynamicRingBuffer,
+    retired_textures: Vec<GpuTexture>,
 }
 
 struct ActiveFrame {
@@ -104,6 +104,7 @@ pub struct VulkanRenderer {
     texture_pool: vk::DescriptorPool,
     frames: Vec<FrameSlot>,
     frame_cursor: usize,
+    frame_number: u64,
     active_frame: Option<ActiveFrame>,
 
     // GPU resource registries
@@ -206,10 +207,9 @@ impl VulkanRenderer {
             let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             let sem_info = vk::SemaphoreCreateInfo::default();
             // SAFETY: `ctx.device` is valid.
-            let (in_flight_fence, image_available, render_finished) = unsafe {
+            let (in_flight_fence, image_available) = unsafe {
                 (
                     ctx.device.create_fence(&fence_info, None)?,
-                    ctx.device.create_semaphore(&sem_info, None)?,
                     ctx.device.create_semaphore(&sem_info, None)?,
                 )
             };
@@ -256,11 +256,11 @@ impl VulkanRenderer {
                 cmd,
                 in_flight_fence,
                 image_available,
-                render_finished,
                 uniform_ring,
                 uniform_set,
                 dynamic_vb,
                 dynamic_ib,
+                retired_textures: Vec::new(),
             });
         }
 
@@ -290,6 +290,7 @@ impl VulkanRenderer {
             texture_pool,
             frames,
             frame_cursor: 0,
+            frame_number: 0,
             active_frame: None,
             next_buffer_id: 1,
             buffers: HashMap::new(),
@@ -329,6 +330,10 @@ impl VulkanRenderer {
 
     pub fn is_windowed(&self) -> bool {
         matches!(self.target, Some(RenderTarget::Windowed(_)))
+    }
+
+    pub fn is_frame_active(&self) -> bool {
+        self.active_frame.is_some()
     }
 
     pub fn validation_active(&self) -> bool {
@@ -438,7 +443,19 @@ impl VulkanRenderer {
         if id == self.default_white_texture {
             return Ok(());
         }
-        // SAFETY: Wait idle before freeing texture/descriptor set.
+        if self.active_texture == id {
+            self.active_texture = self.default_white_texture;
+        }
+        if let Some(af) = &mut self.active_frame {
+            if af.last_texture == Some(id) {
+                af.last_texture = None;
+            }
+            if let Some(tex) = self.textures.remove(&id) {
+                self.frames[af.slot_index].retired_textures.push(tex);
+            }
+            return Ok(());
+        }
+        // SAFETY: Outside an active frame, wait idle before freeing texture/descriptor set.
         unsafe { self.ctx.device.device_wait_idle()? };
         if let Some(tex) = self.textures.remove(&id) {
             let ds = tex.descriptor_set;
@@ -450,9 +467,6 @@ impl VulkanRenderer {
                     .device
                     .free_descriptor_sets(self.texture_pool, &[ds]);
             }
-        }
-        if self.active_texture == id {
-            self.active_texture = self.default_white_texture;
         }
         Ok(())
     }
@@ -596,8 +610,19 @@ impl VulkanRenderer {
         slot.uniform_ring.reset();
         slot.dynamic_vb.reset();
         slot.dynamic_ib.reset();
-
+        let retired: Vec<GpuTexture> = std::mem::take(&mut slot.retired_textures);
         let cmd = slot.cmd;
+        for tex in retired {
+            let ds = tex.descriptor_set;
+            tex.destroy(&mut self.ctx);
+            // SAFETY: Fence was waited, so no in-flight commands reference `ds`.
+            unsafe {
+                let _ = self
+                    .ctx
+                    .device
+                    .free_descriptor_sets(self.texture_pool, &[ds]);
+            }
+        }
         // SAFETY: Fence was waited, so `cmd` is no longer in flight.
         unsafe {
             self.ctx
@@ -675,9 +700,17 @@ impl VulkanRenderer {
                 );
             }
             if clear.clear_depth_stencil {
+                let has_stencil = matches!(
+                    af.depth_format,
+                    vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D24_UNORM_S8_UINT
+                );
+                let mut aspect = vk::ImageAspectFlags::DEPTH;
+                if has_stencil {
+                    aspect |= vk::ImageAspectFlags::STENCIL;
+                }
                 attachments.push(
                     vk::ClearAttachment::default()
-                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .aspect_mask(aspect)
                         .clear_value(vk::ClearValue {
                             depth_stencil: vk::ClearDepthStencilValue {
                                 depth: clear.depth,
@@ -954,14 +987,98 @@ impl VulkanRenderer {
             unsafe { self.ctx.device.cmd_end_rendering(cmd) };
         }
 
-        // For windowed targets, transition swapchain image to PRESENT_SRC_KHR.
-        if af.swapchain_image_index.is_some() {
-            let to_present = [vk::ImageMemoryBarrier2::default()
+        self.frame_number += 1;
+        let capture_path = std::env::var("ZHR_VK_CAPTURE_PNG")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let capture_frame: u64 = std::env::var("ZHR_VK_CAPTURE_FRAME")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        let do_capture = af.swapchain_image_index.is_some()
+            && capture_path.is_some()
+            && self.frame_number == capture_frame;
+
+        let capture_staging = if do_capture {
+            let byte_len = (af.extent.width as usize) * (af.extent.height as usize) * 4;
+            let staging = GpuBuffer::new(
+                &mut self.ctx,
+                "zhr_swapchain_capture",
+                byte_len as u64,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::GpuToCpu,
+            )?;
+            let subresource = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+            let to_src = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(af.target_image)
+                .subresource_range(subresource)];
+            let dep = vk::DependencyInfo::default().image_memory_barriers(&to_src);
+            // SAFETY: Valid barrier inside active command buffer.
+            unsafe { self.ctx.device.cmd_pipeline_barrier2(cmd, &dep) };
+
+            let copy = [vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: af.extent.width,
+                    height: af.extent.height,
+                    depth: 1,
+                })];
+            // SAFETY: Staging buffer fits `extent.width * extent.height * 4` bytes.
+            unsafe {
+                self.ctx.device.cmd_copy_image_to_buffer(
+                    cmd,
+                    af.target_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging.buffer,
+                    &copy,
+                );
+            }
+            Some((staging, byte_len))
+        } else {
+            None
+        };
+
+        // For windowed targets, transition swapchain image to PRESENT_SRC_KHR.
+        if af.swapchain_image_index.is_some() {
+            let src_layout = if capture_staging.is_some() {
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            } else {
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            };
+            let src_stage = if capture_staging.is_some() {
+                vk::PipelineStageFlags2::TRANSFER
+            } else {
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+            };
+            let src_access = if capture_staging.is_some() {
+                vk::AccessFlags2::TRANSFER_READ
+            } else {
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+            };
+            let to_present = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
                 .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
                 .dst_access_mask(vk::AccessFlags2::NONE)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .old_layout(src_layout)
                 .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                 .image(af.target_image)
                 .subresource_range(
@@ -986,7 +1103,7 @@ impl VulkanRenderer {
         {
             let wait_sems = [slot.image_available];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let signal_sems = [slot.render_finished];
+            let signal_sems = [sc.render_finished[img_idx as usize]];
             let submit = [vk::SubmitInfo::default()
                 .wait_semaphores(&wait_sems)
                 .wait_dst_stage_mask(&wait_stages)
@@ -1017,6 +1134,46 @@ impl VulkanRenderer {
                     log::info!("Swapchain out of date on present; caller should resize");
                 }
                 Err(e) => return Err(e.into()),
+            }
+
+            if let (Some(path), Some((staging, byte_len))) = (capture_path, capture_staging) {
+                // SAFETY: Wait for fence before reading back the captured staging buffer.
+                unsafe {
+                    self.ctx
+                        .device
+                        .wait_for_fences(&[slot.in_flight_fence], true, u64::MAX)?;
+                }
+                let mut pixels = staging.mapped_slice()?[..byte_len].to_vec();
+                if af.color_format == vk::Format::B8G8R8A8_UNORM
+                    || af.color_format == vk::Format::B8G8R8A8_SRGB
+                {
+                    for px in pixels.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                        px[3] = 255;
+                    }
+                }
+                let _ =
+                    write_rgba8_png(Path::new(&path), af.extent.width, af.extent.height, &pixels);
+                staging.destroy(&mut self.ctx);
+                if let Ok(stats_path) = std::env::var("ZHR_VK_STATS_LOG")
+                    && !stats_path.is_empty()
+                {
+                    let report = format!(
+                        "device={}\nresolution={}x{}\nframe={}\ndraw_calls={}\ntriangles={}\npipeline_binds={}\ntexture_binds={}\nlive_textures={}\nvalidation_active={}\nvalidation_errors={}\n",
+                        self.ctx.device_info.name,
+                        af.extent.width,
+                        af.extent.height,
+                        self.frame_number,
+                        self.stats.draw_calls,
+                        self.stats.triangles,
+                        self.stats.pipeline_binds,
+                        self.stats.texture_binds,
+                        self.textures.len(),
+                        self.ctx.validation_active,
+                        self.ctx.validation_error_count(),
+                    );
+                    let _ = std::fs::write(stats_path, report);
+                }
             }
         } else {
             let submit = [vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
@@ -1072,6 +1229,9 @@ impl Drop for VulkanRenderer {
             t.destroy(&mut self.ctx);
         }
         for frame in self.frames.drain(..) {
+            for tex in frame.retired_textures {
+                tex.destroy(&mut self.ctx);
+            }
             frame.uniform_ring.destroy(&mut self.ctx);
             frame.dynamic_vb.destroy(&mut self.ctx);
             frame.dynamic_ib.destroy(&mut self.ctx);
@@ -1080,9 +1240,6 @@ impl Drop for VulkanRenderer {
                 self.ctx
                     .device
                     .destroy_semaphore(frame.image_available, None);
-                self.ctx
-                    .device
-                    .destroy_semaphore(frame.render_finished, None);
             }
         }
         self.pipelines.destroy_all(&self.ctx.device);

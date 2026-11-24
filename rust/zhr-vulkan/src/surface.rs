@@ -16,6 +16,7 @@ pub struct SwapchainState {
     pub extent: vk::Extent2D,
     pub images: Vec<vk::Image>,
     pub views: Vec<vk::ImageView>,
+    pub render_finished: Vec<vk::Semaphore>,
     pub depth_image: vk::Image,
     pub depth_view: vk::ImageView,
     depth_alloc: Option<Allocation>,
@@ -70,6 +71,13 @@ impl SwapchainState {
             vk::ImageAspectFlags::DEPTH,
         )?;
 
+        let mut render_finished = Vec::with_capacity(built.images.len());
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        for _ in 0..built.images.len() {
+            // SAFETY: `ctx.device` is valid.
+            render_finished.push(unsafe { ctx.device.create_semaphore(&sem_info, None)? });
+        }
+
         Ok(Self {
             surface_loader,
             surface,
@@ -79,6 +87,7 @@ impl SwapchainState {
             extent: built.extent,
             images: built.images,
             views: built.views,
+            render_finished,
             depth_image,
             depth_view,
             depth_alloc: Some(depth_alloc),
@@ -105,10 +114,13 @@ impl SwapchainState {
             old_swapchain,
         )?;
 
-        // SAFETY: Old views/swapchain/depth are idle.
+        // SAFETY: Old views/semaphores/swapchain/depth are idle.
         unsafe {
             for view in self.views.drain(..) {
                 ctx.device.destroy_image_view(view, None);
+            }
+            for sem in self.render_finished.drain(..) {
+                ctx.device.destroy_semaphore(sem, None);
             }
             self.swapchain_loader.destroy_swapchain(old_swapchain, None);
             ctx.device.destroy_image_view(self.depth_view, None);
@@ -128,6 +140,13 @@ impl SwapchainState {
             vk::ImageAspectFlags::DEPTH,
         )?;
 
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        for _ in 0..built.images.len() {
+            // SAFETY: `ctx.device` is valid.
+            self.render_finished
+                .push(unsafe { ctx.device.create_semaphore(&sem_info, None)? });
+        }
+
         self.swapchain = built.swapchain;
         self.format = built.format;
         self.extent = built.extent;
@@ -144,6 +163,9 @@ impl SwapchainState {
         unsafe {
             for view in self.views.drain(..) {
                 ctx.device.destroy_image_view(view, None);
+            }
+            for sem in self.render_finished.drain(..) {
+                ctx.device.destroy_semaphore(sem, None);
             }
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);

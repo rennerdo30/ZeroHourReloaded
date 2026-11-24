@@ -84,6 +84,10 @@
 
 #include "shdlib.h"
 
+#ifdef ZHR_USE_VULKAN
+#include "Backend/VulkanDX8Bridge.h"
+#endif
+
 const int DEFAULT_RESOLUTION_WIDTH = 640;
 const int DEFAULT_RESOLUTION_HEIGHT = 480;
 const int DEFAULT_BIT_DEPTH = 32;
@@ -310,6 +314,19 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 	Invalidate_Cached_Render_States();
 
 	if (!lite) {
+#ifdef ZHR_USE_VULKAN
+		WWDEBUG_SAY(("Create ZeroHourReloaded Vulkan 1.3 Bridge"));
+		D3DInterface = ZhrCreateVulkanD3D8();
+		if (D3DInterface == nullptr) {
+			Shutdown();
+			return(false);
+		}
+		IsInitted = true;
+
+		WWDEBUG_SAY(("Enumerate Vulkan devices"));
+		Enumerate_Devices();
+		WWDEBUG_SAY(("DX8Wrapper Vulkan Init completed"));
+#else
 		D3D8Lib = LoadLibrary("D3D8.DLL");
 
 		if (D3D8Lib == nullptr) return false;	// Return false at this point if init failed
@@ -344,6 +361,7 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 		WWDEBUG_SAY(("Enumerate devices"));
 		Enumerate_Devices();
 		WWDEBUG_SAY(("DX8Wrapper Init completed"));
+#endif
 	}
 
 	return(true);
@@ -3579,6 +3597,11 @@ unsigned int DX8Wrapper::Get_Free_Texture_RAM()
 // Contrast - controls the difference between the maximum and the minimum of the curve
 void DX8Wrapper::Set_Gamma(float gamma,float bright,float contrast,bool calibrate,bool uselimit)
 {
+#ifdef ZHR_USE_VULKAN
+	// Never mutate desktop gamma via Win32 SetDeviceGammaRamp on Vulkan; post-process gamma will handle this.
+	(void)gamma; (void)bright; (void)contrast; (void)calibrate; (void)uselimit;
+	return;
+#endif
 	gamma=Bound(gamma,0.6f,6.0f);
 	bright=Bound(bright,-0.5f,0.5f);
 	contrast=Bound(contrast,0.5f,2.0f);

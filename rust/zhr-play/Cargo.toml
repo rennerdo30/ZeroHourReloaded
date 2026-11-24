@@ -1,0 +1,11 @@
+[package]
+name = "zhr-play"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One-command `cargo run` builder and launcher for ZeroHourReloaded (64-bit Vulkan 1.3)."
+
+[lints]
+workspace = true

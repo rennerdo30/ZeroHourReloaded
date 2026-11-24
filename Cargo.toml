@@ -4,6 +4,7 @@ members = [
     "rust/zhr-core",
     "rust/zhr-vulkan",
     "rust/zhr-ffi",
+    "rust/zhr-play",
 ]
 
 [workspace.package]
