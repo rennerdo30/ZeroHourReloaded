@@ -17,10 +17,12 @@ pub mod types;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use ash::vk;
 use glam::{Mat4, Vec3};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use zhr_remaster::{RemasterJob, RemasterWorker};
 
 use crate::buffer::{DynamicRingBuffer, GpuBuffer};
 use crate::context::VkContext;
@@ -99,8 +101,8 @@ struct ActiveFrame {
     ssao_applied: bool,
     last_3d_proj: Mat4,
     last_pipeline: Option<vk::Pipeline>,
-    last_texture: Option<TextureId>,
-    last_texture1: Option<TextureId>,
+    last_texture: Option<(TextureId, bool)>,
+    last_texture1: Option<(TextureId, bool)>,
 }
 
 /// Main Vulkan 1.3 renderer instance (stateful interface matching `WW3D2::Renderer`).
@@ -116,6 +118,7 @@ pub struct VulkanRenderer {
     frames: Vec<FrameSlot>,
     frame_cursor: usize,
     frame_number: u64,
+    start_time: Instant,
     active_frame: Option<ActiveFrame>,
 
     // GPU resource registries
@@ -123,6 +126,9 @@ pub struct VulkanRenderer {
     buffers: HashMap<BufferId, GpuBuffer>,
     next_texture_id: u32,
     textures: HashMap<TextureId, GpuTexture>,
+    texture_samplers: HashMap<TextureId, SamplerDesc>,
+    remastered_textures: HashMap<TextureId, GpuTexture>,
+    remaster_worker: Option<RemasterWorker>,
     default_white_texture: TextureId,
 
     // WW3D2-compatible render state
@@ -130,6 +136,7 @@ pub struct VulkanRenderer {
     view_matrix: Mat4,
     proj_matrix: Mat4,
     graphics: GraphicsSettings,
+    material_hint: u32,
     shader: ShaderKey,
     stencil: StencilState,
     active_texture: TextureId,
@@ -312,6 +319,16 @@ impl VulkanRenderer {
         let mut textures = HashMap::new();
         textures.insert(default_white_texture, white_tex);
 
+        let enable_remaster = default_remastered
+            && std::env::var("ZHR_REMASTER_TEXTURES")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+        let remaster_worker = if enable_remaster {
+            Some(RemasterWorker::with_defaults())
+        } else {
+            None
+        };
+
         Ok(Self {
             ctx,
             target: Some(target),
@@ -324,16 +341,21 @@ impl VulkanRenderer {
             frames,
             frame_cursor: 0,
             frame_number: 0,
+            start_time: Instant::now(),
             active_frame: None,
             next_buffer_id: 1,
             buffers: HashMap::new(),
             next_texture_id: 2,
             textures,
+            texture_samplers: HashMap::new(),
+            remastered_textures: HashMap::new(),
+            remaster_worker,
             default_white_texture,
             uniforms: DrawUniforms::default(),
             view_matrix: Mat4::IDENTITY,
             proj_matrix: Mat4::IDENTITY,
             graphics,
+            material_hint: 0,
             shader: ShaderKey::OPAQUE_3D,
             stencil: StencilState::default(),
             active_texture: default_white_texture,
@@ -498,6 +520,8 @@ impl VulkanRenderer {
             self.pipelines.set1_texture_layout,
         )?;
         self.textures.insert(id, tex);
+        self.texture_samplers.insert(id, sampler_desc);
+        self.submit_texture_for_remaster(id, width, height, format, &pixels[..expected]);
         Ok(id)
     }
 
@@ -533,7 +557,57 @@ impl VulkanRenderer {
             self.pipelines.set1_texture_layout,
         )?;
         self.textures.insert(id, tex);
+        self.texture_samplers.insert(id, sampler_desc);
+        self.submit_texture_for_remaster(id, width, height, format, &pixels[..expected_base]);
         Ok(id)
+    }
+
+    fn submit_texture_for_remaster(
+        &self,
+        id: TextureId,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+        base_pixels: &[u8],
+    ) {
+        let Some(worker) = self.remaster_worker.as_ref() else {
+            return;
+        };
+        if !(32..=512).contains(&width) || !(32..=512).contains(&height) {
+            return;
+        }
+        let rgba8 = match format {
+            TextureFormat::Rgba8Unorm => Some(base_pixels.to_vec()),
+            TextureFormat::Bgra8Unorm => Some(zhr_remaster::bgra8_to_rgba8(base_pixels)),
+            TextureFormat::Bc1RgbaUnorm => {
+                zhr_remaster::decode_bc_to_rgba8(2, width, height, base_pixels)
+            }
+            TextureFormat::Bc2Unorm => {
+                zhr_remaster::decode_bc_to_rgba8(3, width, height, base_pixels)
+            }
+            TextureFormat::Bc3Unorm => {
+                zhr_remaster::decode_bc_to_rgba8(4, width, height, base_pixels)
+            }
+        };
+        if let Some(rgba8) = rgba8 {
+            worker.submit(RemasterJob {
+                texture_id: id.0,
+                width,
+                height,
+                rgba8,
+            });
+        }
+    }
+
+    /// Enables the background 2x texture remastering worker (used in tests or runtime opt-in).
+    pub fn enable_texture_remastering(&mut self) {
+        if self.remaster_worker.is_none() {
+            self.remaster_worker = Some(RemasterWorker::with_defaults());
+        }
+    }
+
+    pub fn remastered_texture_count(&self) -> usize {
+        self.remastered_textures.len()
     }
 
     pub fn destroy_texture(&mut self, id: TextureId) -> Result<()> {
@@ -546,21 +620,31 @@ impl VulkanRenderer {
         if self.active_texture1 == id {
             self.active_texture1 = self.default_white_texture;
         }
+        self.texture_samplers.remove(&id);
         if let Some(af) = &mut self.active_frame {
-            if af.last_texture == Some(id) {
+            if af.last_texture.is_some_and(|(t, _)| t == id) {
                 af.last_texture = None;
             }
-            if af.last_texture1 == Some(id) {
+            if af.last_texture1.is_some_and(|(t, _)| t == id) {
                 af.last_texture1 = None;
             }
             if let Some(tex) = self.textures.remove(&id) {
                 self.frames[af.slot_index].retired_textures.push(tex);
             }
+            if let Some(rtex) = self.remastered_textures.remove(&id) {
+                self.frames[af.slot_index].retired_textures.push(rtex);
+            }
             return Ok(());
         }
         // SAFETY: Outside an active frame, wait idle before freeing texture/descriptor set.
         unsafe { self.ctx.device.device_wait_idle()? };
-        if let Some(tex) = self.textures.remove(&id) {
+        for tex in [
+            self.textures.remove(&id),
+            self.remastered_textures.remove(&id),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let ds = tex.descriptor_set;
             tex.destroy(&mut self.ctx);
             // SAFETY: `texture_pool` was created with FREE_DESCRIPTOR_SET.
@@ -609,6 +693,10 @@ impl VulkanRenderer {
 
     pub fn graphics_settings(&self) -> GraphicsSettings {
         self.graphics
+    }
+
+    pub fn set_material_hint(&mut self, hint: u32) {
+        self.material_hint = hint;
     }
 
     pub fn set_ambient(&mut self, color: Vec3) {
@@ -771,6 +859,36 @@ impl VulkanRenderer {
                     .ctx
                     .device
                     .free_descriptor_sets(self.texture_pool, &[ds]);
+            }
+        }
+
+        // Zero-stall async texture hot-swap: upload up to 2 completed 2x remastered textures per frame.
+        if let Some(worker) = self.remaster_worker.as_ref() {
+            let finished = worker.poll_completed(2);
+            for item in finished {
+                let id = TextureId(item.texture_id);
+                if !self.textures.contains_key(&id) {
+                    continue;
+                }
+                let sdesc = self.texture_samplers.get(&id).copied().unwrap_or_default();
+                if let Ok(sampler) =
+                    self.samplers
+                        .get_or_create(&self.ctx.device, sdesc, self.ctx.max_anisotropy)
+                    && let Ok(up_tex) = GpuTexture::new_2d(
+                        &mut self.ctx,
+                        &format!("zhr_tex_2x_{}", id.0),
+                        item.width,
+                        item.height,
+                        TextureFormat::Rgba8Unorm,
+                        &item.albedo_rgba8,
+                        sampler,
+                        self.texture_pool,
+                        self.pipelines.set1_texture_layout,
+                    )
+                    && let Some(prev) = self.remastered_textures.insert(id, up_tex)
+                {
+                    self.frames[slot_index].retired_textures.push(prev);
+                }
             }
         }
         // SAFETY: Fence was waited, so `cmd` is no longer in flight.
@@ -1123,6 +1241,12 @@ impl VulkanRenderer {
             split_x_pixels,
             if is_3d_unlit_surface { 1.0 } else { 0.0 },
         ];
+        draw_uniforms.water_params = [
+            self.start_time.elapsed().as_secs_f32(),
+            self.material_hint as f32,
+            0.0,
+            0.0,
+        ];
 
         let alignment = self.ctx.min_uniform_offset_alignment as usize;
         let dyn_offset = self.frames[slot_index]
@@ -1143,17 +1267,24 @@ impl VulkanRenderer {
             );
         }
 
+        let use_remastered_tex =
+            self.graphics.remaster_textures && self.graphics.mode != GraphicsMode::Classic;
+
         let use_combiner = self.uniforms.stage0_ops[0] != 0;
         let tex_id = if use_combiner || self.shader.texturing_enabled() {
             self.active_texture
         } else {
             self.default_white_texture
         };
-        if af.last_texture != Some(tex_id) {
-            let tex = self
-                .textures
-                .get(&tex_id)
-                .ok_or(VkError::InvalidHandle("texture"))?;
+        let tex0_has_remaster =
+            use_remastered_tex && self.remastered_textures.contains_key(&tex_id);
+        if af.last_texture != Some((tex_id, tex0_has_remaster)) {
+            let tex = if tex0_has_remaster {
+                self.remastered_textures.get(&tex_id)
+            } else {
+                self.textures.get(&tex_id)
+            }
+            .ok_or(VkError::InvalidHandle("texture"))?;
             // SAFETY: Texture descriptor set is valid for this frame.
             unsafe {
                 self.ctx.device.cmd_bind_descriptor_sets(
@@ -1165,7 +1296,7 @@ impl VulkanRenderer {
                     &[],
                 );
             }
-            af.last_texture = Some(tex_id);
+            af.last_texture = Some((tex_id, tex0_has_remaster));
             self.stats.texture_binds += 1;
         }
 
@@ -1174,11 +1305,15 @@ impl VulkanRenderer {
         } else {
             self.default_white_texture
         };
-        if af.last_texture1 != Some(tex1_id) {
-            let tex1 = self
-                .textures
-                .get(&tex1_id)
-                .ok_or(VkError::InvalidHandle("texture1"))?;
+        let tex1_has_remaster =
+            use_remastered_tex && self.remastered_textures.contains_key(&tex1_id);
+        if af.last_texture1 != Some((tex1_id, tex1_has_remaster)) {
+            let tex1 = if tex1_has_remaster {
+                self.remastered_textures.get(&tex1_id)
+            } else {
+                self.textures.get(&tex1_id)
+            }
+            .ok_or(VkError::InvalidHandle("texture1"))?;
             // SAFETY: Texture descriptor set is valid for this frame.
             unsafe {
                 self.ctx.device.cmd_bind_descriptor_sets(
@@ -1190,7 +1325,7 @@ impl VulkanRenderer {
                     &[],
                 );
             }
-            af.last_texture1 = Some(tex1_id);
+            af.last_texture1 = Some((tex1_id, tex1_has_remaster));
             self.stats.texture_binds += 1;
         }
 
@@ -1485,7 +1620,7 @@ impl VulkanRenderer {
                     && !stats_path.is_empty()
                 {
                     let report = format!(
-                        "device={}\nresolution={}x{}\nframe={}\ndraw_calls={}\ntriangles={}\npipeline_binds={}\ntexture_binds={}\nlive_textures={}\nvalidation_active={}\nvalidation_errors={}\n",
+                        "device={}\nresolution={}x{}\nframe={}\ndraw_calls={}\ntriangles={}\npipeline_binds={}\ntexture_binds={}\nlive_textures={}\nremastered_textures={}\nvalidation_active={}\nvalidation_errors={}\n",
                         self.ctx.device_info.name,
                         af.extent.width,
                         af.extent.height,
@@ -1495,6 +1630,7 @@ impl VulkanRenderer {
                         self.stats.pipeline_binds,
                         self.stats.texture_binds,
                         self.textures.len(),
+                        self.remastered_textures.len(),
                         self.ctx.validation_active,
                         self.ctx.validation_error_count(),
                     );
@@ -1542,6 +1678,7 @@ impl VulkanRenderer {
 
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
+        self.remaster_worker = None;
         // SAFETY: Wait for GPU idle, then destroy all owned Vulkan objects before `ctx` drops.
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
@@ -1552,6 +1689,11 @@ impl Drop for VulkanRenderer {
         }
         let textures: Vec<GpuTexture> = self.textures.drain().map(|(_, t)| t).collect();
         for t in textures {
+            t.destroy(&mut self.ctx);
+        }
+        let remastered: Vec<GpuTexture> =
+            self.remastered_textures.drain().map(|(_, t)| t).collect();
+        for t in remastered {
             t.destroy(&mut self.ctx);
         }
         for frame in self.frames.drain(..) {

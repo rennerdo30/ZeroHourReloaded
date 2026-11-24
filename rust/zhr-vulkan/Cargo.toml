@@ -19,6 +19,7 @@ png.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 zhr-core.workspace = true
+zhr-remaster.workspace = true
 
 [lints]
 workspace = true

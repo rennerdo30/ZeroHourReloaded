@@ -17,3 +17,8 @@ target_link_libraries(deps_miles PRIVATE
     depsi_always # Gives force included headers. Link early.
     deps_utility
 )
+
+if(ZHR_BUILD_RUST)
+    target_compile_definitions(deps_miles PRIVATE ZHR_USE_RUST_AUDIO=1)
+    target_include_directories(deps_miles PRIVATE "${CMAKE_SOURCE_DIR}/rust/zhr-ffi/include")
+endif()

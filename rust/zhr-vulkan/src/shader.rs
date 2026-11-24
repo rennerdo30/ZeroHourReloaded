@@ -445,6 +445,7 @@ struct DrawUniforms {
     stage1_ops: vec4<u32>,
     camera_pos_and_pbr: vec4<f32>,
     render_flags: vec4<f32>,
+    water_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: DrawUniforms;
@@ -647,7 +648,65 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    if (pbr_active && u.render_flags.x > 0.5) {
+    if (pbr_active && u.water_params.y > 0.5) {
+        // Modern Vulkan 1.3 Animated Water: domain-warped organic multi-wave normals + Fresnel sky reflection + GGX sun glints.
+        let t = u.water_params.x;
+        // Domain-warp world XY coordinates smoothly so wave trains never form periodic grids.
+        let warp = vec2<f32>(
+            sin(in.world_pos.y * 0.023 + t * 0.45) + cos(in.world_pos.x * 0.017 - t * 0.32),
+            cos(in.world_pos.x * 0.021 + t * 0.38) - sin(in.world_pos.y * 0.019 + t * 0.29),
+        ) * 11.0;
+        let wp = in.world_pos.xy + warp;
+
+        // 5 non-orthogonal, irrational-ratio wave octaves for natural ocean chop.
+        let p1 = dot(wp, vec2<f32>(0.93, 0.36)) * 0.068 + t * 0.95;
+        let p2 = dot(wp, vec2<f32>(0.41, 0.91)) * 0.113 + t * 1.32;
+        let p3 = dot(wp, vec2<f32>(-0.77, 0.64)) * 0.197 + t * 1.75;
+        let p4 = dot(wp, vec2<f32>(0.24, -0.97)) * 0.371 + t * 2.25;
+        let p5 = dot(wp, vec2<f32>(-0.88, -0.47)) * 0.683 + t * 2.90;
+
+        let d1 = cos(p1) * 0.055;
+        let d2 = cos(p2) * 0.044;
+        let d3 = cos(p3) * 0.036;
+        let d4 = cos(p4) * 0.026;
+        let d5 = cos(p5) * 0.018;
+
+        let dh_dx = d1 * 0.93 + d2 * 0.41 - d3 * 0.77 + d4 * 0.24 - d5 * 0.88 + clamp(dl_dx * 2.4, -0.16, 0.16);
+        let dh_dy = d1 * 0.36 + d2 * 0.91 + d3 * 0.64 - d4 * 0.97 - d5 * 0.47 + clamp(dl_dy * 2.4, -0.16, 0.16);
+        let n_water = normalize(vec3<f32>(-dh_dx, -dh_dy, 1.0));
+
+        let to_cam = u.camera_pos_and_pbr.xyz - in.world_pos;
+        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, length(to_cam) > 0.0001));
+        let ndotv = max(dot(n_water, v_dir), 0.03);
+
+        var sun_dir = normalize(vec3<f32>(0.42, 0.28, 0.86));
+        var sun_col = vec3<f32>(1.0, 0.95, 0.86);
+        if (u.lights[0].pos_or_dir_and_kind.w > 0.5 && u.lights[0].pos_or_dir_and_kind.w < 1.5) {
+            sun_dir = normalize(-u.lights[0].pos_or_dir_and_kind.xyz);
+            sun_col = max(u.lights[0].diffuse_and_range.rgb, vec3<f32>(0.65));
+        }
+
+        // Physical Schlick Fresnel + subtle atmospheric sky/horizon reflection.
+        let fresnel = 0.025 + 0.975 * pow(1.0 - ndotv, 4.5);
+        let refl_dir = reflect(-v_dir, n_water);
+        let sky_t = clamp(refl_dir.z * 0.7 + 0.25, 0.0, 1.0);
+        let sky_horizon = vec3<f32>(0.36, 0.52, 0.66);
+        let sky_zenith = vec3<f32>(0.08, 0.20, 0.36);
+        let sky_refl = mix(sky_horizon, sky_zenith, sky_t);
+
+        // Preserve Zero Hour's moody oceanic palette with subtle organic swell shading.
+        let swell = clamp(dot(n_water, sun_dir) * 0.45 + 0.62, 0.72, 1.18);
+        let deep_water = col.rgb * vec3<f32>(0.78, 0.96, 1.12) * swell;
+
+        // Dual-lobe GGX sun glints dancing across fine wave facets.
+        let ndotl = max(dot(n_water, sun_dir), 0.0);
+        let spec_sharp = ggx_specular(n_water, v_dir, sun_dir, 0.075, vec3<f32>(0.045));
+        let spec_broad = ggx_specular(n_water, v_dir, sun_dir, 0.28, vec3<f32>(0.025));
+        let water_spec = sun_col * (spec_sharp * 0.55 + spec_broad * 0.30) * ndotl;
+
+        let final_water = mix(deep_water, sky_refl, clamp(fresnel * 0.52, 0.06, 0.62)) + water_spec;
+        col = vec4<f32>(final_water, clamp(col.a + fresnel * 0.14, 0.0, 1.0));
+    } else if (pbr_active && u.render_flags.x > 0.5) {
         // 3D lit geometry: per-pixel micro-normal + Cook-Torrance GGX specular + hemisphere sky/ground IBL.
         let albedo = eval_combiner(in.raw_color, tex0, tex1);
         let n_geom = normalize(in.world_normal);

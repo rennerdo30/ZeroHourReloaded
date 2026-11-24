@@ -15,6 +15,7 @@ crate-type = ["staticlib", "rlib"]
 glam.workspace = true
 log.workspace = true
 raw-window-handle.workspace = true
+zhr-audio.workspace = true
 zhr-core.workspace = true
 zhr-vulkan.workspace = true
 

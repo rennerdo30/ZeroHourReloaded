@@ -50,8 +50,11 @@ if(ZHR_BUILD_RUST)
 
     set(ZHR_FFI_LIB_BASE "${ZHR_CARGO_TARGET_DIR}${_zhr_target_subdir}")
 
+    set(_zhr_ffi_lib_output "$<IF:$<CONFIG:Debug>,${ZHR_FFI_LIB_BASE}/debug/${ZHR_FFI_LIB_NAME},$<IF:$<CONFIG:RelWithDebInfo>,${ZHR_FFI_LIB_BASE}/release-fast/${ZHR_FFI_LIB_NAME},${ZHR_FFI_LIB_BASE}/release/${ZHR_FFI_LIB_NAME}>>")
+
     add_custom_target(zhr_ffi_cargo ALL
         COMMAND "${ZHR_CARGO_EXECUTABLE}" build -p zhr-ffi ${ZHR_CARGO_TARGET_ARGS} ${_zhr_profile_flag}
+        BYPRODUCTS "${_zhr_ffi_lib_output}"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Building Rust crate zhr-ffi (via cargo + sccache)"
         USES_TERMINAL
@@ -69,7 +72,7 @@ if(ZHR_BUILD_RUST)
     )
 
     if(WIN32)
-        target_link_libraries(zhr_ffi INTERFACE ws2_32 userenv ntdll bcrypt advapi32)
+        target_link_libraries(zhr_ffi INTERFACE ws2_32 userenv ntdll bcrypt advapi32 ole32 oleaut32 propsys runtimeobject avrt)
     elseif(APPLE)
         target_link_libraries(zhr_ffi INTERFACE "-framework Security" "-framework CoreFoundation")
     else()

@@ -755,3 +755,94 @@ fn build_unit_cube() -> (Vec<VertexWw3d>, Vec<u16>) {
     }
     (verts, indices)
 }
+
+#[test]
+fn animated_water_and_async_2x_remaster_hotswap_work_with_zero_validation_errors() {
+    let width = 128u32;
+    let height = 128u32;
+    let mut r = make_headless(width, height);
+    r.enable_texture_remastering();
+    r.set_graphics_settings(GraphicsSettings::remastered());
+
+    // 32x32 ocean texture eligible for async 2x remastering.
+    let mut ocean_rgba = vec![0u8; 32 * 32 * 4];
+    for px in ocean_rgba.chunks_exact_mut(4) {
+        px[0] = 24;
+        px[1] = 68;
+        px[2] = 112;
+        px[3] = 220;
+    }
+    let water_tex = r
+        .create_texture_2d(
+            32,
+            32,
+            TextureFormat::Rgba8Unorm,
+            &ocean_rgba,
+            SamplerDesc::default(),
+        )
+        .unwrap();
+
+    // Horizontal water plane in Zero Hour +Z-up world coordinates.
+    let water_verts = [
+        VertexWw3d::new([-40.0, -40.0, 0.0], [0.0, 0.0, 1.0], [1.0; 4], [0.0, 0.0]),
+        VertexWw3d::new([40.0, -40.0, 0.0], [0.0, 0.0, 1.0], [1.0; 4], [4.0, 0.0]),
+        VertexWw3d::new([40.0, 40.0, 0.0], [0.0, 0.0, 1.0], [1.0; 4], [4.0, 4.0]),
+        VertexWw3d::new([-40.0, 40.0, 0.0], [0.0, 0.0, 1.0], [1.0; 4], [0.0, 4.0]),
+    ];
+    let water_idx = [0u16, 1, 2, 0, 2, 3];
+
+    let proj = perspective_lh(50.0f32.to_radians(), 1.0, 1.0, 200.0);
+    let view = look_at_lh(Vec3::new(0.0, -45.0, 22.0), Vec3::ZERO, Vec3::Z);
+
+    // Pump frames until async worker completes & hot-swaps the 2x remastered texture.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        r.begin_frame().unwrap();
+        r.set_viewport(Viewport::full(width, height));
+        r.clear(ClearState {
+            clear_color: true,
+            clear_depth_stencil: true,
+            color: [0.04, 0.08, 0.14, 1.0],
+            depth: 1.0,
+            stencil: 0,
+        })
+        .unwrap();
+        r.set_world_identity();
+        r.set_view(view);
+        r.set_projection(proj);
+        r.set_ambient(Vec3::splat(0.3));
+        r.set_lighting_enabled(false);
+        r.set_light(
+            0,
+            GpuLight::directional(Vec3::new(-0.3, -0.6, -0.7), Vec3::new(1.0, 0.96, 0.88)),
+        );
+        r.set_shader(ShaderKey::ALPHA_BLEND);
+        r.set_texture(Some(water_tex));
+        r.set_material_hint(1);
+        r.draw_dynamic(&water_verts, &water_idx).unwrap();
+        r.set_material_hint(0);
+        r.end_frame().unwrap();
+
+        if r.remastered_texture_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        r.remastered_texture_count() >= 1,
+        "expected async 2x remaster texture hot-swap to complete"
+    );
+
+    let pixels = r.readback_rgba8().unwrap();
+    let center = ((height / 2) * width + (width / 2)) as usize * 4;
+    // Water shader produces visible oceanic blue/teal with sky reflection & wave variation.
+    assert!(
+        pixels[center + 2] > pixels[center],
+        "expected oceanic blue water at center, got RGB=({}, {}, {})",
+        pixels[center],
+        pixels[center + 1],
+        pixels[center + 2]
+    );
+    assert_eq!(r.validation_error_count(), 0);
+}

@@ -214,6 +214,10 @@ target_link_libraries(corei_gameenginedevice_private INTERFACE
     stb
 )
 
+if(ZHR_BUILD_RUST)
+    target_include_directories(corei_gameenginedevice_private INTERFACE "${CMAKE_SOURCE_DIR}/rust/zhr-ffi/include")
+endif()
+
 target_link_libraries(corei_gameenginedevice_public INTERFACE
     corei_gameengine_public
     deps_bink

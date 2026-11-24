@@ -1,0 +1,15 @@
+[package]
+name = "zhr-remaster"
+description = "Zero-stall async local texture 2x super-resolution & PBR normal/roughness remastering with BLAKE3 disk cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

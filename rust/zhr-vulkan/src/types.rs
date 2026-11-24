@@ -173,6 +173,8 @@ pub struct DrawUniforms {
     pub camera_pos_and_pbr: [f32; 4],
     /// x = is_3d_lit, y = is_hdr_emissive (additive VFX), z = split_x_pixels, w = is_3d_unlit_surface.
     pub render_flags: [f32; 4],
+    /// x = elapsed_time_sec, y = material_hint (0=default, 1=animated water), z/w = reserved.
+    pub water_params: [f32; 4],
 }
 
 impl Default for DrawUniforms {
@@ -190,6 +192,7 @@ impl Default for DrawUniforms {
             stage1_ops: [0, 0, 0, 0],
             camera_pos_and_pbr: [0.0, 0.0, 100.0, 0.0],
             render_flags: [0.0, 0.0, 0.0, 0.0],
+            water_params: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -217,12 +220,13 @@ impl GraphicsMode {
     }
 }
 
-/// Live-toggleable graphics enhancement switches (F9/F10/F11).
+/// Live-toggleable graphics enhancement switches (F7/F8/F9/F10/F11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GraphicsSettings {
     pub mode: GraphicsMode,
     pub pbr_lighting: bool,
     pub post_fx: bool,
+    pub remaster_textures: bool,
 }
 
 impl GraphicsSettings {
@@ -231,6 +235,7 @@ impl GraphicsSettings {
             mode: GraphicsMode::Classic,
             pbr_lighting: false,
             post_fx: false,
+            remaster_textures: false,
         }
     }
 
@@ -239,6 +244,7 @@ impl GraphicsSettings {
             mode: GraphicsMode::Remastered,
             pbr_lighting: true,
             post_fx: true,
+            remaster_textures: true,
         }
     }
 
@@ -247,6 +253,7 @@ impl GraphicsSettings {
             mode: GraphicsMode::SplitScreen,
             pbr_lighting: true,
             post_fx: true,
+            remaster_textures: true,
         }
     }
 

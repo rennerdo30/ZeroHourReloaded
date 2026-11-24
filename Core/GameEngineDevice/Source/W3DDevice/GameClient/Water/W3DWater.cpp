@@ -68,6 +68,10 @@
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
 
+#if defined(ZHR_USE_VULKAN)
+#include <zhr_ffi.h>
+#endif
+
 
 
 #define MIPMAP_BUMP_TEXTURE
@@ -1556,6 +1560,13 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 		WW3D::Add_To_Static_Sort_List(this, sort_level);
 		return;
 	}
+
+#if defined(ZHR_USE_VULKAN)
+	struct ZhrVulkanWaterGuard {
+		ZhrVulkanWaterGuard() { zhr_vk_set_material_hint(1u); }
+		~ZhrVulkanWaterGuard() { zhr_vk_set_material_hint(0u); }
+	} zhrWaterGuard;
+#endif
 
 	switch(m_waterType)
 	{

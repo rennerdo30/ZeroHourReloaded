@@ -1,9 +1,10 @@
 //! C-ABI entry points for linking ZeroHourReloaded Rust subsystems (including Vulkan) into C++.
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
 use glam::{Mat4, Vec3};
+use zhr_audio::{AudioEngine, VoiceKind};
 use zhr_vulkan::shader::{DepthCompare, ShaderKey, StencilOp, StencilState};
 use zhr_vulkan::types::{
     ClearState, FogState, GpuLight, GraphicsMode, GraphicsSettings, SamplerDesc, TextureFormat,
@@ -584,15 +585,45 @@ pub unsafe extern "C" fn zhr_vk_create_texture_2d_mips(
 pub extern "C" fn zhr_vk_set_graphics_mode(mode: u32, pbr_lighting: bool, post_fx: bool) {
     let mut guard = vk_state().lock().expect("vk state poisoned");
     if let Some(ren) = guard.renderer.as_mut() {
+        let prev = ren.graphics_settings();
+        let parsed_mode = GraphicsMode::from_u32(mode);
+        let remaster_textures = if parsed_mode == GraphicsMode::Classic {
+            false
+        } else if prev.mode == GraphicsMode::Classic {
+            true
+        } else {
+            prev.remaster_textures
+        };
         ren.set_graphics_settings(GraphicsSettings {
-            mode: GraphicsMode::from_u32(mode),
+            mode: parsed_mode,
             pbr_lighting,
             post_fx,
+            remaster_textures,
         });
     }
 }
 
-/// Returns packed graphics state: bits 0..1 = mode, bit 2 = pbr_lighting, bit 3 = post_fx.
+/// Toggles 2x remastered textures on/off live without restarting.
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_remaster_textures(enabled: bool) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        let mut s = ren.graphics_settings();
+        s.remaster_textures = enabled;
+        ren.set_graphics_settings(s);
+    }
+}
+
+/// Sets a semantic material hint for upcoming draws (`0 = default`, `1 = animated water`).
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_material_hint(hint: u32) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_material_hint(hint);
+    }
+}
+
+/// Returns packed graphics state: bits 0..1 = mode, bit 2 = pbr_lighting, bit 3 = post_fx, bit 4 = remaster_textures.
 #[unsafe(no_mangle)]
 pub extern "C" fn zhr_vk_get_graphics_mode() -> u32 {
     let guard = vk_state().lock().expect("vk state poisoned");
@@ -600,7 +631,10 @@ pub extern "C" fn zhr_vk_get_graphics_mode() -> u32 {
         return 0;
     };
     let s = ren.graphics_settings();
-    (s.mode as u32 & 0x3) | (u32::from(s.pbr_lighting) << 2) | (u32::from(s.post_fx) << 3)
+    (s.mode as u32 & 0x3)
+        | (u32::from(s.pbr_lighting) << 2)
+        | (u32::from(s.post_fx) << 3)
+        | (u32::from(s.remaster_textures) << 4)
 }
 
 /// Uploads a 2D RGBA8 texture and returns its non-zero handle (0 on failure).
@@ -712,6 +746,387 @@ pub unsafe extern "C" fn zhr_vk_draw_dynamic(
         return 0;
     };
     i32::from(ren.draw_dynamic(verts, inds).is_ok())
+}
+
+// ---------------------------------------------------------------------------
+// Native 64-bit Cross-Platform Audio C-ABI (replaces 32-bit mss32.dll)
+// ---------------------------------------------------------------------------
+
+struct AudioGlobalState {
+    engine: Option<AudioEngine>,
+    device_name_cstr: CString,
+}
+
+fn audio_state() -> &'static Mutex<AudioGlobalState> {
+    static STATE: OnceLock<Mutex<AudioGlobalState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(AudioGlobalState {
+            engine: None,
+            device_name_cstr: c"Uninitialized".to_owned(),
+        })
+    })
+}
+
+fn voice_kind_from_u32(kind: u32) -> VoiceKind {
+    match kind {
+        1 => VoiceKind::Sample3D,
+        2 => VoiceKind::Stream,
+        _ => VoiceKind::Sample2D,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_init(headless: bool) -> i32 {
+    let mut guard = audio_state().lock().expect("audio state poisoned");
+    if guard.engine.is_none() {
+        let env_headless = std::env::var("ZHR_AUDIO_HEADLESS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let engine = AudioEngine::new(headless || env_headless);
+        let name =
+            CString::new(engine.device_name()).unwrap_or_else(|_| c"Audio Device".to_owned());
+        guard.device_name_cstr = name;
+        guard.engine = Some(engine);
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_shutdown() {
+    let mut guard = audio_state().lock().expect("audio state poisoned");
+    guard.engine = None;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_device_name() -> *const c_char {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    guard.device_name_cstr.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_alloc_voice(kind: u32) -> u32 {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    guard
+        .engine
+        .as_ref()
+        .map(|e| e.alloc_voice(voice_kind_from_u32(kind)))
+        .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_release_voice(voice_id: u32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.release_voice(voice_id);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_reset_voice(voice_id: u32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.reset_voice(voice_id);
+    }
+}
+
+/// Decodes and attaches an in-memory WAV/PCM/ADPCM/MP3 buffer to `voice_id`.
+///
+/// # Safety
+/// `bytes` must point to `byte_len` readable bytes; `hint_ext` may be null or a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_audio_load_bytes(
+    voice_id: u32,
+    bytes: *const u8,
+    byte_len: usize,
+    hint_ext: *const c_char,
+) -> i32 {
+    if bytes.is_null() || byte_len == 0 {
+        return 0;
+    }
+    // SAFETY: Caller guarantees `bytes` is valid for `byte_len` bytes.
+    let slice = unsafe { std::slice::from_raw_parts(bytes, byte_len) };
+    let hint = if hint_ext.is_null() {
+        None
+    } else {
+        // SAFETY: Caller passed a valid NUL-terminated C string.
+        unsafe { CStr::from_ptr(hint_ext) }.to_str().ok()
+    };
+    let guard = audio_state().lock().expect("audio state poisoned");
+    guard
+        .engine
+        .as_ref()
+        .map(|e| i32::from(e.load_voice_bytes(voice_id, slice, hint)))
+        .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_start(voice_id: u32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.start_voice(voice_id);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_stop(voice_id: u32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.stop_voice(voice_id);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_pause(voice_id: u32, paused: bool) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.pause_voice(voice_id, paused);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_volume_pan(voice_id: u32, volume: f32, pan: f32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_volume_pan(voice_id, volume, pan);
+    }
+}
+
+/// Reads a voice's current volume and pan into optional output pointers.
+///
+/// # Safety
+/// Non-null `out_volume` and `out_pan` must point to writable `f32` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_audio_get_volume_pan(
+    voice_id: u32,
+    out_volume: *mut f32,
+    out_pan: *mut f32,
+) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    let (vol, pan) = guard
+        .engine
+        .as_ref()
+        .map(|e| e.get_volume_pan(voice_id))
+        .unwrap_or((1.0, 0.5));
+    if !out_volume.is_null() {
+        // SAFETY: Caller passed a valid writable pointer.
+        unsafe { *out_volume = vol };
+    }
+    if !out_pan.is_null() {
+        // SAFETY: Caller passed a valid writable pointer.
+        unsafe { *out_pan = pan };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_loop_count(voice_id: u32, count: u32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_loop_count(voice_id, count);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_get_loop_count(voice_id: u32) -> u32 {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    guard
+        .engine
+        .as_ref()
+        .map(|e| e.get_loop_count(voice_id))
+        .unwrap_or(1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_playback_rate(voice_id: u32, rate: u32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_playback_rate(voice_id, rate);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_get_playback_rate(voice_id: u32) -> u32 {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    guard
+        .engine
+        .as_ref()
+        .map(|e| e.get_playback_rate(voice_id))
+        .unwrap_or(22050)
+}
+
+/// Reads `(total_ms, current_ms)` for a voice into optional output pointers.
+///
+/// # Safety
+/// Non-null pointers must be valid writable `u32` locations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_audio_get_ms_position(
+    voice_id: u32,
+    out_total_ms: *mut u32,
+    out_current_ms: *mut u32,
+) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    let (total, cur) = guard
+        .engine
+        .as_ref()
+        .map(|e| e.get_ms_position(voice_id))
+        .unwrap_or((0, 0));
+    if !out_total_ms.is_null() {
+        // SAFETY: Caller passed a valid writable pointer.
+        unsafe { *out_total_ms = total };
+    }
+    if !out_current_ms.is_null() {
+        // SAFETY: Caller passed a valid writable pointer.
+        unsafe { *out_current_ms = cur };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_ms_position(voice_id: u32, ms: u32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_ms_position(voice_id, ms);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_3d_position(voice_id: u32, x: f32, y: f32, z: f32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_3d_position(voice_id, x, y, z);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_3d_distances(voice_id: u32, d1: f32, d2: f32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_3d_distances(voice_id, d1, d2);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_3d_occlusion(voice_id: u32, occlusion: f32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_3d_occlusion(voice_id, occlusion);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_listener_position(x: f32, y: f32, z: f32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_listener_position(x, y, z);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_listener_orientation(
+    fx: f32,
+    fy: f32,
+    fz: f32,
+    ux: f32,
+    uy: f32,
+    uz: f32,
+) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_listener_orientation(fx, fy, fz, ux, uy, uz);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_set_user_data(voice_id: u32, index: u32, value: i32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.set_user_data(voice_id, index as usize, value);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_get_user_data(voice_id: u32, index: u32) -> i32 {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    guard
+        .engine
+        .as_ref()
+        .map(|e| e.get_user_data(voice_id, index as usize))
+        .unwrap_or(0)
+}
+
+/// Pops one completed voice ID and kind for main-thread EOS callback dispatch. Returns 1 if popped, 0 if empty.
+///
+/// # Safety
+/// Non-null output pointers must point to valid writable `u32` locations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_audio_pop_completed(
+    out_voice_id: *mut u32,
+    out_kind: *mut u32,
+) -> i32 {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    let Some(e) = guard.engine.as_ref() else {
+        return 0;
+    };
+    let Some((id, kind)) = e.pop_completed() else {
+        return 0;
+    };
+    if !out_voice_id.is_null() {
+        // SAFETY: Caller passed a valid writable pointer.
+        unsafe { *out_voice_id = id };
+    }
+    if !out_kind.is_null() {
+        // SAFETY: Caller passed a valid writable pointer.
+        unsafe { *out_kind = kind as u32 };
+    }
+    1
+}
+
+/// Decodes an IMA-ADPCM (or any WAV) buffer into a newly allocated 16-bit PCM RIFF/WAVE buffer.
+/// Free with `zhr_audio_free_buffer(ptr, len)`. Returns 1 on success, 0 on failure.
+///
+/// # Safety
+/// `bytes` must point to `byte_len` readable bytes; `out_ptr` and `out_len` must be valid writable pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_audio_decode_wav_pcm16(
+    bytes: *const u8,
+    byte_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if bytes.is_null() || byte_len == 0 || out_ptr.is_null() || out_len.is_null() {
+        return 0;
+    }
+    // SAFETY: Caller guarantees valid slice and output pointers.
+    let slice = unsafe { std::slice::from_raw_parts(bytes, byte_len) };
+    let Some(wav) = zhr_audio::decode_to_wav_pcm16(slice) else {
+        unsafe {
+            *out_ptr = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 0;
+    };
+    let mut boxed = wav.into_boxed_slice();
+    let len = boxed.len();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    // SAFETY: Output pointers verified non-null above.
+    unsafe {
+        *out_ptr = ptr;
+        *out_len = len;
+    }
+    1
+}
+
+/// Frees a buffer previously returned by `zhr_audio_decode_wav_pcm16`.
+///
+/// # Safety
+/// `ptr` and `len` must match a live allocation returned by `zhr_audio_decode_wav_pcm16`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_audio_free_buffer(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: Reconstructs the boxed slice forgotten in `zhr_audio_decode_wav_pcm16`.
+    let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
+    let _ = unsafe { Box::from_raw(slice_ptr) };
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -2323,29 +2324,185 @@ private:
 
         SyncDrawState(is_rhw);
 
-        if (is_rhw)
+        const uint32_t gfx_packed = zhr_vk_get_graphics_mode();
+        const bool remaster_active = (gfx_packed & 0x3u) != 0u;
+        const bool can_smooth_mesh =
+            m_mesh_smoothing_enabled &&
+            remaster_active &&
+            !is_rhw &&
+            has_normal &&
+            (m_render_states[D3DRS_LIGHTING] != 0) &&
+            (m_render_states[D3DRS_STENCILENABLE] == 0) &&
+            (m_render_states[D3DRS_ALPHABLENDENABLE] == 0) &&
+            prim_type == D3DPT_TRIANGLELIST &&
+            prim_count >= 8u &&
+            prim_count <= 2000u &&
+            m_scratch_verts.size() < 12000u;
+
+        if (can_smooth_mesh && ApplyCreasePreservingPhongSubdiv())
         {
-            D3DMATRIX ident{};
-            MakeIdentityMatrix(ident);
-            zhr_vk_set_transform(0, &ident.m[0][0]);
-            zhr_vk_set_transform(1, &ident.m[0][0]);
-            zhr_vk_set_transform(2, &ident.m[0][0]);
+            zhr_vk_draw_dynamic(
+                m_subdiv_verts.data(),
+                m_subdiv_verts.size(),
+                m_subdiv_indices.data(),
+                m_subdiv_indices.size());
         }
-
-        zhr_vk_draw_dynamic(
-            m_scratch_verts.data(),
-            m_scratch_verts.size(),
-            m_scratch_indices.data(),
-            m_scratch_indices.size());
-
-        if (is_rhw)
+        else
         {
-            zhr_vk_set_transform(0, &m_world.m[0][0]);
-            zhr_vk_set_transform(1, &m_view.m[0][0]);
-            zhr_vk_set_transform(2, &m_proj.m[0][0]);
+            if (is_rhw)
+            {
+                D3DMATRIX ident{};
+                MakeIdentityMatrix(ident);
+                zhr_vk_set_transform(0, &ident.m[0][0]);
+                zhr_vk_set_transform(1, &ident.m[0][0]);
+                zhr_vk_set_transform(2, &ident.m[0][0]);
+            }
+
+            zhr_vk_draw_dynamic(
+                m_scratch_verts.data(),
+                m_scratch_verts.size(),
+                m_scratch_indices.data(),
+                m_scratch_indices.size());
+
+            if (is_rhw)
+            {
+                zhr_vk_set_transform(0, &m_world.m[0][0]);
+                zhr_vk_set_transform(1, &m_view.m[0][0]);
+                zhr_vk_set_transform(2, &m_proj.m[0][0]);
+            }
         }
 
         return D3D_OK;
+    }
+
+    // Deterministic, rig-safe 1-level crease-preserving Phong triangle subdivision (Boubekeur & Alexa 2008).
+    // Preserves sharp armor/building creases (angle > ~38 deg) while curving barrels, wheels, radar dishes,
+    // domes, aircraft fuselages, and ship hulls cleanly with zero bone/UV breakage.
+    bool ApplyCreasePreservingPhongSubdiv()
+    {
+        const size_t tri_count = m_scratch_indices.size() / 3;
+        if (tri_count == 0 || m_scratch_verts.size() + tri_count * 3 > 65000)
+        {
+            return false;
+        }
+
+        m_subdiv_verts = m_scratch_verts;
+        m_subdiv_indices.clear();
+        m_subdiv_indices.reserve(tri_count * 12);
+
+        m_edge_midpoints.clear();
+        m_edge_midpoints.reserve(tri_count * 2);
+
+        auto get_midpoint = [&](uint16_t ia, uint16_t ib) -> uint16_t {
+            const uint32_t lo = ia < ib ? ia : ib;
+            const uint32_t hi = ia < ib ? ib : ia;
+            const uint32_t key = (lo << 16) | hi;
+            auto it = m_edge_midpoints.find(key);
+            if (it != m_edge_midpoints.end())
+            {
+                return it->second;
+            }
+
+            const ZhrVertexWw3d& va = m_scratch_verts[ia];
+            const ZhrVertexWw3d& vb = m_scratch_verts[ib];
+            ZhrVertexWw3d mid{};
+
+            const float mx = 0.5f * (va.position[0] + vb.position[0]);
+            const float my = 0.5f * (va.position[1] + vb.position[1]);
+            const float mz = 0.5f * (va.position[2] + vb.position[2]);
+
+            const float dx = vb.position[0] - va.position[0];
+            const float dy = vb.position[1] - va.position[1];
+            const float dz = vb.position[2] - va.position[2];
+            const float dist_sq = dx * dx + dy * dy + dz * dz;
+
+            const float nax = va.normal[0], nay = va.normal[1], naz = va.normal[2];
+            const float nbx = vb.normal[0], nby = vb.normal[1], nbz = vb.normal[2];
+            const float na_len = std::sqrt(nax * nax + nay * nay + naz * naz);
+            const float nb_len = std::sqrt(nbx * nbx + nby * nby + nbz * nbz);
+
+            float px = mx, py = my, pz = mz;
+            if (na_len > 0.001f && nb_len > 0.001f && dist_sq > 1e-4f && dist_sq < 40000.0f)
+            {
+                const float an_x = nax / na_len, an_y = nay / na_len, an_z = naz / na_len;
+                const float bn_x = nbx / nb_len, bn_y = nby / nb_len, bn_z = nbz / nb_len;
+                const float dot_n = an_x * bn_x + an_y * bn_y + an_z * bn_z;
+
+                // Smooth curved edge (< ~38 deg) -> Phong tangent-plane projection; hard crease -> keep flat!
+                if (dot_n > 0.78f && dot_n < 0.9995f)
+                {
+                    const float da = (mx - va.position[0]) * an_x +
+                                     (my - va.position[1]) * an_y +
+                                     (mz - va.position[2]) * an_z;
+                    const float db = (mx - vb.position[0]) * bn_x +
+                                     (my - vb.position[1]) * bn_y +
+                                     (mz - vb.position[2]) * bn_z;
+                    const float pax = mx - da * an_x;
+                    const float pay = my - da * an_y;
+                    const float paz = mz - da * an_z;
+                    const float pbx = mx - db * bn_x;
+                    const float pby = my - db * bn_y;
+                    const float pbz = mz - db * bn_z;
+
+                    constexpr float kSmoothAlpha = 0.38f;
+                    px = mx + kSmoothAlpha * (0.5f * (pax + pbx) - mx);
+                    py = my + kSmoothAlpha * (0.5f * (pay + pby) - my);
+                    pz = mz + kSmoothAlpha * (0.5f * (paz + pbz) - mz);
+                }
+            }
+
+            mid.position[0] = px;
+            mid.position[1] = py;
+            mid.position[2] = pz;
+
+            float nx = nax + nbx;
+            float ny = nay + nby;
+            float nz = naz + nbz;
+            const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nlen > 0.0001f)
+            {
+                mid.normal[0] = nx / nlen;
+                mid.normal[1] = ny / nlen;
+                mid.normal[2] = nz / nlen;
+            }
+            else
+            {
+                mid.normal[0] = va.normal[0];
+                mid.normal[1] = va.normal[1];
+                mid.normal[2] = va.normal[2];
+            }
+
+            for (int c = 0; c < 4; ++c) mid.color[c] = 0.5f * (va.color[c] + vb.color[c]);
+            mid.uv0[0] = 0.5f * (va.uv0[0] + vb.uv0[0]);
+            mid.uv0[1] = 0.5f * (va.uv0[1] + vb.uv0[1]);
+            mid.uv1[0] = 0.5f * (va.uv1[0] + vb.uv1[0]);
+            mid.uv1[1] = 0.5f * (va.uv1[1] + vb.uv1[1]);
+
+            const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
+            m_subdiv_verts.push_back(mid);
+            m_edge_midpoints.emplace(key, new_idx);
+            return new_idx;
+        };
+
+        for (size_t t = 0; t < tri_count; ++t)
+        {
+            const uint16_t i0 = m_scratch_indices[t * 3 + 0];
+            const uint16_t i1 = m_scratch_indices[t * 3 + 1];
+            const uint16_t i2 = m_scratch_indices[t * 3 + 2];
+            if (i0 >= m_scratch_verts.size() || i1 >= m_scratch_verts.size() || i2 >= m_scratch_verts.size())
+            {
+                return false;
+            }
+            const uint16_t m01 = get_midpoint(i0, i1);
+            const uint16_t m12 = get_midpoint(i1, i2);
+            const uint16_t m20 = get_midpoint(i2, i0);
+
+            m_subdiv_indices.push_back(i0);  m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(m20);
+            m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(i1);  m_subdiv_indices.push_back(m12);
+            m_subdiv_indices.push_back(m20); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(i2);
+            m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(m20);
+        }
+        return true;
     }
 
     void PollGraphicsHotkeys()
@@ -2354,6 +2511,8 @@ private:
         {
             return;
         }
+        const bool f7_down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         const bool f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
         const bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
         const bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
@@ -2363,7 +2522,20 @@ private:
         uint32_t mode = packed & 0x3u;
         bool pbr = ((packed >> 2) & 0x1u) != 0;
         bool post_fx = ((packed >> 3) & 0x1u) != 0;
+        bool remaster_tex = ((packed >> 4) & 0x1u) != 0;
 
+        if (f7_down && !m_f7_was_down)
+        {
+            m_mesh_smoothing_enabled = !m_mesh_smoothing_enabled;
+            changed = true;
+        }
+        if (f8_down && !m_f8_was_down)
+        {
+            remaster_tex = !remaster_tex;
+            if (remaster_tex && mode == 0u) mode = 1u;
+            zhr_vk_set_remaster_textures(remaster_tex);
+            changed = true;
+        }
         if (f9_down && !m_f9_was_down)
         {
             // Cycle Remastered (1) -> Split-Screen A/B (2) -> Classic 2003 (0) -> Remastered (1)
@@ -2372,18 +2544,21 @@ private:
                 mode = 2u;
                 pbr = true;
                 post_fx = true;
+                remaster_tex = true;
             }
             else if (mode == 2u)
             {
                 mode = 0u;
                 pbr = false;
                 post_fx = false;
+                remaster_tex = false;
             }
             else
             {
                 mode = 1u;
                 pbr = true;
                 post_fx = true;
+                remaster_tex = true;
             }
             changed = true;
         }
@@ -2400,6 +2575,8 @@ private:
             changed = true;
         }
 
+        m_f7_was_down = f7_down;
+        m_f8_was_down = f8_down;
         m_f9_was_down = f9_down;
         m_f10_was_down = f10_down;
         m_f11_was_down = f11_down;
@@ -2407,11 +2584,12 @@ private:
         if (changed)
         {
             zhr_vk_set_graphics_mode(mode, pbr, post_fx);
-            UpdateGraphicsTitleBanner(mode, pbr, post_fx);
+            zhr_vk_set_remaster_textures(remaster_tex);
+            UpdateGraphicsTitleBanner(mode, pbr, post_fx, remaster_tex);
         }
     }
 
-    void UpdateGraphicsTitleBanner(uint32_t mode, bool pbr, bool post_fx)
+    void UpdateGraphicsTitleBanner(uint32_t mode, bool pbr, bool post_fx, bool remaster_tex)
     {
         if (!m_hwnd) return;
         if (m_base_window_title[0] == '\0')
@@ -2430,9 +2608,11 @@ private:
         std::snprintf(
             title,
             sizeof(title),
-            "%s  [Vulkan 1.3 | %s | PBR:%s | PostFX:%s | F9/F10/F11]",
+            "%s  [Vulkan 1.3 | %s | Mesh:%s | 2xTex:%s | PBR:%s | PostFX:%s | F7-F11]",
             m_base_window_title,
             mode_label,
+            (m_mesh_smoothing_enabled && mode != 0u) ? "ON" : "OFF",
+            (remaster_tex && mode != 0u) ? "ON" : "OFF",
             pbr ? "ON" : "OFF",
             post_fx ? "ON" : "OFF");
         SetWindowTextA(m_hwnd, title);
@@ -2441,6 +2621,9 @@ private:
     std::atomic<ULONG> m_ref_count{1};
     IDirect3D8* m_parent_d3d;
     HWND m_hwnd;
+    bool m_mesh_smoothing_enabled{true};
+    bool m_f7_was_down{false};
+    bool m_f8_was_down{false};
     bool m_f9_was_down{false};
     bool m_f10_was_down{false};
     bool m_f11_was_down{false};
@@ -2477,6 +2660,9 @@ private:
 
     std::vector<ZhrVertexWw3d> m_scratch_verts;
     std::vector<uint16_t> m_scratch_indices;
+    std::vector<ZhrVertexWw3d> m_subdiv_verts;
+    std::vector<uint16_t> m_subdiv_indices;
+    std::unordered_map<uint32_t, uint16_t> m_edge_midpoints;
 };
 
 HRESULT STDMETHODCALLTYPE ZhrVkSurface8::GetDevice(IDirect3DDevice8** ppDevice)

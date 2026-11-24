@@ -119,6 +119,8 @@ uint32_t zhr_vk_create_texture_2d_mips(
     bool linear_filter,
     bool clamp_edge);
 void zhr_vk_set_graphics_mode(uint32_t mode, bool pbr_lighting, bool post_fx);
+void zhr_vk_set_remaster_textures(bool enabled);
+void zhr_vk_set_material_hint(uint32_t hint);
 uint32_t zhr_vk_get_graphics_mode(void);
 uint32_t zhr_vk_create_texture_rgba8(
     uint32_t width,
@@ -143,6 +145,46 @@ int32_t zhr_vk_draw_dynamic(
     size_t vertex_count,
     const uint16_t* indices,
     size_t index_count);
+
+// --- Native 64-bit Cross-Platform Audio C-ABI (replaces 32-bit mss32.dll) ---
+int32_t zhr_audio_init(bool headless);
+void zhr_audio_shutdown(void);
+const char* zhr_audio_device_name(void);
+uint32_t zhr_audio_alloc_voice(uint32_t kind); // 0=2D, 1=3D, 2=Stream
+void zhr_audio_release_voice(uint32_t voice_id);
+void zhr_audio_reset_voice(uint32_t voice_id);
+int32_t zhr_audio_load_bytes(
+    uint32_t voice_id,
+    const uint8_t* bytes,
+    size_t byte_len,
+    const char* hint_ext);
+void zhr_audio_start(uint32_t voice_id);
+void zhr_audio_stop(uint32_t voice_id);
+void zhr_audio_pause(uint32_t voice_id, bool paused);
+void zhr_audio_set_volume_pan(uint32_t voice_id, float volume, float pan);
+void zhr_audio_get_volume_pan(uint32_t voice_id, float* out_volume, float* out_pan);
+void zhr_audio_set_loop_count(uint32_t voice_id, uint32_t count);
+uint32_t zhr_audio_get_loop_count(uint32_t voice_id);
+void zhr_audio_set_playback_rate(uint32_t voice_id, uint32_t rate);
+uint32_t zhr_audio_get_playback_rate(uint32_t voice_id);
+void zhr_audio_get_ms_position(uint32_t voice_id, uint32_t* out_total_ms, uint32_t* out_current_ms);
+void zhr_audio_set_ms_position(uint32_t voice_id, uint32_t ms);
+void zhr_audio_set_3d_position(uint32_t voice_id, float x, float y, float z);
+void zhr_audio_set_3d_distances(uint32_t voice_id, float d1, float d2);
+void zhr_audio_set_3d_occlusion(uint32_t voice_id, float occlusion);
+void zhr_audio_set_listener_position(float x, float y, float z);
+void zhr_audio_set_listener_orientation(
+    float fx, float fy, float fz,
+    float ux, float uy, float uz);
+void zhr_audio_set_user_data(uint32_t voice_id, uint32_t index, int32_t value);
+int32_t zhr_audio_get_user_data(uint32_t voice_id, uint32_t index);
+int32_t zhr_audio_pop_completed(uint32_t* out_voice_id, uint32_t* out_kind);
+int32_t zhr_audio_decode_wav_pcm16(
+    const uint8_t* bytes,
+    size_t byte_len,
+    uint8_t** out_ptr,
+    size_t* out_len);
+void zhr_audio_free_buffer(uint8_t* ptr, size_t len);
 
 #ifdef __cplusplus
 }
