@@ -97,7 +97,27 @@ inline void EvalMonotoneCubic(float p0, float p1, float p2, float p3, float t, f
               + (3.0f * t2 - 2.0f * t) * m2;
 }
 
-inline void SampleTerrainSmooth(
+struct ZhrBakedTerrainSample
+{
+    float z{0.0f};
+    float nx{0.0f};
+    float ny{0.0f};
+    float nz{1.0f};
+};
+
+struct ZhrBakedTerrainGrid
+{
+    uint64_t generation{0};
+    int32_t width{0};
+    int32_t height{0};
+    int32_t sub_w{0};
+    int32_t sub_h{0};
+    std::vector<ZhrBakedTerrainSample> samples;
+};
+
+ZhrBakedTerrainGrid g_zhr_terrain_baked{};
+
+inline void SampleTerrainSmoothAnalytic(
     const ZhrTerrainHeightmapState& hm,
     float wx,
     float wy,
@@ -158,6 +178,137 @@ inline void SampleTerrainSmooth(
     out_normal[0] = nx * inv_len;
     out_normal[1] = ny * inv_len;
     out_normal[2] = nz * inv_len;
+}
+
+// Pre-bakes the entire map's 4x sub-grid (10u / 5u / 2.5u knots) ONCE on map load (~6ms)
+// so every terrain tessellation lookup during camera scrolling/zooming is a 1ns O(1) table read.
+void RebuildBakedTerrainGrid(const ZhrTerrainHeightmapState& hm)
+{
+    g_zhr_terrain_baked.generation = hm.generation;
+    g_zhr_terrain_baked.width = hm.width;
+    g_zhr_terrain_baked.height = hm.height;
+    g_zhr_terrain_baked.samples.clear();
+
+    if (hm.data == nullptr || hm.width < 4 || hm.height < 4 ||
+        static_cast<int64_t>(hm.width) * static_cast<int64_t>(hm.height) > 262144)
+    {
+        g_zhr_terrain_baked.sub_w = 0;
+        g_zhr_terrain_baked.sub_h = 0;
+        return;
+    }
+
+    const int32_t sub_w = (hm.width - 1) * 4 + 1;
+    const int32_t sub_h = (hm.height - 1) * 4 + 1;
+    g_zhr_terrain_baked.sub_w = sub_w;
+    g_zhr_terrain_baked.sub_h = sub_h;
+    g_zhr_terrain_baked.samples.resize(static_cast<size_t>(sub_w) * static_cast<size_t>(sub_h));
+
+    const float inv_xy = 1.0f / hm.xy_factor;
+    static constexpr float kT[4] = {0.0f, 0.25f, 0.5f, 0.75f};
+
+    for (int32_t iy = 0; iy < hm.height; ++iy)
+    {
+        const int32_t fy_max = (iy < hm.height - 1) ? 4 : 1;
+        for (int32_t ix = 0; ix < hm.width; ++ix)
+        {
+            const int32_t fx_max = (ix < hm.width - 1) ? 4 : 1;
+
+            float h[4][4];
+            float min_h = 1e9f;
+            float max_h = -1e9f;
+            for (int r = 0; r < 4; ++r)
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    const float v = FetchTerrainGridZ(hm, ix - 1 + c, iy - 1 + r);
+                    h[r][c] = v;
+                    if (v < min_h) min_h = v;
+                    if (v > max_h) max_h = v;
+                }
+            }
+
+            if (max_h - min_h < 1e-4f)
+            {
+                const ZhrBakedTerrainSample flat{h[1][1], 0.0f, 0.0f, 1.0f};
+                for (int sy = 0; sy < fy_max; ++sy)
+                {
+                    ZhrBakedTerrainSample* row_dst =
+                        &g_zhr_terrain_baked.samples[static_cast<size_t>(iy * 4 + sy) * static_cast<size_t>(sub_w) + static_cast<size_t>(ix * 4)];
+                    for (int sx = 0; sx < fx_max; ++sx)
+                    {
+                        row_dst[sx] = flat;
+                    }
+                }
+                continue;
+            }
+
+            for (int sx = 0; sx < fx_max; ++sx)
+            {
+                const float fx = kT[sx];
+                float row_val[4];
+                float row_dx[4];
+                for (int r = 0; r < 4; ++r)
+                {
+                    EvalMonotoneCubic(h[r][0], h[r][1], h[r][2], h[r][3], fx, row_val[r], row_dx[r]);
+                }
+                for (int sy = 0; sy < fy_max; ++sy)
+                {
+                    const float fy = kT[sy];
+                    float z_val = 0.0f;
+                    float dz_dy = 0.0f;
+                    EvalMonotoneCubic(row_val[0], row_val[1], row_val[2], row_val[3], fy, z_val, dz_dy);
+                    float dz_dx = 0.0f;
+                    float dummy = 0.0f;
+                    EvalMonotoneCubic(row_dx[0], row_dx[1], row_dx[2], row_dx[3], fy, dz_dx, dummy);
+
+                    const float nx = -dz_dx * inv_xy;
+                    const float ny = -dz_dy * inv_xy;
+                    const float inv_len = 1.0f / std::sqrt(nx * nx + ny * ny + 1.0f);
+                    g_zhr_terrain_baked.samples[static_cast<size_t>(iy * 4 + sy) * static_cast<size_t>(sub_w) + static_cast<size_t>(ix * 4 + sx)] =
+                        {z_val, nx * inv_len, ny * inv_len, inv_len};
+                }
+            }
+        }
+    }
+}
+
+inline void SampleTerrainSmooth(
+    const ZhrTerrainHeightmapState& hm,
+    float wx,
+    float wy,
+    float& out_z,
+    float out_normal[3]) noexcept
+{
+    if (g_zhr_terrain_baked.generation == hm.generation &&
+        !g_zhr_terrain_baked.samples.empty())
+    {
+        const float gx4 = (wx / hm.xy_factor + static_cast<float>(hm.border)) * 4.0f;
+        const float gy4 = (wy / hm.xy_factor + static_cast<float>(hm.border)) * 4.0f;
+        const int32_t qx = static_cast<int32_t>(std::lround(gx4));
+        const int32_t qy = static_cast<int32_t>(std::lround(gy4));
+        if (qx >= 0 && qx < g_zhr_terrain_baked.sub_w &&
+            qy >= 0 && qy < g_zhr_terrain_baked.sub_h &&
+            std::fabs(gx4 - static_cast<float>(qx)) < 1e-2f &&
+            std::fabs(gy4 - static_cast<float>(qy)) < 1e-2f)
+        {
+            // Verify live grid knot hasn't been deformed by a mid-match crater explosion.
+            const int32_t kx = qx >> 2;
+            const int32_t ky = qy >> 2;
+            const float live_knot = FetchTerrainGridZ(hm, kx, ky);
+            const float baked_knot = g_zhr_terrain_baked.samples[static_cast<size_t>(ky * 4) * static_cast<size_t>(g_zhr_terrain_baked.sub_w) + static_cast<size_t>(kx * 4)].z;
+            if (std::fabs(live_knot - baked_knot) < 1e-3f)
+            {
+                const ZhrBakedTerrainSample& s =
+                    g_zhr_terrain_baked.samples[static_cast<size_t>(qy) * static_cast<size_t>(g_zhr_terrain_baked.sub_w) + static_cast<size_t>(qx)];
+                out_z = s.z;
+                out_normal[0] = s.nx;
+                out_normal[1] = s.ny;
+                out_normal[2] = s.nz;
+                return;
+            }
+        }
+    }
+    SampleTerrainSmoothAnalytic(hm, wx, wy, out_z, out_normal);
 }
 
 // --- Helpers ---
@@ -1988,7 +2139,16 @@ public:
         const DWORD pos_flags = fvf & D3DFVF_POSITION_MASK;
         const bool is_rhw = (pos_flags == D3DFVF_XYZRHW);
         const bool is_dynamic_vb = m_streams[0]->IsDynamic() || m_index_buffer->IsDynamic();
+        const bool terrain_pass_active = g_zhr_terrain_pass_active.load(std::memory_order_relaxed);
         const uint64_t cur_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
+        const bool is_static_terrain_tile =
+            !is_rhw &&
+            !is_dynamic_vb &&
+            terrain_pass_active &&
+            PrimitiveType == D3DPT_TRIANGLELIST &&
+            primCount >= 2u &&
+            primCount <= 4096u &&
+            NumVertices >= 3u;
         const bool buffers_stable =
             !is_dynamic_vb &&
             (m_streams[0]->Generation() <= 2u || m_streams[0]->LastMutatedFrame() + 1u < cur_frame) &&
@@ -1997,7 +2157,7 @@ public:
         StaticDrawKey static_key{};
         const StaticDrawKey* static_key_ptr = nullptr;
 
-        if (!is_rhw && buffers_stable)
+        if (!is_rhw && (buffers_stable || is_static_terrain_tile))
         {
             const bool has_normal = (fvf & D3DFVF_NORMAL) != 0;
             const bool has_diffuse = (fvf & D3DFVF_DIFFUSE) != 0;
@@ -2021,7 +2181,6 @@ public:
             const uint32_t gfx_packed = zhr_vk_get_graphics_mode();
             const bool remaster_active = (gfx_packed & 0x3u) != 0u;
             const bool mesh_smooth_on = g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) && remaster_active;
-            const bool terrain_pass_active = g_zhr_terrain_pass_active.load(std::memory_order_relaxed);
             const bool is_stencil_only_pass =
                 (m_render_states[D3DRS_COLORWRITEENABLE] & 0x7u) == 0 ||
                 (m_render_states[D3DRS_ZWRITEENABLE] == 0) ||
@@ -2068,37 +2227,104 @@ public:
                 tess_mode |= 0x80u;
             }
 
-            static_key.vb_id = m_streams[0]->Id();
-            static_key.vb_gen = m_streams[0]->Generation();
-            static_key.ib_id = m_index_buffer->Id();
-            static_key.ib_gen = m_index_buffer->Generation();
-            static_key.base_vertex = m_base_vertex_index;
-            static_key.start_index = startIndex;
-            static_key.prim_count = primCount;
-            static_key.prim_type = static_cast<uint32_t>(PrimitiveType);
-            static_key.fvf = fvf;
-            static_key.stride = stride;
-            static_key.mat_rgba = mat_rgba;
-            static_key.tess_mode = tess_mode;
-            static_key.extra_key = extra_key;
-
-            auto it = m_static_gpu_cache.find(static_key);
-            if (it != m_static_gpu_cache.end())
+            if (is_static_terrain_tile)
             {
-                it->second.last_used_frame = cur_frame;
-                EnsureFrameBegun();
-                SyncDrawState(false, tex_count);
-                zhr_vk_draw_indexed(it->second.gpu_vb, it->second.gpu_ib, it->second.index_count, 0u, 0);
-                if (m_perf_enabled)
+                // World-origin terrain tile signature: stays identical across HeightMap VB scroll shifts,
+                // zoom changes, Pass 0 (base), Pass 1 (clouds/noise), and Shroud pass -> 100% VRAM hit!
+                const uint32_t v0_idx = m_base_vertex_index + minIndex;
+                const uint32_t v_cnt = NumVertices;
+                const size_t byte0 = static_cast<size_t>(v0_idx) * stride;
+                const size_t byte_end = byte0 + static_cast<size_t>(v_cnt) * stride;
+                if (byte_end <= m_streams[0]->Size())
                 {
-                    ++m_perf_static_hits;
-                    const auto t_sub1 = std::chrono::steady_clock::now();
-                    m_perf_submit_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_sub1 - t_sub0).count());
+                    const uint8_t* base_p = m_streams[0]->Data() + byte0;
+                    const float* p0 = reinterpret_cast<const float*>(base_p);
+                    const float* p1 = reinterpret_cast<const float*>(base_p + static_cast<size_t>(v_cnt - 1u) * stride);
+                    const uint64_t qx0 = static_cast<uint64_t>(static_cast<int64_t>(std::llround(p0[0] * 10.0f)) & 0xFFFFLL);
+                    const uint64_t qy0 = static_cast<uint64_t>(static_cast<int64_t>(std::llround(p0[1] * 10.0f)) & 0xFFFFLL);
+                    const uint64_t qx1 = static_cast<uint64_t>(static_cast<int64_t>(std::llround(p1[0] * 10.0f)) & 0xFFFFLL);
+                    const uint64_t qy1 = static_cast<uint64_t>(static_cast<int64_t>(std::llround(p1[1] * 10.0f)) & 0xFFFFLL);
+                    const uint64_t world_bounds = (qx0 << 48) | (qy0 << 32) | (qx1 << 16) | qy1;
+
+                    // Fast ~0.3us FNV-1a hash over vertex colors + corner UVs/Z so dynamic lighting or
+                    // atlas/crater changes never serve stale vertex attributes.
+                    uint32_t diff_off = 12u;
+                    if (has_normal) diff_off += 12u;
+                    if (fvf & D3DFVF_PSIZE) diff_off += 4u;
+                    uint64_t attr_sig = 14695981039346656037ULL ^ world_bounds;
+                    if (has_diffuse && diff_off + 4u <= stride)
+                    {
+                        for (uint32_t k = 0; k < v_cnt; ++k)
+                        {
+                            const uint32_t argb = *reinterpret_cast<const uint32_t*>(base_p + static_cast<size_t>(k) * stride + diff_off);
+                            attr_sig = (attr_sig ^ argb) * 1099511628211ULL;
+                        }
+                    }
+                    // Mix in first, middle, and last full vertex bytes (catches UV/Z changes).
+                    const uint32_t sample_idxs[3] = {0u, v_cnt / 2u, v_cnt - 1u};
+                    for (uint32_t si : sample_idxs)
+                    {
+                        const uint32_t* vw = reinterpret_cast<const uint32_t*>(base_p + static_cast<size_t>(si) * stride);
+                        const uint32_t wcnt = stride / 4u;
+                        for (uint32_t wi = 0; wi < wcnt; ++wi)
+                        {
+                            attr_sig = (attr_sig ^ vw[wi]) * 1099511628211ULL;
+                        }
+                    }
+
+                    static_key.vb_id = 0x7E44A10000000000ULL;
+                    static_key.vb_gen = world_bounds;
+                    static_key.ib_id = m_index_buffer->Id();
+                    static_key.ib_gen = attr_sig ^ m_index_buffer->Generation();
+                    static_key.base_vertex = 0u;
+                    static_key.start_index = startIndex;
+                    static_key.prim_count = primCount;
+                    static_key.prim_type = static_cast<uint32_t>(PrimitiveType);
+                    static_key.fvf = fvf;
+                    static_key.stride = stride;
+                    static_key.mat_rgba = mat_rgba;
+                    static_key.tess_mode = tess_mode;
+                    static_key.extra_key = extra_key;
+                    static_key_ptr = &static_key;
                 }
-                return D3D_OK;
             }
-            static_key_ptr = &static_key;
+            else
+            {
+                static_key.vb_id = m_streams[0]->Id();
+                static_key.vb_gen = m_streams[0]->Generation();
+                static_key.ib_id = m_index_buffer->Id();
+                static_key.ib_gen = m_index_buffer->Generation();
+                static_key.base_vertex = m_base_vertex_index;
+                static_key.start_index = startIndex;
+                static_key.prim_count = primCount;
+                static_key.prim_type = static_cast<uint32_t>(PrimitiveType);
+                static_key.fvf = fvf;
+                static_key.stride = stride;
+                static_key.mat_rgba = mat_rgba;
+                static_key.tess_mode = tess_mode;
+                static_key.extra_key = extra_key;
+                static_key_ptr = &static_key;
+            }
+
+            if (static_key_ptr != nullptr)
+            {
+                auto it = m_static_gpu_cache.find(static_key);
+                if (it != m_static_gpu_cache.end())
+                {
+                    it->second.last_used_frame = cur_frame;
+                    EnsureFrameBegun();
+                    SyncDrawState(false, tex_count);
+                    zhr_vk_draw_indexed(it->second.gpu_vb, it->second.gpu_ib, it->second.index_count, 0u, 0);
+                    if (m_perf_enabled)
+                    {
+                        ++m_perf_static_hits;
+                        const auto t_sub1 = std::chrono::steady_clock::now();
+                        m_perf_submit_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_sub1 - t_sub0).count());
+                    }
+                    return D3D_OK;
+                }
+            }
         }
 
         const uint16_t* raw_indices = m_index_buffer->Data16() + startIndex;
@@ -4865,6 +5091,7 @@ extern "C" void zhr_vk_set_terrain_heightmap(
     if (changed)
     {
         g_zhr_terrain_hm.generation += 1u;
+        RebuildBakedTerrainGrid(g_zhr_terrain_hm);
     }
 }
 

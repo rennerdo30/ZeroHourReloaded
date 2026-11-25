@@ -358,6 +358,10 @@ void W3DGameWinDefaultDraw( GameWindow *window, WinInstanceData *instData )
 			ZhrMenuStyle::drawSubPanel(origin.x, origin.y, size.x, size.y);
 			return;
 		}
+		if (ZhrMenuStyle::isLegacyInteriorBackdrop(window, instData))
+		{
+			return;
+		}
 		if (ZhrMenuStyle::shouldStyleShellPanel(window, instData))
 		{
 			ZhrMenuStyle::drawGlassPanel(

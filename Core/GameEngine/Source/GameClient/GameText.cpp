@@ -1269,6 +1269,22 @@ UnicodeString GameTextManager::fetch( const Char *label, Bool *exists )
 
 	if( lookUp == nullptr )
 	{
+		// Built-in fallback labels for community/patch .wnd strings missing from retail .csf archives.
+		if (label != nullptr)
+		{
+			if (_stricmp(label, "GUI:CustomMission") == 0)
+			{
+				if (exists) *exists = TRUE;
+				static const UnicodeString s_customMission(L"CUSTOM MISSION");
+				return s_customMission;
+			}
+			if (_stricmp(label, "TOOLTIP:CustomMission") == 0)
+			{
+				if (exists) *exists = TRUE;
+				static const UnicodeString s_customMissionTip(L"Play custom single-player missions");
+				return s_customMissionTip;
+			}
+		}
 
 		// string not found
 		if( exists )

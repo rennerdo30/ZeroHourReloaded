@@ -39,6 +39,12 @@ Bool shouldStyleShellButton(GameWindow *window, WinInstanceData *instData);
 /// Returns true if `window` is a shell gadget (checkbox, slider, combo, text entry, listbox) that should receive modern vector styling.
 Bool shouldStyleShellGadget(GameWindow *window);
 
+/// Marks the start of a new render frame (prevents 30Hz logic-frame deduplication flicker at high FPS).
+void beginRenderFrame();
+
+/// Returns true if `window` is a redundant legacy interior backdrop (e.g. `EarthMap*` behind `MapBorder*`).
+Bool isLegacyInteriorBackdrop(GameWindow *window, WinInstanceData *instData);
+
 /// Draws the clean widescreen shell vignette, razor-thin tactical perimeter frame, and bottom-left engine status pill.
 void drawShellBackdropFrame(Bool rightHalfOnly = FALSE);
 

@@ -1888,6 +1888,7 @@ void W3DDisplay::calculateTerrainLOD()
 			if (WW3D::Begin_Render( true, true, Vector3( 0.0f, 0.0f, 0.0f ) ) == WW3D_ERROR_OK)
 			{
 				// draw all views of the world
+				ZhrMenuStyle::beginRenderFrame();
 				drawViews();
 				// render is all done!
 				WW3D::End_Render();
@@ -2197,6 +2198,7 @@ AGAIN:
 					Debug_Statistics::Record_DX8_Polys_And_Vertices(numRenderTargetPolygons,numRenderTargetVertices,ShaderClass::_PresetOpaqueShader);
 
 				// draw all views of the world
+				ZhrMenuStyle::beginRenderFrame();
 				drawViews();
 
 				// draw the user interface

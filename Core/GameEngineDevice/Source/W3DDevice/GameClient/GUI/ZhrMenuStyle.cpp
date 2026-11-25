@@ -36,6 +36,7 @@ namespace
 {
 DisplayString *s_statusBadgeText = nullptr;
 UnsignedInt s_cachedGfxMode = 0xFFFFFFFFu;
+UnsignedInt s_renderFrameCounter = 0u;
 UnsignedInt s_lastBackdropFrame = 0xFFFFFFFFu;
 
 bool containsCaseInsensitive(const char *haystack, const char *needle)
@@ -333,12 +334,22 @@ Bool isSubPanelWindow(GameWindow *window, WinInstanceData *instData)
 	return containsCaseInsensitive(name, "ZhrSubPanel") ? TRUE : FALSE;
 }
 
+Bool isLegacyInteriorBackdrop(GameWindow *window, WinInstanceData *instData)
+{
+	if (!window || !instData)
+		return FALSE;
+	const char *name = instData->m_decoratedNameString.str();
+	// MainMenu.wnd stacks `EarthMap*` right over `MapBorder*` as a legacy flat interior fill;
+	// our frosted glass `MapBorder*` panel replaces both cleanly without double borders/corner brackets.
+	return containsCaseInsensitive(name, "EarthMap") ? TRUE : FALSE;
+}
+
 Bool shouldStyleShellPanel(GameWindow *window, WinInstanceData *instData)
 {
 	if (!isStyledForWindow(window) || !window || !instData)
 		return FALSE;
 
-	if (isDividerLineWindow(window, instData) || isSubPanelWindow(window, instData))
+	if (isDividerLineWindow(window, instData) || isSubPanelWindow(window, instData) || isLegacyInteriorBackdrop(window, instData))
 		return FALSE;
 
 	// Never paint frosted glass onto transparent click-catcher / SEE_THRU wrapper containers.
@@ -437,18 +448,19 @@ Bool shouldStyleShellGadget(GameWindow *window)
 	return isStyledForWindow(window);
 }
 
+void beginRenderFrame()
+{
+	++s_renderFrameCounter;
+}
+
 void drawShellBackdropFrame(Bool rightHalfOnly)
 {
 	if (!TheDisplay)
 		return;
 
-	if (TheGameClient)
-	{
-		const UnsignedInt curFrame = TheGameClient->getFrame();
-		if (s_lastBackdropFrame == curFrame)
-			return;
-		s_lastBackdropFrame = curFrame;
-	}
+	if (s_lastBackdropFrame == s_renderFrameCounter)
+		return;
+	s_lastBackdropFrame = s_renderFrameCounter;
 
 	const Int w = TheDisplay->getWidth();
 	const Int h = TheDisplay->getHeight();

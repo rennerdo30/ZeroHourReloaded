@@ -21,6 +21,75 @@ pub struct GpuTexture {
 }
 
 impl GpuTexture {
+    /// Creates a 2D texture with automatic GPU-blitted mipmaps (`>= 4x4`), recording its upload
+    /// directly into an active command buffer (outside dynamic rendering) with zero `vkQueueWaitIdle` stall.
+    /// The transient staging buffer is pushed into `retired_buffers` to be freed after the frame fence signals.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_2d_recorded(
+        ctx: &mut VkContext,
+        cmd: vk::CommandBuffer,
+        retired_buffers: &mut Vec<GpuBuffer>,
+        name: &str,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+        pixels: &[u8],
+        sampler: vk::Sampler,
+        descriptor_pool: vk::DescriptorPool,
+        set_layout: vk::DescriptorSetLayout,
+    ) -> Result<Self> {
+        let generate_mips = !format.is_compressed() && width >= 4 && height >= 4;
+        Self::create_internal(
+            ctx,
+            Some((cmd, retired_buffers)),
+            name,
+            width,
+            height,
+            1,
+            generate_mips,
+            format,
+            pixels,
+            sampler,
+            descriptor_pool,
+            set_layout,
+        )
+    }
+
+    /// Creates a multi-mip 2D texture, recording its upload directly into an active command buffer
+    /// (outside dynamic rendering) with zero `vkQueueWaitIdle` stall.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_2d_with_mips_recorded(
+        ctx: &mut VkContext,
+        cmd: vk::CommandBuffer,
+        retired_buffers: &mut Vec<GpuBuffer>,
+        name: &str,
+        width: u32,
+        height: u32,
+        provided_mips: u32,
+        format: TextureFormat,
+        pixels: &[u8],
+        sampler: vk::Sampler,
+        descriptor_pool: vk::DescriptorPool,
+        set_layout: vk::DescriptorSetLayout,
+    ) -> Result<Self> {
+        let generate_mips =
+            provided_mips <= 1 && !format.is_compressed() && width >= 4 && height >= 4;
+        Self::create_internal(
+            ctx,
+            Some((cmd, retired_buffers)),
+            name,
+            width,
+            height,
+            provided_mips.max(1),
+            generate_mips,
+            format,
+            pixels,
+            sampler,
+            descriptor_pool,
+            set_layout,
+        )
+    }
+
     /// Creates a 2D texture with automatic GPU-blitted mipmaps for uncompressed textures (`>= 4x4`),
     /// or single-mip upload for compressed textures.
     #[allow(clippy::too_many_arguments)]
@@ -38,6 +107,7 @@ impl GpuTexture {
         let generate_mips = !format.is_compressed() && width >= 4 && height >= 4;
         Self::create_internal(
             ctx,
+            None,
             name,
             width,
             height,
@@ -70,6 +140,7 @@ impl GpuTexture {
             provided_mips <= 1 && !format.is_compressed() && width >= 4 && height >= 4;
         Self::create_internal(
             ctx,
+            None,
             name,
             width,
             height,
@@ -86,6 +157,7 @@ impl GpuTexture {
     #[allow(clippy::too_many_arguments)]
     fn create_internal(
         ctx: &mut VkContext,
+        recorded: Option<(vk::CommandBuffer, &mut Vec<GpuBuffer>)>,
         name: &str,
         width: u32,
         height: u32,
@@ -206,7 +278,7 @@ impl GpuTexture {
         )?;
         staging.write_bytes(0, &pixels[..byte_offset])?;
 
-        ctx.submit_immediate(|device, cmd| {
+        let record_upload = |device: &ash::Device, cmd: vk::CommandBuffer| {
             let all_mips = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(0)
@@ -366,9 +438,15 @@ impl GpuTexture {
                 // SAFETY: Valid transition to shader-read-only optimal.
                 unsafe { device.cmd_pipeline_barrier2(cmd, &dep2) };
             }
-        })?;
+        };
 
-        staging.destroy(ctx);
+        if let Some((cmd, retired_buffers)) = recorded {
+            record_upload(&ctx.device, cmd);
+            retired_buffers.push(staging);
+        } else {
+            ctx.submit_immediate(record_upload)?;
+            staging.destroy(ctx);
+        }
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)

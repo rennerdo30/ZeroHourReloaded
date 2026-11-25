@@ -596,17 +596,43 @@ impl VulkanRenderer {
                 .get_or_create(&self.ctx.device, sampler_desc, self.ctx.max_anisotropy)?;
         let id = TextureId(self.next_texture_id);
         self.next_texture_id += 1;
-        let tex = GpuTexture::new_2d(
-            &mut self.ctx,
-            &format!("zhr_tex_{}", id.0),
-            width,
-            height,
-            format,
-            &pixels[..expected],
-            sampler,
-            self.texture_pool,
-            self.pipelines.set1_texture_layout,
-        )?;
+        let tex = if let Some(af) = self.active_frame.as_mut() {
+            let slot_index = af.slot_index;
+            let cmd = self.frames[slot_index].cmd;
+            if af.rendering_begun {
+                af.rendering_begun = false;
+                af.last_pipeline = None;
+                af.last_texture = None;
+                af.last_texture1 = None;
+                // SAFETY: Active dynamic rendering pass suspended cleanly before transfer commands.
+                unsafe { self.ctx.device.cmd_end_rendering(cmd) };
+            }
+            GpuTexture::new_2d_recorded(
+                &mut self.ctx,
+                cmd,
+                &mut self.frames[slot_index].retired_buffers,
+                &format!("zhr_tex_{}", id.0),
+                width,
+                height,
+                format,
+                &pixels[..expected],
+                sampler,
+                self.texture_pool,
+                self.pipelines.set1_texture_layout,
+            )?
+        } else {
+            GpuTexture::new_2d(
+                &mut self.ctx,
+                &format!("zhr_tex_{}", id.0),
+                width,
+                height,
+                format,
+                &pixels[..expected],
+                sampler,
+                self.texture_pool,
+                self.pipelines.set1_texture_layout,
+            )?
+        };
         self.textures.insert(id, tex);
         self.texture_samplers.insert(id, sampler_desc);
         self.submit_texture_for_remaster(id, width, height, format, &pixels[..expected]);
@@ -632,18 +658,45 @@ impl VulkanRenderer {
                 .get_or_create(&self.ctx.device, sampler_desc, self.ctx.max_anisotropy)?;
         let id = TextureId(self.next_texture_id);
         self.next_texture_id += 1;
-        let tex = GpuTexture::new_2d_with_mips(
-            &mut self.ctx,
-            &format!("zhr_tex_{}", id.0),
-            width,
-            height,
-            mip_count,
-            format,
-            pixels,
-            sampler,
-            self.texture_pool,
-            self.pipelines.set1_texture_layout,
-        )?;
+        let tex = if let Some(af) = self.active_frame.as_mut() {
+            let slot_index = af.slot_index;
+            let cmd = self.frames[slot_index].cmd;
+            if af.rendering_begun {
+                af.rendering_begun = false;
+                af.last_pipeline = None;
+                af.last_texture = None;
+                af.last_texture1 = None;
+                // SAFETY: Active dynamic rendering pass suspended cleanly before transfer commands.
+                unsafe { self.ctx.device.cmd_end_rendering(cmd) };
+            }
+            GpuTexture::new_2d_with_mips_recorded(
+                &mut self.ctx,
+                cmd,
+                &mut self.frames[slot_index].retired_buffers,
+                &format!("zhr_tex_{}", id.0),
+                width,
+                height,
+                mip_count,
+                format,
+                pixels,
+                sampler,
+                self.texture_pool,
+                self.pipelines.set1_texture_layout,
+            )?
+        } else {
+            GpuTexture::new_2d_with_mips(
+                &mut self.ctx,
+                &format!("zhr_tex_{}", id.0),
+                width,
+                height,
+                mip_count,
+                format,
+                pixels,
+                sampler,
+                self.texture_pool,
+                self.pipelines.set1_texture_layout,
+            )?
+        };
         self.textures.insert(id, tex);
         self.texture_samplers.insert(id, sampler_desc);
         self.submit_texture_for_remaster(id, width, height, format, &pixels[..expected_base]);
@@ -983,9 +1036,20 @@ impl VulkanRenderer {
             }
         }
 
-        // Zero-stall async texture hot-swap: upload up to 2 completed 2x remastered textures per frame.
+        // SAFETY: Fence was waited, so `cmd` is no longer in flight.
+        unsafe {
+            self.ctx
+                .device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.ctx.device.begin_command_buffer(cmd, &begin)?;
+        }
+
+        // Zero-stall async texture hot-swap: record up to 8 completed 2x remastered textures directly
+        // into this frame's command buffer (ZERO `submit_immediate()` / `vkQueueWaitIdle()` stalls!).
         if let Some(worker) = self.remaster_worker.as_ref() {
-            let finished = worker.poll_completed(2);
+            let finished = worker.poll_completed(8);
             for item in finished {
                 let id = TextureId(item.texture_id);
                 if !self.textures.contains_key(&id) {
@@ -995,8 +1059,10 @@ impl VulkanRenderer {
                 if let Ok(sampler) =
                     self.samplers
                         .get_or_create(&self.ctx.device, sdesc, self.ctx.max_anisotropy)
-                    && let Ok(up_tex) = GpuTexture::new_2d(
+                    && let Ok(up_tex) = GpuTexture::new_2d_recorded(
                         &mut self.ctx,
+                        cmd,
+                        &mut self.frames[slot_index].retired_buffers,
                         &format!("zhr_tex_2x_{}", id.0),
                         item.width,
                         item.height,
@@ -1011,15 +1077,6 @@ impl VulkanRenderer {
                     self.frames[slot_index].retired_textures.push(prev);
                 }
             }
-        }
-        // SAFETY: Fence was waited, so `cmd` is no longer in flight.
-        unsafe {
-            self.ctx
-                .device
-                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.ctx.device.begin_command_buffer(cmd, &begin)?;
         }
 
         // Transition HDR scene color target -> COLOR_ATTACHMENT_OPTIMAL.

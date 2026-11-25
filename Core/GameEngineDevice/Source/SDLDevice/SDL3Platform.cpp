@@ -27,6 +27,24 @@ namespace
 	Bool g_sdlInitialized = FALSE;
 	Bool g_focused = TRUE;
 	Bool g_minimized = FALSE;
+#ifdef _WIN32
+	HWND g_sdlHwnd = nullptr;
+	WNDPROC g_origSdlWndProc = nullptr;
+
+	LRESULT CALLBACK zhrSdlCursorSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+	{
+		if (msg == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT && TheWin32Mouse)
+		{
+			TheWin32Mouse->setCursor(TheWin32Mouse->getMouseCursor());
+			return TRUE;
+		}
+		if (g_origSdlWndProc)
+		{
+			return CallWindowProcW(g_origSdlWndProc, hwnd, msg, wParam, lParam);
+		}
+		return DefWindowProcW(hwnd, msg, wParam, lParam);
+	}
+#endif
 
 	void sdlPointToBackbufferPixel(float x, float y, int& outX, int& outY)
 	{
@@ -118,6 +136,12 @@ Bool createWindow(const char* title, Int width, Int height, Bool windowed, void*
 #ifdef _WIN32
 	SDL_PropertiesID props = SDL_GetWindowProperties(g_sdlWindow);
 	void* hwnd = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+	if (hwnd && !headlessRender)
+	{
+		g_sdlHwnd = static_cast<HWND>(hwnd);
+		g_origSdlWndProc = reinterpret_cast<WNDPROC>(
+			SetWindowLongPtrW(g_sdlHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(zhrSdlCursorSubclassProc)));
+	}
 	if (outNativeHandle)
 		*outNativeHandle = hwnd;
 #endif
@@ -127,6 +151,14 @@ Bool createWindow(const char* title, Int width, Int height, Bool windowed, void*
 
 void destroyWindow()
 {
+#ifdef _WIN32
+	if (g_sdlHwnd && g_origSdlWndProc)
+	{
+		SetWindowLongPtrW(g_sdlHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origSdlWndProc));
+		g_origSdlWndProc = nullptr;
+		g_sdlHwnd = nullptr;
+	}
+#endif
 	if (g_sdlWindow)
 	{
 		SDL_DestroyWindow(g_sdlWindow);
