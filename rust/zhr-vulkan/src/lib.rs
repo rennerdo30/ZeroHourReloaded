@@ -100,6 +100,7 @@ struct ActiveFrame {
     has_3d_depth_writes: bool,
     ssao_applied: bool,
     backdrop_captured: bool,
+    water_depth_captured: bool,
     last_3d_proj: Mat4,
     last_pipeline: Option<vk::Pipeline>,
     last_texture: Option<(TextureId, bool)>,
@@ -112,6 +113,7 @@ pub struct VulkanRenderer {
     target: Option<RenderTarget>,
     postprocess: Option<PostProcessPipeline>,
     ui_backdrop_set: vk::DescriptorSet,
+    water_depth_set: vk::DescriptorSet,
     hdr_initialized: bool,
     pipelines: PipelineCache,
     samplers: SamplerCache,
@@ -301,16 +303,24 @@ impl VulkanRenderer {
             depth_sample_view,
             FRAMES_IN_FLIGHT,
         )?;
-        let backdrop_layouts = [pipelines.set1_texture_layout];
+        let backdrop_layouts = [pipelines.set1_texture_layout, pipelines.set1_texture_layout];
         let backdrop_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(texture_pool)
             .set_layouts(&backdrop_layouts);
         // SAFETY: Pool has plenty of sets (`MAX_TEXTURES`).
-        let ui_backdrop_set = unsafe { ctx.device.allocate_descriptor_sets(&backdrop_alloc)?[0] };
+        let extra_sets = unsafe { ctx.device.allocate_descriptor_sets(&backdrop_alloc)? };
+        let ui_backdrop_set = extra_sets[0];
+        let water_depth_set = extra_sets[1];
         write_sampled_texture_set(
             &ctx.device,
             ui_backdrop_set,
             postprocess.ui_backdrop_view(),
+            postprocess.linear_sampler(),
+        );
+        write_sampled_texture_set(
+            &ctx.device,
+            water_depth_set,
+            postprocess.water_depth_view(),
             postprocess.linear_sampler(),
         );
         let graphics = GraphicsSettings::from_env(default_remastered);
@@ -348,6 +358,7 @@ impl VulkanRenderer {
             target: Some(target),
             postprocess: Some(postprocess),
             ui_backdrop_set,
+            water_depth_set,
             hdr_initialized: false,
             pipelines,
             samplers,
@@ -465,6 +476,12 @@ impl VulkanRenderer {
                 &self.ctx.device,
                 self.ui_backdrop_set,
                 pp.ui_backdrop_view(),
+                pp.linear_sampler(),
+            );
+            write_sampled_texture_set(
+                &self.ctx.device,
+                self.water_depth_set,
+                pp.water_depth_view(),
                 pp.linear_sampler(),
             );
             self.hdr_initialized = false;
@@ -611,6 +628,9 @@ impl VulkanRenderer {
             }
         };
         if let Some(rgba8) = rgba8 {
+            if is_font_alpha_mask(&rgba8) {
+                return;
+            }
             worker.submit(RemasterJob {
                 texture_id: id.0,
                 width,
@@ -978,6 +998,7 @@ impl VulkanRenderer {
             has_3d_depth_writes: false,
             ssao_applied: false,
             backdrop_captured: false,
+            water_depth_captured: false,
             last_3d_proj: Mat4::IDENTITY,
             last_pipeline: None,
             last_texture: None,
@@ -1183,6 +1204,49 @@ impl VulkanRenderer {
     fn bind_draw_state(&mut self) -> Result<(vk::CommandBuffer, usize)> {
         let is_3d_pass =
             self.shader.depth_compare() != DepthCompare::Always || self.shader.depth_write();
+        // Snapshot opaque 3D depth before the first water draw so water gets exact per-pixel depth
+        // for Beer-Lambert coastal absorption, soft shoreline edges, animated rock foam, and caustics.
+        if is_3d_pass
+            && self.material_hint == 1
+            && self.graphics.mode != GraphicsMode::Classic
+            && self.graphics.pbr_lighting
+            && self.active_frame.as_ref().is_some_and(|af| {
+                af.rendering_begun && af.has_3d_depth_writes && !af.water_depth_captured
+            })
+        {
+            let (slot_index, depth_image, depth_format, proj) = {
+                let af = self.active_frame.as_mut().expect("active frame");
+                af.water_depth_captured = true;
+                af.rendering_begun = false;
+                af.last_pipeline = None;
+                af.last_texture = None;
+                af.last_texture1 = None;
+                (
+                    af.slot_index,
+                    af.depth_image,
+                    af.depth_format,
+                    if self.proj_matrix.col(3).z.abs() > 1e-5 {
+                        self.proj_matrix
+                    } else {
+                        af.last_3d_proj
+                    },
+                )
+            };
+            let cmd = self.frames[slot_index].cmd;
+            // SAFETY: `cmd_begin_rendering` was active before suspending for depth linearization.
+            unsafe { self.ctx.device.cmd_end_rendering(cmd) };
+            if let Some(pp) = &mut self.postprocess {
+                pp.capture_water_depth(
+                    &self.ctx.device,
+                    cmd,
+                    slot_index,
+                    depth_image,
+                    depth_format,
+                    proj,
+                )?;
+            }
+        }
+
         // When transitioning from 3D world (including stencil shadows) to 2D HUD/UI,
         // apply depth-based bilateral SSAO and capture the frosted-glass backdrop before UI draws on top.
         if !is_3d_pass && !self.stencil.enabled {
@@ -1284,6 +1348,11 @@ impl VulkanRenderer {
             && self.material_hint == 2
             && self.graphics.mode != GraphicsMode::Classic
             && af.backdrop_captured;
+        let use_water_depth = is_3d_pass
+            && self.material_hint == 1
+            && self.graphics.mode != GraphicsMode::Classic
+            && self.graphics.pbr_lighting
+            && af.water_depth_captured;
         let glass_hint = if use_ui_glass {
             if self.graphics.mode == GraphicsMode::SplitScreen {
                 3.0
@@ -1295,11 +1364,21 @@ impl VulkanRenderer {
         } else {
             0.0
         };
+        let screen_inv_w = if use_ui_glass || use_water_depth {
+            1.0 / (af.extent.width.max(1) as f32)
+        } else {
+            0.0
+        };
+        let screen_inv_h = if use_ui_glass || use_water_depth {
+            1.0 / (af.extent.height.max(1) as f32)
+        } else {
+            0.0
+        };
         draw_uniforms.water_params = [
             self.start_time.elapsed().as_secs_f32(),
             glass_hint,
-            1.0 / (af.extent.width.max(1) as f32),
-            1.0 / (af.extent.height.max(1) as f32),
+            screen_inv_w,
+            screen_inv_h,
         ];
 
         let alignment = self.ctx.min_uniform_offset_alignment as usize;
@@ -1321,8 +1400,10 @@ impl VulkanRenderer {
             );
         }
 
-        let use_remastered_tex =
-            self.graphics.remaster_textures && self.graphics.mode != GraphicsMode::Classic;
+        // Keep 2D UI, HUD, and GDI font glyph atlases pixel-sharp; apply 2x remastering to 3D world geometry.
+        let use_remastered_tex = is_3d_pass
+            && self.graphics.remaster_textures
+            && self.graphics.mode != GraphicsMode::Classic;
 
         let use_combiner = self.uniforms.stage0_ops[0] != 0;
         let tex_id = if use_combiner || self.shader.texturing_enabled() {
@@ -1369,6 +1450,23 @@ impl VulkanRenderer {
                     );
                 }
                 af.last_texture1 = Some((glass_sentinel, false));
+                self.stats.texture_binds += 1;
+            }
+        } else if use_water_depth {
+            let wd_sentinel = TextureId(u32::MAX - 1);
+            if af.last_texture1 != Some((wd_sentinel, false)) {
+                // SAFETY: `water_depth_set` is valid and `water_depth` is in SHADER_READ_ONLY_OPTIMAL.
+                unsafe {
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.pipeline_layout,
+                        2,
+                        &[self.water_depth_set],
+                        &[],
+                    );
+                }
+                af.last_texture1 = Some((wd_sentinel, false));
                 self.stats.texture_binds += 1;
             }
         } else {
@@ -1804,6 +1902,25 @@ impl Drop for VulkanRenderer {
             }
         }
     }
+}
+
+/// Returns true when an RGBA8 texture is a pure white alpha mask (e.g. `Render2DSentenceClass`
+/// GDI font glyph atlases), which must stay at native pixel-accurate resolution instead of being
+/// passed through the 2x edge-directed texture upscaler.
+fn is_font_alpha_mask(rgba8: &[u8]) -> bool {
+    let mut has_transparent = false;
+    let mut has_visible = false;
+    for px in rgba8.chunks_exact(4) {
+        if px[3] == 0 {
+            has_transparent = true;
+        } else {
+            has_visible = true;
+            if px[0] < 248 || px[1] < 248 || px[2] < 248 {
+                return false;
+            }
+        }
+    }
+    has_transparent && has_visible
 }
 
 fn write_sampled_texture_set(

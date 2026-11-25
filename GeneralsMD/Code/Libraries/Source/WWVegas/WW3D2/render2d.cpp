@@ -196,6 +196,7 @@ void	  Render2DClass::Update_Bias()
 
 	BiasedCoordinateOffset = CoordinateOffset;
 
+#if !defined(ZHR_USE_VULKAN) && !defined(ZHR_VULKAN_BACKEND)
 	if ( WW3D::Is_Screen_UV_Biased() ) {
 		// Global bais setting
 		Vector2 bais_add( -0.5f ,-0.5f );	// offset by -0.5,-0.5 in pixels
@@ -206,6 +207,7 @@ void	  Render2DClass::Update_Bias()
 
 		BiasedCoordinateOffset += bais_add;
 	}
+#endif
 }
 
 #if 0

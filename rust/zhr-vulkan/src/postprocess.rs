@@ -13,7 +13,7 @@ use crate::types::{GraphicsMode, GraphicsSettings};
 
 pub const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-const SLOTS_PER_FRAME: usize = 11;
+const SLOTS_PER_FRAME: usize = 12;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -213,6 +213,17 @@ fn fs_ssao_apply(in: VsOut) -> @location(0) vec4<f32> {
 // ============================================================================
 
 @fragment
+fn fs_water_depth_copy(in: VsOut) -> @location(0) vec4<f32> {
+    let scene_rgb = clamp(textureSample(t_src1, s_samp, in.uv).rgb, vec3<f32>(0.0), vec3<f32>(16.0));
+    let d = textureSample(t_src0, s_samp, in.uv).r;
+    if (d >= 0.9995 || d <= 0.00001 || abs(u.params2.w) < 0.00001) {
+        return vec4<f32>(scene_rgb, 10000.0);
+    }
+    let lin_z = clamp(depth_to_view_z(d), 0.01, 20000.0);
+    return vec4<f32>(scene_rgb, lin_z);
+}
+
+@fragment
 fn fs_backdrop_copy(in: VsOut) -> @location(0) vec4<f32> {
     let texel = vec2<f32>(u.params0.z, u.params0.w);
     let c0 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>(-1.0, -1.0)).rgb;
@@ -333,6 +344,16 @@ struct ImageTarget {
 
 impl ImageTarget {
     fn new(ctx: &mut VkContext, name: &str, width: u32, height: u32) -> Result<Self> {
+        Self::new_with_format(ctx, name, width, height, HDR_FORMAT)
+    }
+
+    fn new_with_format(
+        ctx: &mut VkContext,
+        name: &str,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<Self> {
         let w = width.max(1);
         let h = height.max(1);
         let (image, view, alloc) = create_attachment(
@@ -340,7 +361,7 @@ impl ImageTarget {
             name,
             w,
             h,
-            HDR_FORMAT,
+            format,
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_DST,
@@ -374,6 +395,7 @@ pub struct PostProcessPipeline {
     bloom_a: ImageTarget,
     bloom_b: ImageTarget,
     ui_backdrop: ImageTarget,
+    water_depth: ImageTarget,
     ssao_a: ImageTarget,
     ssao_b: ImageTarget,
     depth_sample_view: vk::ImageView,
@@ -390,9 +412,11 @@ pub struct PostProcessPipeline {
     set_ssao_blur_h: vk::DescriptorSet,
     set_ssao_blur_v: vk::DescriptorSet,
     set_ssao_apply: vk::DescriptorSet,
+    set_water_snapshot: vk::DescriptorSet,
     params_ubo: GpuBuffer,
     slot_stride: usize,
     vs_module: vk::ShaderModule,
+    fs_water_depth_module: vk::ShaderModule,
     fs_backdrop_copy_module: vk::ShaderModule,
     fs_extract_module: vk::ShaderModule,
     fs_blur_module: vk::ShaderModule,
@@ -400,6 +424,7 @@ pub struct PostProcessPipeline {
     fs_ssao_raw_module: vk::ShaderModule,
     fs_ssao_blur_module: vk::ShaderModule,
     fs_ssao_apply_module: vk::ShaderModule,
+    water_depth_pipeline: vk::Pipeline,
     backdrop_copy_pipeline: vk::Pipeline,
     extract_pipeline: vk::Pipeline,
     blur_pipeline: vk::Pipeline,
@@ -430,6 +455,7 @@ impl PostProcessPipeline {
         let bloom_a = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let bloom_b = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
         let ui_backdrop = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
+        let water_depth = ImageTarget::new(ctx, "zhr_water_snapshot", w, h)?;
         let ssao_a = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let ssao_b = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
 
@@ -439,6 +465,7 @@ impl PostProcessPipeline {
                 bloom_a.image,
                 bloom_b.image,
                 ui_backdrop.image,
+                water_depth.image,
                 ssao_a.image,
                 ssao_b.image,
             ],
@@ -499,28 +526,28 @@ impl PostProcessPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 16,
+                descriptor_count: 18,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: 8,
+                descriptor_count: 9,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                descriptor_count: 8,
+                descriptor_count: 9,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(8)
+            .max_sets(9)
             .pool_sizes(&pool_sizes);
         // SAFETY: `device` is valid.
         let descriptor_pool = unsafe { ctx.device.create_descriptor_pool(&pool_info, None)? };
 
-        let alloc_layouts = [set_layout; 8];
+        let alloc_layouts = [set_layout; 9];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&alloc_layouts);
-        // SAFETY: Pool has room for 8 sets.
+        // SAFETY: Pool has room for 9 sets.
         let sets = unsafe { ctx.device.allocate_descriptor_sets(&alloc_info)? };
 
         let align = ctx.min_uniform_offset_alignment as usize;
@@ -537,6 +564,11 @@ impl PostProcessPipeline {
 
         let vs_spv =
             compile_wgsl_to_spirv(POSTPROCESS_WGSL, naga::ShaderStage::Vertex, "vs_fullscreen")?;
+        let fs_water_depth_spv = compile_wgsl_to_spirv(
+            POSTPROCESS_WGSL,
+            naga::ShaderStage::Fragment,
+            "fs_water_depth_copy",
+        )?;
         let fs_backdrop_copy_spv = compile_wgsl_to_spirv(
             POSTPROCESS_WGSL,
             naga::ShaderStage::Fragment,
@@ -571,6 +603,7 @@ impl PostProcessPipeline {
         )?;
 
         let vs_module = create_shader_module(&ctx.device, &vs_spv)?;
+        let fs_water_depth_module = create_shader_module(&ctx.device, &fs_water_depth_spv)?;
         let fs_backdrop_copy_module = create_shader_module(&ctx.device, &fs_backdrop_copy_spv)?;
         let fs_extract_module = create_shader_module(&ctx.device, &fs_extract_spv)?;
         let fs_blur_module = create_shader_module(&ctx.device, &fs_blur_spv)?;
@@ -579,6 +612,15 @@ impl PostProcessPipeline {
         let fs_ssao_blur_module = create_shader_module(&ctx.device, &fs_ssao_blur_spv)?;
         let fs_ssao_apply_module = create_shader_module(&ctx.device, &fs_ssao_apply_spv)?;
 
+        let water_depth_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_water_depth_module,
+            c"fs_water_depth_copy",
+            HDR_FORMAT,
+            false,
+        )?;
         let backdrop_copy_pipeline = create_fullscreen_pipeline(
             &ctx.device,
             pipeline_layout,
@@ -648,6 +690,7 @@ impl PostProcessPipeline {
             bloom_a,
             bloom_b,
             ui_backdrop,
+            water_depth,
             ssao_a,
             ssao_b,
             depth_sample_view,
@@ -664,9 +707,11 @@ impl PostProcessPipeline {
             set_ssao_blur_h: sets[5],
             set_ssao_blur_v: sets[6],
             set_ssao_apply: sets[7],
+            set_water_snapshot: sets[8],
             params_ubo,
             slot_stride,
             vs_module,
+            fs_water_depth_module,
             fs_backdrop_copy_module,
             fs_extract_module,
             fs_blur_module,
@@ -674,6 +719,7 @@ impl PostProcessPipeline {
             fs_ssao_raw_module,
             fs_ssao_blur_module,
             fs_ssao_apply_module,
+            water_depth_pipeline,
             backdrop_copy_pipeline,
             extract_pipeline,
             blur_pipeline,
@@ -699,6 +745,10 @@ impl PostProcessPipeline {
         self.ui_backdrop.view
     }
 
+    pub fn water_depth_view(&self) -> vk::ImageView {
+        self.water_depth.view
+    }
+
     pub fn linear_sampler(&self) -> vk::Sampler {
         self.linear_sampler
     }
@@ -722,6 +772,7 @@ impl PostProcessPipeline {
         let new_ba = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let new_bb = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
         let new_ui = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
+        let new_wd = ImageTarget::new(ctx, "zhr_water_snapshot", w, h)?;
         let new_sa = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let new_sb = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
         transition_images_to_shader_read(
@@ -730,6 +781,7 @@ impl PostProcessPipeline {
                 new_ba.image,
                 new_bb.image,
                 new_ui.image,
+                new_wd.image,
                 new_sa.image,
                 new_sb.image,
             ],
@@ -739,12 +791,14 @@ impl PostProcessPipeline {
         let old_ba = std::mem::replace(&mut self.bloom_a, new_ba);
         let old_bb = std::mem::replace(&mut self.bloom_b, new_bb);
         let old_ui = std::mem::replace(&mut self.ui_backdrop, new_ui);
+        let old_wd = std::mem::replace(&mut self.water_depth, new_wd);
         let old_sa = std::mem::replace(&mut self.ssao_a, new_sa);
         let old_sb = std::mem::replace(&mut self.ssao_b, new_sb);
         old_hdr.destroy(ctx);
         old_ba.destroy(ctx);
         old_bb.destroy(ctx);
         old_ui.destroy(ctx);
+        old_wd.destroy(ctx);
         old_sa.destroy(ctx);
         old_sb.destroy(ctx);
 
@@ -874,6 +928,14 @@ impl PostProcessPipeline {
             self.bloom_a.view,
             self.linear_sampler,
         );
+        // Pre-water snapshot pass: reads opaque depth (t_src0) + opaque HDR seabed/rocks (t_src1).
+        write_set(
+            self.set_water_snapshot,
+            self.depth_sample_view,
+            dsro,
+            self.hdr_scene.view,
+            self.nearest_sampler,
+        );
     }
 
     /// Computes half-res depth-based bilateral SSAO and multiplies it directly into `hdr_scene`.
@@ -893,15 +955,19 @@ impl PostProcessPipeline {
         if settings.mode == GraphicsMode::Classic || !settings.pbr_lighting {
             return Ok(());
         }
-        // Only run SSAO for perspective 3D projections (m32 != 0).
+        // Only run SSAO for perspective 3D projections (m32 != 0 and m23 != 0).
         let cols = proj.to_cols_array_2d();
         let m00 = cols[0][0];
         let m11 = cols[1][1];
         let m22 = cols[2][2];
+        let m23 = cols[2][3];
         let m32 = cols[3][2];
-        if m00.abs() < 1e-4 || m11.abs() < 1e-4 || m32.abs() < 1e-5 {
+        if m00.abs() < 1e-4 || m11.abs() < 1e-4 || m32.abs() < 1e-5 || m23.abs() < 1e-5 {
             return Ok(());
         }
+        // Normalize by m23 so `depth_to_view_z` is exact for both RH (m23=-1) and LH (m23=+1).
+        let m22_eff = m22 / m23;
+        let m32_eff = m32 / m23;
 
         let split_x_uv = if settings.mode == GraphicsMode::SplitScreen {
             0.5
@@ -916,7 +982,7 @@ impl PostProcessPipeline {
 
         let inv_sw = 1.0 / (self.ssao_a.width.max(1) as f32);
         let inv_sh = 1.0 / (self.ssao_a.height.max(1) as f32);
-        let proj_unpack = [1.0 / m00.abs(), 1.0 / m11.abs(), m22, m32];
+        let proj_unpack = [1.0 / m00.abs(), 1.0 / m11.abs(), m22_eff, m32_eff];
 
         let p_raw = PostParams {
             params0: [1.0, split_x_uv, inv_sw, inv_sh],
@@ -1108,6 +1174,138 @@ impl PostProcessPipeline {
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         );
 
+        Ok(())
+    }
+
+    /// Snapshots the opaque pre-water `hdr_scene` (RGB) and linearized view-space depth (A) into
+    /// `water_depth` (`R16G16B16A16_SFLOAT`) so the water shader gets true screen-space seabed/rock
+    /// refraction, Beer-Lambert coastal absorption, soft shoreline feathering, animated rock foam,
+    /// and shallow underwater caustics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_water_depth(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+        depth_image: vk::Image,
+        depth_format: vk::Format,
+        proj: Mat4,
+    ) -> Result<()> {
+        let cols = proj.to_cols_array_2d();
+        let m00 = cols[0][0];
+        let m11 = cols[1][1];
+        let m22 = cols[2][2];
+        let m23 = cols[2][3];
+        let m32 = cols[3][2];
+        if m00.abs() < 1e-4 || m11.abs() < 1e-4 || m32.abs() < 1e-5 || m23.abs() < 1e-5 {
+            return Ok(());
+        }
+        let m22_eff = m22 / m23;
+        let m32_eff = m32 / m23;
+
+        let off_wd = ((frame_slot * SLOTS_PER_FRAME + 11) * self.slot_stride) as u32;
+        let p_wd = PostParams {
+            params0: [
+                1.0,
+                -1.0,
+                1.0 / (self.water_depth.width.max(1) as f32),
+                1.0 / (self.water_depth.height.max(1) as f32),
+            ],
+            params1: [0.0; 4],
+            params2: [1.0 / m00.abs(), 1.0 / m11.abs(), m22_eff, m32_eff],
+        };
+        self.params_ubo
+            .write_bytes(off_wd as usize, bytemuck::bytes_of(&p_wd))?;
+
+        let depth_aspect = depth_barrier_aspect(depth_format);
+        cmd_depth_barrier(
+            device,
+            cmd,
+            depth_image,
+            depth_aspect,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.hdr_scene.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        cmd_barrier(
+            device,
+            cmd,
+            self.water_depth.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        let wd_extent = vk::Extent2D {
+            width: self.water_depth.width,
+            height: self.water_depth.height,
+        };
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.water_depth.view,
+            wd_extent,
+            self.water_depth_pipeline,
+            self.pipeline_layout,
+            self.set_water_snapshot,
+            off_wd,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.water_depth.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        cmd_barrier(
+            device,
+            cmd,
+            self.hdr_scene.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        cmd_depth_barrier(
+            device,
+            cmd,
+            depth_image,
+            depth_aspect,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        );
         Ok(())
     }
 
@@ -1515,11 +1713,13 @@ impl PostProcessPipeline {
         self.bloom_a.destroy(ctx);
         self.bloom_b.destroy(ctx);
         self.ui_backdrop.destroy(ctx);
+        self.water_depth.destroy(ctx);
         self.ssao_a.destroy(ctx);
         self.ssao_b.destroy(ctx);
         self.params_ubo.destroy(ctx);
         // SAFETY: Caller ensures GPU is idle.
         unsafe {
+            ctx.device.destroy_pipeline(self.water_depth_pipeline, None);
             ctx.device
                 .destroy_pipeline(self.backdrop_copy_pipeline, None);
             ctx.device.destroy_pipeline(self.extract_pipeline, None);
@@ -1529,6 +1729,8 @@ impl PostProcessPipeline {
             ctx.device.destroy_pipeline(self.ssao_blur_pipeline, None);
             ctx.device.destroy_pipeline(self.ssao_apply_pipeline, None);
             ctx.device.destroy_shader_module(self.vs_module, None);
+            ctx.device
+                .destroy_shader_module(self.fs_water_depth_module, None);
             ctx.device
                 .destroy_shader_module(self.fs_backdrop_copy_module, None);
             ctx.device

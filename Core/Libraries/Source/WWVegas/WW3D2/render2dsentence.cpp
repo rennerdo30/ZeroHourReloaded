@@ -1622,9 +1622,9 @@ FontCharsClass::Create_GDI_Font (const char *font_name)
 {
 	HDC screen_dc = ::GetDC ((HWND)WW3D::Get_Window());
 
-	const char *fontToUseForGenerals = "Segoe UI Semibold";
+	const char *fontToUseForGenerals = "Franklin Gothic Medium";
 	bool doingGenerals = false;
-	if (strcmp(font_name, "Generals")==0) {
+	if (_stricmp(font_name, "Generals") == 0) {
 		font_name = fontToUseForGenerals;
 		doingGenerals = true;
 	}
@@ -1635,7 +1635,7 @@ FontCharsClass::Create_GDI_Font (const char *font_name)
 	const int dotsPerInch = 96; // always use 96.	jba.
 	int font_height = -MulDiv (PointSize, dotsPerInch, 72);
 
-	int fontWidth = 0; // use crisp native glyph proportions.
+	int fontWidth = 0; // use crisp native geometric proportions.
 	PixelOverlap = (-font_height)/8;
 
 	// Sanity check in case of perversion. :)
@@ -1644,12 +1644,12 @@ FontCharsClass::Create_GDI_Font (const char *font_name)
 	//
 	//	Create the Windows font
 	//
-	DWORD bold		= IsBold ? FW_BOLD : (doingGenerals ? FW_SEMIBOLD : FW_NORMAL);
+	DWORD bold		= IsBold ? FW_BOLD : FW_NORMAL;
 	DWORD italic	= 0;
-	GDIFont			= ::CreateFont (font_height, fontWidth, 0, 0, bold, italic,
-								FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+	GDIFont			= ::CreateFontA (font_height, fontWidth, 0, 0, bold, italic,
+								FALSE, FALSE, ANSI_CHARSET, OUT_TT_PRECIS,
 								CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-								VARIABLE_PITCH, font_name);
+								DEFAULT_PITCH | FF_DONTCARE, font_name);
 
 	//
 	//	Create a device context we can select the font and bitmap into

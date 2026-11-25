@@ -28,13 +28,16 @@ Replaces legacy 32-bit DirectX 8 (`d3d8.dll`) with a native 64-bit Vulkan 1.3 dy
 
 ---
 
-### 2. Domain-Warped Animated Water, Fresnel Reflections & PBR Terrain Relief (`F10`)
-Replaces flat scrolling water planes and matte terrain with 5-octave domain-warped procedural waves, viewing-angle Fresnel sky reflections, GGX sun glints, animated shoreline ripples, and derivative micro-normal PBR relief on rocky coastlines and terrain.
+### 2. Depth-Aware Modern Coastal & Oceanic Water, Screen-Space Refraction & PBR Terrain Relief (`F10`)
+Replaces flat dark scrolling water planes and hard dry polygon rock intersections with a pre-water HDR + linearized depth snapshot (`PostProcessPipeline::capture_water_depth`) driving true per-pixel optical water:
+- **Screen-Space Underwater Refraction & Beer-Lambert Absorption:** Translucent emerald-turquoise coastal shallows revealing submerged seabed and rocks, smoothly absorbing into cerulean and deep oceanic sapphire with depth-guarded dry-rock rejection.
+- **Organic Coastal Shoreline Foam & Wet Feathering:** Animated lacy white contact foam hugging rocks, islands, and ship hulls, rolling beach surf bands, soft wet shoreline edge transitions, dappled shallow sun caustics, and backlit wave-crest subsurface scattering (SSS).
+- **Fluid Multi-Directional Swells, Sky/Cloud Fresnel Reflections & HDR Sun Glints:** Smooth rolling waves with atmospheric sky/cloud Fresnel reflections, dual-lobe GGX specular glints, and PBR micro-normal stone relief on coastlines.
 
-| Classic Water & Coastline | Remastered Animated Water & PBR Rocks |
+| Classic Water & Coastline | Remastered Modern Coastal Water & PBR Rocks |
 | :---: | :---: |
 | ![Classic Water and Rocks](docs/screenshots/a_water_rocks_classic.png) | ![Remastered Water and Rocks](docs/screenshots/b_water_rocks_remastered.png) |
-| *Static low-contrast water texture with flat Gouraud-shaded shoreline rocks* | *Animated multi-octave waves, crisp specular water highlights, Fresnel sky reflection, and PBR micro-normal stone relief* |
+| *Flat dark water with hard dry polygon cuts around rocks & islands and no shoreline blending* | *Translucent turquoise shallows with seabed refraction, lacy rock/island shoreline foam, dappled caustics, liquid swells & PBR stone relief* |
 
 ---
 
@@ -67,7 +70,7 @@ Legacy 32-bit `binkw32.dll` and `mss32.dll` cannot load in a 64-bit process. Zer
 Replaces the stretched 2003 full-screen blue grid border, blurry bitmap button frames, and 4-bit quantized (`A4R4G4B4`) fonts with a crisp, resolution-independent tactical UI — **live-toggleable via `F9`**:
 - **Real-Time Vulkan 1.3 Frosted Glass:** Quarter-resolution separable Gaussian blur of the live 3D shell battle (or 2D `-quickstart` backdrop) sampled directly behind menu panels (`PostProcessPipeline::capture_ui_backdrop` + `WW3D2_UBER_WGSL`).
 - **Crisp Tactical Buttons & Clean Widescreen Framing (`ZhrMenuStyle`):** Soft cinematic edge vignettes, minimal perimeter brackets, dark-slate translucent gradient buttons with luminous cyan/gold/crimson accent rails, and a live bottom-left engine/hotkey status pill.
-- **Full 8-Bit Antialiased HD Fonts (`render2dsentence.cpp`):** Upgraded glyph atlases from 4-bit `A4R4G4B4` (16 alpha levels) to full 8-bit `A8R8G8B8` (256 alpha levels) with modern `Segoe UI Semibold` proportions — preserving 100% of original hitboxes, transitions, sub-menus, and in-game HUD cameos.
+- **Full 8-Bit Antialiased HD Fonts (`render2dsentence.cpp`, `render2d.cpp`):** Upgraded glyph atlases from 4-bit `A4R4G4B4` (16 alpha levels) to full 8-bit `A8R8G8B8` (256 alpha levels) using crisp military `Franklin Gothic Medium` typography, disabled the legacy D3D8 `-0.5` pixel UV bias on Vulkan so point-sampled glyphs land dead-center on texels with zero jagged distortion, and excluded 2D UI/font atlases from 2× texture upscaling — preserving 100% of original hitboxes, transitions, sub-menus, and in-game HUD cameos.
 
 ![Live 50/50 Split-Screen Main Menu — Classic 2003 (Left) vs. Modern Frosted-Glass UI (Right)](docs/screenshots/ab_menu_split.png)
 

@@ -471,6 +471,7 @@ struct VsOut {
     @location(4) world_pos: vec3<f32>,
     @location(5) world_normal: vec3<f32>,
     @location(6) raw_color: vec4<f32>,
+    @location(7) view_z: f32,
 };
 
 @vertex
@@ -519,6 +520,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.world_pos = world_pos.xyz;
     out.world_normal = n_world;
     out.raw_color = in.color;
+    out.view_z = abs(view_pos.z);
     return out;
 }
 
@@ -600,6 +602,51 @@ fn eval_combiner(diffuse: vec4<f32>, tex0: vec4<f32>, tex1: vec4<f32>) -> vec4<f
     return col;
 }
 
+fn hash21(p: vec2<f32>) -> f32 {
+    let p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    let d = dot(p3, p3.yzx + vec3<f32>(33.33));
+    return fract((p3.x + p3.y) * d);
+}
+
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (vec2<f32>(3.0) - 2.0 * f);
+    let a = hash21(i);
+    let b = hash21(i + vec2<f32>(1.0, 0.0));
+    let c = hash21(i + vec2<f32>(0.0, 1.0));
+    let d = hash21(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn water_fbm(p: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var amp = 0.52;
+    var q = p;
+    for (var i: u32 = 0u; i < 3u; i = i + 1u) {
+        v = v + amp * value_noise(q);
+        q = vec2<f32>(q.x * 1.62 - q.y * 1.18, q.x * 1.18 + q.y * 1.62) + vec2<f32>(13.7, 7.3);
+        amp = amp * 0.5;
+    }
+    return v;
+}
+
+fn water_height_field(wp: vec2<f32>, t: f32) -> f32 {
+    // Smooth, fluid multi-directional ocean swells + soft wind ripples (liquid modern water, zero grainy noise).
+    let p1 = dot(wp, vec2<f32>(0.92, 0.39)) * 0.042 + t * 0.88;
+    let p2 = dot(wp, vec2<f32>(-0.48, 0.88)) * 0.064 - t * 1.08;
+    let p3 = dot(wp, vec2<f32>(0.34, -0.94)) * 0.095 + t * 1.32;
+    let p4 = dot(wp, vec2<f32>(-0.86, -0.51)) * 0.142 - t * 1.62;
+    let s1 = sin(p1) * 0.42 + sin(p1 * 2.0 + 0.6) * 0.08;
+    let s2 = sin(p2) * 0.30 + sin(p2 * 2.0 - 0.4) * 0.06;
+    let s3 = sin(p3) * 0.15;
+    let s4 = sin(p4) * 0.07;
+    // Broad organic FBM modulation breaks up periodic swells without introducing high-frequency crunch.
+    let n1 = water_fbm(wp * 0.036 + vec2<f32>(t * 0.18, t * 0.12));
+    let n2 = water_fbm(wp * 0.082 + vec2<f32>(-t * 0.22, t * 0.19));
+    return s1 + s2 + s3 + s4 + (n1 - 0.5) * 0.72 + (n2 - 0.5) * 0.30;
+}
+
 fn ggx_specular(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, roughness: f32, f0: vec3<f32>) -> vec3<f32> {
     let h_raw = v + l;
     let h_len = length(h_raw);
@@ -664,63 +711,139 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             col = vec4<f32>(glass_rgb, 0.96);
         }
     } else if (pbr_active && u.water_params.y > 0.5) {
-        // Modern Vulkan 1.3 Animated Water: domain-warped organic multi-wave normals + Fresnel sky reflection + GGX sun glints.
+        // Next-Gen Vulkan 1.3 Modern Coastal & Oceanic Water:
+        // - True per-pixel depth & screen-space seabed/rock refraction from pre-water HDR snapshot
+        // - Smooth fluid multi-directional ocean swells + soft sunlit capillary sheen
+        // - Optical Beer-Lambert depth absorption (crystal turquoise shallows -> deep oceanic blue)
+        // - Soft sunlit underwater caustics in coastal shallows + wave-crest subsurface scattering (SSS)
+        // - Organic broken coastal rock/island foam + gentle lapping beach surf waves
+        // - Realistic atmospheric sky/cloud Fresnel reflections + crisp HDR GGX sun glints
         let t = u.water_params.x;
-        // Domain-warp world XY coordinates smoothly so wave trains never form periodic grids.
-        let warp = vec2<f32>(
-            sin(in.world_pos.y * 0.023 + t * 0.45) + cos(in.world_pos.x * 0.017 - t * 0.32),
-            cos(in.world_pos.x * 0.021 + t * 0.38) - sin(in.world_pos.y * 0.019 + t * 0.29),
-        ) * 11.0;
-        let wp = in.world_pos.xy + warp;
-
-        // 5 non-orthogonal, irrational-ratio wave octaves for natural ocean chop.
-        let p1 = dot(wp, vec2<f32>(0.93, 0.36)) * 0.068 + t * 0.95;
-        let p2 = dot(wp, vec2<f32>(0.41, 0.91)) * 0.113 + t * 1.32;
-        let p3 = dot(wp, vec2<f32>(-0.77, 0.64)) * 0.197 + t * 1.75;
-        let p4 = dot(wp, vec2<f32>(0.24, -0.97)) * 0.371 + t * 2.25;
-        let p5 = dot(wp, vec2<f32>(-0.88, -0.47)) * 0.683 + t * 2.90;
-
-        let d1 = cos(p1) * 0.055;
-        let d2 = cos(p2) * 0.044;
-        let d3 = cos(p3) * 0.036;
-        let d4 = cos(p4) * 0.026;
-        let d5 = cos(p5) * 0.018;
-
-        let dh_dx = d1 * 0.93 + d2 * 0.41 - d3 * 0.77 + d4 * 0.24 - d5 * 0.88 + clamp(dl_dx * 2.4, -0.16, 0.16);
-        let dh_dy = d1 * 0.36 + d2 * 0.91 + d3 * 0.64 - d4 * 0.97 - d5 * 0.47 + clamp(dl_dy * 2.4, -0.16, 0.16);
-        let n_water = normalize(vec3<f32>(-dh_dx, -dh_dy, 1.0));
+        let wp = in.world_pos.xy;
 
         let to_cam = u.camera_pos_and_pbr.xyz - in.world_pos;
-        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, length(to_cam) > 0.0001));
-        let ndotv = max(dot(n_water, v_dir), 0.03);
+        let cam_dist = length(to_cam);
+        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, cam_dist > 0.0001));
+
+        // Central-difference fluid wave normals with distance-safe attenuation.
+        let detail_fade = clamp(1.0 - (cam_dist - 160.0) / 1100.0, 0.48, 1.0);
+        let eps = 0.85;
+        let h_c = water_height_field(wp, t);
+        let h_px = water_height_field(wp + vec2<f32>(eps, 0.0), t);
+        let h_mx = water_height_field(wp - vec2<f32>(eps, 0.0), t);
+        let h_py = water_height_field(wp + vec2<f32>(0.0, eps), t);
+        let h_my = water_height_field(wp - vec2<f32>(0.0, eps), t);
+        let normal_strength = 0.36 * detail_fade;
+        let dh_dx = (h_px - h_mx) / (2.0 * eps) * normal_strength;
+        let dh_dy = (h_py - h_my) / (2.0 * eps) * normal_strength;
+        let n_water = normalize(vec3<f32>(-dh_dx, -dh_dy, 1.0));
+        let ndotv = max(dot(n_water, v_dir), 0.04);
 
         var sun_dir = normalize(vec3<f32>(0.42, 0.28, 0.86));
-        var sun_col = vec3<f32>(1.0, 0.95, 0.86);
+        var sun_col = vec3<f32>(1.0, 0.96, 0.88);
         if (u.lights[0].pos_or_dir_and_kind.w > 0.5 && u.lights[0].pos_or_dir_and_kind.w < 1.5) {
             sun_dir = normalize(-u.lights[0].pos_or_dir_and_kind.xyz);
-            sun_col = max(u.lights[0].diffuse_and_range.rgb, vec3<f32>(0.65));
+            sun_col = max(u.lights[0].diffuse_and_range.rgb, vec3<f32>(0.80));
         }
 
-        // Physical Schlick Fresnel + subtle atmospheric sky/horizon reflection.
-        let fresnel = 0.025 + 0.975 * pow(1.0 - ndotv, 4.5);
-        let refl_dir = reflect(-v_dir, n_water);
-        let sky_t = clamp(refl_dir.z * 0.7 + 0.25, 0.0, 1.0);
-        let sky_horizon = vec3<f32>(0.36, 0.52, 0.66);
-        let sky_zenith = vec3<f32>(0.08, 0.20, 0.36);
-        let sky_refl = mix(sky_horizon, sky_zenith, sky_t);
+        // True per-pixel water depth & screen-space seabed refraction from pre-water snapshot.
+        let has_snap = u.water_params.z > 0.0 && backdrop_sample.a > 0.01;
+        let raw_ground_z = select(in.view_z + 28.0, backdrop_sample.a, has_snap);
+        let raw_ray_depth = max(raw_ground_z - in.view_z, 0.0);
+        let raw_water_depth = min(raw_ray_depth * 0.72, 60.0);
 
-        // Preserve Zero Hour's moody oceanic palette with subtle organic swell shading.
-        let swell = clamp(dot(n_water, sun_dir) * 0.45 + 0.62, 0.72, 1.18);
-        let deep_water = col.rgb * vec3<f32>(0.78, 0.96, 1.12) * swell;
+        // Smooth refracted UV with depth-guarded dry-rock rejection.
+        let refract_scale = 0.011 * smoothstep(0.6, 5.5, raw_water_depth) * detail_fade;
+        let refract_uv = clamp(backdrop_uv + n_water.xy * refract_scale, vec2<f32>(0.002), vec2<f32>(0.998));
+        let refract_sample = textureSampleLevel(t_diffuse1, s_diffuse1, refract_uv, 0.0);
+        let refract_valid = has_snap && (refract_sample.a > in.view_z + 0.85);
+        let seabed_rgb = select(backdrop_sample.rgb, refract_sample.rgb, refract_valid);
+        let eff_ground_z = select(raw_ground_z, refract_sample.a, refract_valid);
+        let water_depth = min(max(eff_ground_z - in.view_z, 0.0) * 0.72, 60.0);
 
-        // Dual-lobe GGX sun glints dancing across fine wave facets.
+        // Optical Beer-Lambert absorption: crystal coastal turquoise -> rich cerulean -> deep oceanic sapphire.
+        let transmittance = exp(-water_depth * vec3<f32>(0.22, 0.095, 0.052));
+        let shallow_mix = clamp(1.0 - exp(-water_depth * 0.13), 0.0, 1.0);
+        let deep_mix = clamp(1.0 - exp(-water_depth * 0.042), 0.0, 1.0);
+        let shallow_scatter = vec3<f32>(0.075, 0.39, 0.44);
+        let mid_scatter = vec3<f32>(0.028, 0.19, 0.32);
+        let deep_scatter = vec3<f32>(0.014, 0.078, 0.165);
+        let volume_col = mix(mix(shallow_scatter, mid_scatter, shallow_mix), deep_scatter, deep_mix);
+
+        // Soft, dappled sunlit caustics ONLY in translucent shallow water over seabed/submerged rocks.
+        let c_a = value_noise(wp * 0.14 + n_water.xy * 1.4 + vec2<f32>(t * 0.28, -t * 0.18));
+        let c_b = value_noise(wp * 0.19 - n_water.xy * 1.2 + vec2<f32>(-t * 0.21, t * 0.25));
+        let caustic_pool = smoothstep(0.32, 0.85, c_a * c_b * 2.2);
+        let caustics = caustic_pool
+            * smoothstep(7.5, 0.7, water_depth)
+            * smoothstep(0.08, 0.65, water_depth);
+
+        // Blend refracted underwater seabed + dappled caustics with Beer-Lambert volume scattering.
+        let lit_seabed = seabed_rgb * transmittance
+            + vec3<f32>(0.26, 0.56, 0.58) * sun_col * caustics * 0.36;
+        let seabed_vis = clamp(transmittance.g * 0.86, 0.0, 0.86);
+        let underwater = select(
+            volume_col,
+            mix(volume_col, lit_seabed, seabed_vis),
+            has_snap
+        );
+
+        // Backlit emerald-aqua subsurface scattering through elevated ocean swell crests.
         let ndotl = max(dot(n_water, sun_dir), 0.0);
-        let spec_sharp = ggx_specular(n_water, v_dir, sun_dir, 0.075, vec3<f32>(0.045));
-        let spec_broad = ggx_specular(n_water, v_dir, sun_dir, 0.28, vec3<f32>(0.025));
-        let water_spec = sun_col * (spec_sharp * 0.55 + spec_broad * 0.30) * ndotl;
+        let crest_height = clamp(h_c * 0.65 + 0.40, 0.0, 1.0);
+        let sss_view = pow(clamp(dot(v_dir, -sun_dir + n_water * 0.52), 0.0, 1.0), 2.4);
+        let sss_amount = (crest_height * 0.48 + sss_view * 0.62) * (0.35 + 0.65 * ndotl);
+        let sss_col = vec3<f32>(0.05, 0.44, 0.49) * sss_amount * 0.32;
 
-        let final_water = mix(deep_water, sky_refl, clamp(fresnel * 0.52, 0.06, 0.62)) + water_spec;
-        col = vec4<f32>(final_water, clamp(col.a + fresnel * 0.14, 0.0, 1.0));
+        // Physical Schlick Fresnel + luminous sky gradient & soft drifting reflected clouds.
+        let fresnel = 0.032 + 0.968 * pow(1.0 - ndotv, 4.2);
+        let refl_dir = reflect(-v_dir, n_water);
+        let sky_t = clamp(refl_dir.z * 0.78 + 0.16, 0.0, 1.0);
+        let sky_horizon = vec3<f32>(0.58, 0.76, 0.88);
+        let sky_zenith = vec3<f32>(0.10, 0.27, 0.50);
+        let cloud_uv = wp * 0.0055 + refl_dir.xy * 1.4 + vec2<f32>(t * 0.014, t * 0.007);
+        let cloud_mask = smoothstep(0.45, 0.78, water_fbm(cloud_uv));
+        let sky_refl = mix(mix(sky_horizon, sky_zenith, sky_t), vec3<f32>(0.92, 0.96, 1.0), cloud_mask * 0.38);
+
+        // Dual-lobe GGX sun reflections: crisp HDR specular sparkles + glossy liquid sun sheen.
+        let spec_sparkle = ggx_specular(n_water, v_dir, sun_dir, 0.042, vec3<f32>(0.065));
+        let spec_broad = ggx_specular(n_water, v_dir, sun_dir, 0.20, vec3<f32>(0.035));
+        let water_spec = sun_col * (spec_sparkle * 0.95 + spec_broad * 0.42) * ndotl;
+
+        // Organic frothy shoreline foam around rocks/islands + soft breaking coastal surf waves.
+        let foam_noise = water_fbm(wp * 0.19 + vec2<f32>(t * 0.12, -t * 0.09));
+        let foam_detail = value_noise(wp * 0.52 - vec2<f32>(t * 0.18, t * 0.14));
+        let foam_tex = foam_noise * 0.65 + foam_detail * 0.35;
+
+        // Soft, broken organic contact foam collar hugging rocks, hulls, and beaches.
+        let contact_band = smoothstep(2.4, 0.08, raw_water_depth);
+        let contact_foam = smoothstep(0.38, 0.74, contact_band * 1.08 + (foam_tex - 0.5) * 0.92) * contact_band;
+
+        // Gently rolling surf ripples lapping inward around coastlines and shallow rocks.
+        let surf_zone = smoothstep(6.8, 0.6, raw_water_depth) * smoothstep(0.18, 1.0, raw_water_depth);
+        let surf_wave = sin(raw_water_depth * 1.85 - t * 2.0 + foam_noise * 3.6);
+        let surf_rings = smoothstep(0.52, 0.94, surf_wave) * smoothstep(0.36, 0.72, foam_tex) * surf_zone * 0.66;
+
+        // Subtle wind-swept whitecaps on the tallest deep-water swell peaks.
+        let whitecap = smoothstep(0.84, 1.16, h_c + foam_tex * 0.34) * smoothstep(4.5, 14.0, raw_water_depth) * 0.18;
+
+        let total_foam = clamp(contact_foam * 0.88 + surf_rings + whitecap, 0.0, 1.0);
+        let foam_col = mix(vec3<f32>(0.82, 0.92, 0.96), vec3<f32>(0.98, 0.99, 1.0), 0.72) * (0.76 + 0.32 * ndotl);
+
+        let water_body = underwater + sss_col;
+        let reflected_water = mix(water_body, sky_refl, clamp(fresnel * 0.72, 0.10, 0.80)) + water_spec;
+        let surfaced_water = mix(reflected_water, foam_col, total_foam);
+
+        // Soft wet shoreline edge feathering eliminates hard polygon cuts around every rock & island.
+        let shore_feather = select(1.0, smoothstep(0.0, 0.75, raw_water_depth), has_snap);
+        let wet_shore = backdrop_sample.rgb * 0.82;
+        let final_water = select(surfaced_water, mix(wet_shore, surfaced_water, shore_feather), has_snap);
+        let final_alpha = select(
+            clamp(col.a + fresnel * 0.25 + total_foam * 0.5, 0.55, 0.98),
+            clamp(max(shore_feather, total_foam * 0.82), 0.0, 1.0),
+            has_snap
+        );
+        col = vec4<f32>(final_water, final_alpha);
     } else if (pbr_active && u.render_flags.x > 0.5) {
         // 3D lit geometry: per-pixel micro-normal + Cook-Torrance GGX specular + hemisphere sky/ground IBL.
         let albedo = eval_combiner(in.raw_color, tex0, tex1);
