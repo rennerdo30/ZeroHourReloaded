@@ -90,6 +90,14 @@
 
 #include "Common/UnitTimings.h" //Contains the DO_UNIT_TIMINGS define jba.
 
+#ifdef ZHR_USE_VULKAN
+#include <zhr_ffi.h>
+#include <cstdint>
+extern "C" void zhr_vk_set_terrain_heightmap(
+	const uint8_t* data, int32_t width, int32_t height, int32_t border, float xy_factor, float height_scale);
+extern "C" void zhr_vk_set_terrain_pass_active(bool active);
+#endif
+
 
 #define no_OPTIMIZED_HEIGHTMAP_LIGHTING	01
 // Doesn't work well.  jba.
@@ -144,6 +152,10 @@ void HeightMapRenderObjClass::freeIndexVertexBuffers()
 //=============================================================================
 Int HeightMapRenderObjClass::freeMapResources()
 {
+#ifdef ZHR_USE_VULKAN
+	zhr_vk_set_terrain_pass_active(false);
+	zhr_vk_set_terrain_heightmap(nullptr, 0, 0, 0, MAP_XY_FACTOR, MAP_HEIGHT_SCALE);
+#endif
 	BaseHeightMapRenderObjClass::freeMapResources();
 	freeIndexVertexBuffers();
 
@@ -2023,6 +2035,29 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 	}
 
 	Int pass;
+#ifdef ZHR_USE_VULKAN
+	if (m_map && m_map->getDataPtr())
+	{
+		zhr_vk_set_terrain_heightmap(
+			m_map->getDataPtr(),
+			m_map->getXExtent(),
+			m_map->getYExtent(),
+			m_map->getBorderSizeInline(),
+			MAP_XY_FACTOR,
+			MAP_HEIGHT_SCALE);
+	}
+	{
+		struct ZhrVulkanTerrainGuard {
+			ZhrVulkanTerrainGuard() {
+				zhr_vk_set_terrain_pass_active(true);
+				zhr_vk_set_material_hint(4u);
+			}
+			~ZhrVulkanTerrainGuard() {
+				zhr_vk_set_material_hint(0u);
+				zhr_vk_set_terrain_pass_active(false);
+			}
+		} zhrTerrainGuard;
+#endif
  	for (pass=0; pass<devicePasses; pass++) {
 #ifdef TIMING_TESTS
 #endif
@@ -2063,6 +2098,9 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 
 			}
 	}
+#ifdef ZHR_USE_VULKAN
+	}
+#endif
 
 	if (!doMultiPassWireFrame)
 	{
@@ -2074,7 +2112,15 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 
 		//Do additional pass over any tiles that have 3 textures blended together.
 		if (TheGlobalData->m_use3WayTerrainBlends)
+		{
+#ifdef ZHR_USE_VULKAN
+			zhr_vk_set_terrain_pass_active(true);
+#endif
 			renderExtraBlendTiles();
+#ifdef ZHR_USE_VULKAN
+			zhr_vk_set_terrain_pass_active(false);
+#endif
+		}
 
 		Int yCoordMin = m_map->getDrawOrgY();
 		Int yCoordMax = m_y+m_map->getDrawOrgY()-1;
@@ -2091,8 +2137,14 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 			if (Scene) {
 				RTS3DScene *pMyScene = (RTS3DScene *)Scene;
 				RefRenderObjListIterator pDynamicLightsIterator(pMyScene->getDynamicLights());
+#ifdef ZHR_USE_VULKAN
+				zhr_vk_set_terrain_pass_active(true);
+#endif
 				m_roadBuffer->drawRoads(&rinfo.Camera, doCloud?m_stageTwoTexture:nullptr, TheGlobalData->m_useLightMap?m_stageThreeTexture:nullptr,
 					m_disableTextures,xCoordMin-m_map->getBorderSizeInline(), xCoordMax-m_map->getBorderSizeInline(), yCoordMin-m_map->getBorderSizeInline(), yCoordMax-m_map->getBorderSizeInline(), &pDynamicLightsIterator);
+#ifdef ZHR_USE_VULKAN
+				zhr_vk_set_terrain_pass_active(false);
+#endif
 			}
 		}
 	#endif
@@ -2119,7 +2171,13 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 		if (m_shroud && rinfo.Additional_Pass_Count())
 		{
 			rinfo.Peek_Additional_Pass(0)->Install_Materials();
+#ifdef ZHR_USE_VULKAN
+			zhr_vk_set_terrain_pass_active(true);
+#endif
 			renderTerrainPass(&rinfo.Camera);
+#ifdef ZHR_USE_VULKAN
+			zhr_vk_set_terrain_pass_active(false);
+#endif
 			rinfo.Peek_Additional_Pass(0)->UnInstall_Materials();
 		}
 

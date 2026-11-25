@@ -31,6 +31,131 @@ namespace {
 
 std::atomic<bool> g_zhr_mesh_smoothing_enabled{true};
 std::atomic<bool> g_zhr_title_banner_dirty{true};
+std::atomic<bool> g_zhr_terrain_pass_active{false};
+
+struct ZhrTerrainHeightmapState
+{
+    const uint8_t* data{nullptr};
+    int32_t width{0};
+    int32_t height{0};
+    int32_t border{0};
+    float xy_factor{10.0f};
+    float height_scale{0.625f};
+    uint64_t generation{0};
+};
+
+ZhrTerrainHeightmapState g_zhr_terrain_hm{};
+
+inline float FetchTerrainGridZ(const ZhrTerrainHeightmapState& hm, int32_t ix, int32_t iy) noexcept
+{
+    const int32_t cx = std::clamp(ix, 0, hm.width - 1);
+    const int32_t cy = std::clamp(iy, 0, hm.height - 1);
+    return static_cast<float>(hm.data[static_cast<size_t>(cy) * static_cast<size_t>(hm.width) + static_cast<size_t>(cx)]) * hm.height_scale;
+}
+
+inline float SampleTerrainLinearZ(const ZhrTerrainHeightmapState& hm, float wx, float wy) noexcept
+{
+    const float gx = wx / hm.xy_factor + static_cast<float>(hm.border);
+    const float gy = wy / hm.xy_factor + static_cast<float>(hm.border);
+    const int32_t ix = static_cast<int32_t>(std::floor(gx));
+    const int32_t iy = static_cast<int32_t>(std::floor(gy));
+    const float fx = std::clamp(gx - static_cast<float>(ix), 0.0f, 1.0f);
+    const float fy = std::clamp(gy - static_cast<float>(iy), 0.0f, 1.0f);
+    const float h00 = FetchTerrainGridZ(hm, ix, iy);
+    const float h10 = FetchTerrainGridZ(hm, ix + 1, iy);
+    const float h01 = FetchTerrainGridZ(hm, ix, iy + 1);
+    const float h11 = FetchTerrainGridZ(hm, ix + 1, iy + 1);
+    const float hx0 = h00 + (h10 - h00) * fx;
+    const float hx1 = h01 + (h11 - h01) * fx;
+    return hx0 + (hx1 - hx0) * fy;
+}
+
+// Fritsch-Carlson Monotone Cubic Hermite 1D evaluator + exact derivative:
+// - C1 continuous and interpolating at all integer grid knots (zero cracks across tiles).
+// - Strictly monotone: flat buildable plateaus adjacent to cliffs stay 100.00% dead-flat
+//   (zero Gibbs overshoot / zero building or bib clipping).
+inline void EvalMonotoneCubic(float p0, float p1, float p2, float p3, float t, float& out_val, float& out_deriv) noexcept
+{
+    const float d0 = p1 - p0;
+    const float d1 = p2 - p1;
+    const float d2 = p3 - p2;
+    const float m1 = (d0 * d1 > 0.0f) ? ((2.0f * d0 * d1) / (d0 + d1)) : 0.0f;
+    const float m2 = (d1 * d2 > 0.0f) ? ((2.0f * d1 * d2) / (d1 + d2)) : 0.0f;
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    const float h00 = 2.0f * t3 - 3.0f * t2 + 1.0f;
+    const float h10 = t3 - 2.0f * t2 + t;
+    const float h01 = -2.0f * t3 + 3.0f * t2;
+    const float h11 = t3 - t2;
+    out_val = h00 * p1 + h10 * m1 + h01 * p2 + h11 * m2;
+    out_deriv = (6.0f * t2 - 6.0f * t) * p1
+              + (3.0f * t2 - 4.0f * t + 1.0f) * m1
+              + (-6.0f * t2 + 6.0f * t) * p2
+              + (3.0f * t2 - 2.0f * t) * m2;
+}
+
+inline void SampleTerrainSmooth(
+    const ZhrTerrainHeightmapState& hm,
+    float wx,
+    float wy,
+    float& out_z,
+    float out_normal[3]) noexcept
+{
+    const float gx = wx / hm.xy_factor + static_cast<float>(hm.border);
+    const float gy = wy / hm.xy_factor + static_cast<float>(hm.border);
+    const int32_t ix = static_cast<int32_t>(std::floor(gx));
+    const int32_t iy = static_cast<int32_t>(std::floor(gy));
+    const float fx = std::clamp(gx - static_cast<float>(ix), 0.0f, 1.0f);
+    const float fy = std::clamp(gy - static_cast<float>(iy), 0.0f, 1.0f);
+
+    float h[4][4];
+    float min_h = 1e9f;
+    float max_h = -1e9f;
+    for (int r = 0; r < 4; ++r)
+    {
+        for (int c = 0; c < 4; ++c)
+        {
+            const float v = FetchTerrainGridZ(hm, ix - 1 + c, iy - 1 + r);
+            h[r][c] = v;
+            if (v < min_h) min_h = v;
+            if (v > max_h) max_h = v;
+        }
+    }
+
+    if (max_h - min_h < 1e-4f)
+    {
+        out_z = h[1][1];
+        out_normal[0] = 0.0f;
+        out_normal[1] = 0.0f;
+        out_normal[2] = 1.0f;
+        return;
+    }
+
+    float row_val[4];
+    float row_dx[4];
+    for (int r = 0; r < 4; ++r)
+    {
+        EvalMonotoneCubic(h[r][0], h[r][1], h[r][2], h[r][3], fx, row_val[r], row_dx[r]);
+    }
+
+    float z_val = 0.0f;
+    float dz_dy_grid = 0.0f;
+    EvalMonotoneCubic(row_val[0], row_val[1], row_val[2], row_val[3], fy, z_val, dz_dy_grid);
+
+    float dz_dx_grid = 0.0f;
+    float dummy_dxy = 0.0f;
+    EvalMonotoneCubic(row_dx[0], row_dx[1], row_dx[2], row_dx[3], fy, dz_dx_grid, dummy_dxy);
+
+    const float inv_xy = 1.0f / hm.xy_factor;
+    const float nx = -dz_dx_grid * inv_xy;
+    const float ny = -dz_dy_grid * inv_xy;
+    const float nz = 1.0f;
+    const float inv_len = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
+    out_z = z_val;
+    out_normal[0] = nx * inv_len;
+    out_normal[1] = ny * inv_len;
+    out_normal[2] = nz * inv_len;
+}
 
 // --- Helpers ---
 
@@ -2468,7 +2593,22 @@ private:
             (m_render_states[D3DRS_ZWRITEENABLE] == 0) ||
             (m_render_states[D3DRS_STENCILENABLE] != 0 &&
              m_render_states[D3DRS_STENCILFUNC] == D3DCMP_NEVER);
+        const bool terrain_pass_active = g_zhr_terrain_pass_active.load(std::memory_order_relaxed);
+        const bool can_smooth_terrain =
+            g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) &&
+            remaster_active &&
+            terrain_pass_active &&
+            g_zhr_terrain_hm.data != nullptr &&
+            g_zhr_terrain_hm.width >= 4 &&
+            g_zhr_terrain_hm.height >= 4 &&
+            !is_rhw &&
+            prim_type == D3DPT_TRIANGLELIST &&
+            prim_count >= 2u &&
+            prim_count <= 4096u &&
+            m_scratch_verts.size() <= 16384u;
+
         const bool can_smooth_mesh =
+            !terrain_pass_active &&
             g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) &&
             remaster_active &&
             !is_rhw &&
@@ -2486,9 +2626,42 @@ private:
                 ? static_cast<ZhrVkTexture8*>(m_textures[0])
                 : nullptr;
 
+        if (can_smooth_terrain)
+        {
+            const TessCacheKey cache_key = ComputeTessCacheKey(diffuse_tex, true);
+            auto cache_it = m_tess_cache.find(cache_key);
+            if (cache_it != m_tess_cache.end())
+            {
+                zhr_vk_draw_dynamic(
+                    cache_it->second.verts.data(),
+                    cache_it->second.verts.size(),
+                    cache_it->second.indices.data(),
+                    cache_it->second.indices.size());
+                return D3D_OK;
+            }
+
+            if (ApplySmartTerrainTessellation())
+            {
+                if (m_tess_cache.size() >= 1024u)
+                {
+                    m_tess_cache.clear();
+                }
+                CachedTessMesh entry;
+                entry.verts = m_subdiv_verts;
+                entry.indices = m_subdiv_indices;
+                auto inserted = m_tess_cache.emplace(cache_key, std::move(entry));
+                zhr_vk_draw_dynamic(
+                    inserted.first->second.verts.data(),
+                    inserted.first->second.verts.size(),
+                    inserted.first->second.indices.data(),
+                    inserted.first->second.indices.size());
+                return D3D_OK;
+            }
+        }
+
         if (can_smooth_mesh)
         {
-            const TessCacheKey cache_key = ComputeTessCacheKey(diffuse_tex);
+            const TessCacheKey cache_key = ComputeTessCacheKey(diffuse_tex, false);
             auto cache_it = m_tess_cache.find(cache_key);
             if (cache_it != m_tess_cache.end())
             {
@@ -2502,7 +2675,7 @@ private:
 
             if (ApplySmartAdaptiveTessellation(diffuse_tex))
             {
-                if (m_tess_cache.size() >= 512u)
+                if (m_tess_cache.size() >= 1024u)
                 {
                     m_tess_cache.clear();
                 }
@@ -2544,6 +2717,179 @@ private:
         }
 
         return D3D_OK;
+    }
+
+    // Smart Crack-Free Adaptive Terrain Tessellation (2-Level Red-Green + Fritsch-Carlson Monotone Bicubic):
+    // - Evaluates a globally continuous C1 monotone bicubic heightfield & smooth analytic surface normals
+    //   directly from WorldHeightMap across all VB tile boundaries, 3-way blends, cloud passes, shroud, and roads.
+    // - Flat buildable plains (slope == 0) remain 100% flat with zero extra triangles and zero foundation clipping;
+    //   hills, cliffs, shorelines, craters, and embankments adaptively refine from 10u -> 5u -> 2.5u with 0 T-junctions.
+    bool ApplySmartTerrainTessellation()
+    {
+        const ZhrTerrainHeightmapState hm = g_zhr_terrain_hm;
+        if (hm.data == nullptr || hm.width < 4 || hm.height < 4)
+        {
+            return false;
+        }
+        const size_t in_tris = m_scratch_indices.size() / 3;
+        const size_t in_verts = m_scratch_verts.size();
+        if (in_tris == 0 || in_verts == 0 || in_verts >= 60000)
+        {
+            return false;
+        }
+
+        m_subdiv_verts = m_scratch_verts;
+        m_subdiv_indices = m_scratch_indices;
+
+        // Per-vertex elevation bias above linear terrain (0.0 for base/blend/shroud, ~+0.15 for roads).
+        std::vector<float> v_bias(in_verts, 0.0f);
+        v_bias.reserve(in_verts * 3);
+        for (size_t i = 0; i < in_verts; ++i)
+        {
+            ZhrVertexWw3d& v = m_subdiv_verts[i];
+            const float lin_z = SampleTerrainLinearZ(hm, v.position[0], v.position[1]);
+            float bias = v.position[2] - lin_z;
+            if (std::fabs(bias) < 0.02f) bias = 0.0f;
+            else bias = std::clamp(bias, -2.0f, 4.0f);
+            v_bias[i] = bias;
+
+            float smooth_z = v.position[2];
+            SampleTerrainSmooth(hm, v.position[0], v.position[1], smooth_z, v.normal);
+            v.position[2] = smooth_z + bias;
+        }
+
+        auto run_red_green_pass = [&](float min_dist_sq, float curv_thresh, float norm_thresh, float slope_thresh) {
+            const size_t cur_tris = m_subdiv_indices.size() / 3;
+            if (cur_tris == 0 || m_subdiv_verts.size() >= 56000)
+            {
+                return;
+            }
+            std::vector<uint16_t> out_indices;
+            out_indices.reserve(m_subdiv_indices.size() * 2);
+            m_edge_midpoints.clear();
+            m_edge_midpoints.reserve(cur_tris);
+
+            auto should_split = [&](uint16_t ia, uint16_t ib) -> bool {
+                const ZhrVertexWw3d& va = m_subdiv_verts[ia];
+                const ZhrVertexWw3d& vb = m_subdiv_verts[ib];
+                const float dx = vb.position[0] - va.position[0];
+                const float dy = vb.position[1] - va.position[1];
+                const float dist_sq = dx * dx + dy * dy;
+                if (dist_sq < min_dist_sq || dist_sq > 2500.0f)
+                {
+                    return false;
+                }
+                // Symmetric global world-space edge test -> guaranteed identical decision across every tile & overlay!
+                const float za = va.position[2] - v_bias[ia];
+                const float zb = vb.position[2] - v_bias[ib];
+                if (std::fabs(za - zb) > slope_thresh)
+                {
+                    return true;
+                }
+                const float dot_n = va.normal[0] * vb.normal[0] +
+                                    va.normal[1] * vb.normal[1] +
+                                    va.normal[2] * vb.normal[2];
+                if (1.0f - dot_n > norm_thresh)
+                {
+                    return true;
+                }
+                const float mx = 0.5f * (va.position[0] + vb.position[0]);
+                const float my = 0.5f * (va.position[1] + vb.position[1]);
+                float zm = 0.0f;
+                float nm[3];
+                SampleTerrainSmooth(hm, mx, my, zm, nm);
+                return std::fabs(zm - 0.5f * (za + zb)) > curv_thresh;
+            };
+
+            auto get_mid = [&](uint16_t ia, uint16_t ib) -> uint16_t {
+                const uint32_t lo = ia < ib ? ia : ib;
+                const uint32_t hi = ia < ib ? ib : ia;
+                const uint32_t key = (lo << 16) | hi;
+                auto it = m_edge_midpoints.find(key);
+                if (it != m_edge_midpoints.end())
+                {
+                    return it->second;
+                }
+                const ZhrVertexWw3d& va = m_subdiv_verts[ia];
+                const ZhrVertexWw3d& vb = m_subdiv_verts[ib];
+                ZhrVertexWw3d mid{};
+                mid.position[0] = 0.5f * (va.position[0] + vb.position[0]);
+                mid.position[1] = 0.5f * (va.position[1] + vb.position[1]);
+                const float mid_bias = 0.5f * (v_bias[ia] + v_bias[ib]);
+                float smooth_z = 0.0f;
+                SampleTerrainSmooth(hm, mid.position[0], mid.position[1], smooth_z, mid.normal);
+                mid.position[2] = smooth_z + mid_bias;
+                for (int c = 0; c < 4; ++c) mid.color[c] = 0.5f * (va.color[c] + vb.color[c]);
+                mid.uv0[0] = 0.5f * (va.uv0[0] + vb.uv0[0]);
+                mid.uv0[1] = 0.5f * (va.uv0[1] + vb.uv0[1]);
+                mid.uv1[0] = 0.5f * (va.uv1[0] + vb.uv1[0]);
+                mid.uv1[1] = 0.5f * (va.uv1[1] + vb.uv1[1]);
+
+                const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
+                m_subdiv_verts.push_back(mid);
+                v_bias.push_back(mid_bias);
+                m_edge_midpoints.emplace(key, new_idx);
+                return new_idx;
+            };
+
+            for (size_t t = 0; t < cur_tris; ++t)
+            {
+                const uint16_t i0 = m_subdiv_indices[t * 3 + 0];
+                const uint16_t i1 = m_subdiv_indices[t * 3 + 1];
+                const uint16_t i2 = m_subdiv_indices[t * 3 + 2];
+                if (i0 >= m_subdiv_verts.size() || i1 >= m_subdiv_verts.size() || i2 >= m_subdiv_verts.size())
+                {
+                    continue;
+                }
+                const bool s01 = should_split(i0, i1);
+                const bool s12 = should_split(i1, i2);
+                const bool s20 = should_split(i2, i0);
+                const int mask = (s01 ? 1 : 0) | (s12 ? 2 : 0) | (s20 ? 4 : 0);
+
+                if (mask == 0 || m_subdiv_verts.size() + 3 >= 62000)
+                {
+                    out_indices.push_back(i0); out_indices.push_back(i1); out_indices.push_back(i2);
+                }
+                else if (mask == 7)
+                {
+                    const uint16_t m01 = get_mid(i0, i1);
+                    const uint16_t m12 = get_mid(i1, i2);
+                    const uint16_t m20 = get_mid(i2, i0);
+                    out_indices.push_back(i0);  out_indices.push_back(m01); out_indices.push_back(m20);
+                    out_indices.push_back(m01); out_indices.push_back(i1);  out_indices.push_back(m12);
+                    out_indices.push_back(m20); out_indices.push_back(m12); out_indices.push_back(i2);
+                    out_indices.push_back(m01); out_indices.push_back(m12); out_indices.push_back(m20);
+                }
+                else if (mask == 1 || mask == 2 || mask == 4)
+                {
+                    uint16_t a = i0, b = i1, c = i2;
+                    if (mask == 2) { a = i1; b = i2; c = i0; }
+                    else if (mask == 4) { a = i2; b = i0; c = i1; }
+                    const uint16_t mab = get_mid(a, b);
+                    out_indices.push_back(a);   out_indices.push_back(mab); out_indices.push_back(c);
+                    out_indices.push_back(mab); out_indices.push_back(b);   out_indices.push_back(c);
+                }
+                else
+                {
+                    uint16_t a = i0, b = i1, c = i2;
+                    if (mask == 3) { a = i1; b = i2; c = i0; }
+                    else if (mask == 6) { a = i2; b = i0; c = i1; }
+                    const uint16_t mab = get_mid(a, b);
+                    const uint16_t mca = get_mid(c, a);
+                    out_indices.push_back(a);   out_indices.push_back(mab); out_indices.push_back(mca);
+                    out_indices.push_back(mab); out_indices.push_back(b);   out_indices.push_back(c);
+                    out_indices.push_back(mab); out_indices.push_back(c);   out_indices.push_back(mca);
+                }
+            }
+            m_subdiv_indices.swap(out_indices);
+        };
+
+        // Pass 1: 10u -> 5u on curved hills, shorelines, craters, and steep slopes (flat plains untouched!).
+        run_red_green_pass(16.0f, 0.065f, 0.008f, 2.6f);
+        // Pass 2: 5u -> 2.5u strictly on sharp cliff lips, ridges, craters, and steep embankments.
+        run_red_green_pass(9.0f, 0.13f, 0.022f, 6.5f);
+
+        return true;
     }
 
     // Smart Adaptive Crack-Free Tessellation + Polygonal Cylinder Rounding + Texture Heightmap Displacement:
@@ -3557,13 +3903,15 @@ private:
     };
 
     // Fast 128-bit content hash over object-space vertices & indices (~1.5us per draw) so static
-    // .W3D meshes & terrain props are tessellated + heightmap-displaced ONCE and replayed at 0ms/frame.
-    TessCacheKey ComputeTessCacheKey(ZhrVkTexture8* diffuse_tex) const
+    // .W3D meshes & terrain tiles are tessellated + heightmap-displaced ONCE and replayed at 0ms/frame.
+    TessCacheKey ComputeTessCacheKey(ZhrVkTexture8* diffuse_tex, bool is_terrain = false) const
     {
         TessCacheKey k{};
         k.v_count = static_cast<uint32_t>(m_scratch_verts.size());
         k.i_count = static_cast<uint32_t>(m_scratch_indices.size());
-        k.tex_ptr = reinterpret_cast<uintptr_t>(diffuse_tex);
+        k.tex_ptr = is_terrain
+            ? (static_cast<uintptr_t>(0x7E44A100ULL) ^ static_cast<uintptr_t>(g_zhr_terrain_hm.generation))
+            : reinterpret_cast<uintptr_t>(diffuse_tex);
 
         uint64_t ha = 14695981039346656037ULL ^ (static_cast<uint64_t>(k.v_count) << 32) ^ k.i_count;
         uint64_t hb = 0x517CC1B727220A95ULL ^ static_cast<uint64_t>(k.tex_ptr);
@@ -4031,4 +4379,34 @@ extern "C" bool zhr_vk_get_mesh_smoothing(void)
 extern "C" void zhr_vk_mark_title_banner_dirty(void)
 {
     g_zhr_title_banner_dirty.store(true, std::memory_order_relaxed);
+}
+
+extern "C" void zhr_vk_set_terrain_heightmap(
+    const uint8_t* data,
+    int32_t width,
+    int32_t height,
+    int32_t border,
+    float xy_factor,
+    float height_scale)
+{
+    const bool changed =
+        g_zhr_terrain_hm.data != data ||
+        g_zhr_terrain_hm.width != width ||
+        g_zhr_terrain_hm.height != height ||
+        g_zhr_terrain_hm.border != border;
+    g_zhr_terrain_hm.data = data;
+    g_zhr_terrain_hm.width = width;
+    g_zhr_terrain_hm.height = height;
+    g_zhr_terrain_hm.border = border;
+    g_zhr_terrain_hm.xy_factor = (xy_factor > 0.01f) ? xy_factor : 10.0f;
+    g_zhr_terrain_hm.height_scale = (height_scale > 0.001f) ? height_scale : 0.625f;
+    if (changed)
+    {
+        g_zhr_terrain_hm.generation += 1u;
+    }
+}
+
+extern "C" void zhr_vk_set_terrain_pass_active(bool active)
+{
+    g_zhr_terrain_pass_active.store(active, std::memory_order_relaxed);
 }

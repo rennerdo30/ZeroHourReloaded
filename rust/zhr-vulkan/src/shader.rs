@@ -998,23 +998,96 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             + sky_amb * fresnel_rim;
         col = vec4<f32>(pbr_rgb, col.a);
     } else if (pbr_active && u.render_flags.w > 0.5) {
-        // 3D unlit opaque terrain/ground: natural micro-relief lighting without blooming sunlit stone.
+        // 3D unlit opaque terrain/ground: atlas-safe Steep Parallax Occlusion Mapping (POM)
+        // + 4-tap finite-difference micro-relief normal aligned to the smooth bicubic terrain normal
+        // + micro-cavity self-shadowing (matte dielectric, zero blooming sand/stone).
         let n_geom = normalize(in.world_normal);
-        let r1 = cross(dpos_dy, n_geom);
-        let r2 = cross(n_geom, dpos_dx);
-        let det = dot(dpos_dx, r1);
-        var relief = 0.0;
-        if (abs(det) > 0.00001) {
-            let surf_grad = sign(det) * (dl_dx * r1 + dl_dy * r2);
-            let grad_len = length(surf_grad);
-            let n_bump = normalize(abs(det) * n_geom - 0.18 * (surf_grad / max(1.0, grad_len * 0.5)));
-            var sun_dir = normalize(vec3<f32>(0.42, 0.28, 0.86));
-            if (u.lights[0].pos_or_dir_and_kind.w > 0.5 && u.lights[0].pos_or_dir_and_kind.w < 1.5) {
-                sun_dir = normalize(-u.lights[0].pos_or_dir_and_kind.xyz);
-            }
-            relief = clamp(dot(n_bump, sun_dir) - dot(n_geom, sun_dir), -0.18, 0.10);
+        let to_cam = u.camera_pos_and_pbr.xyz - in.world_pos;
+        let cam_dist = length(to_cam);
+        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, cam_dist > 0.0001));
+
+        var sun_dir = normalize(vec3<f32>(0.42, 0.28, 0.86));
+        if (u.lights[0].pos_or_dir_and_kind.w > 0.5 && u.lights[0].pos_or_dir_and_kind.w < 1.5) {
+            sun_dir = normalize(-u.lights[0].pos_or_dir_and_kind.xyz);
         }
-        col = vec4<f32>(col.rgb * (1.0 + relief * 0.38), col.a);
+
+        var t_col = col.rgb;
+        var t_cavity = 1.0;
+        var n_bump = n_geom;
+        var used_terrain_pom = false;
+
+        let uv_det = duv_dx.x * duv_dy.y - duv_dx.y * duv_dy.x;
+        let t_pom_fade = smoothstep(460.0, 115.0, cam_dist);
+        if (u.fog_and_shader_params.w > 0.5 && t_pom_fade > 0.02 && abs(uv_det) > 0.0000001) {
+            let inv_uv_det = 1.0 / uv_det;
+            let t_raw = (dpos_dx * duv_dy.y - dpos_dy * duv_dx.y) * inv_uv_det;
+            let b_raw = (dpos_dy * duv_dx.x - dpos_dx * duv_dy.x) * inv_uv_det;
+            let t_ortho = t_raw - n_geom * dot(t_raw, n_geom);
+            let b_ortho = b_raw - n_geom * dot(b_raw, n_geom);
+            let t_len = length(t_ortho);
+            let b_len = length(b_ortho);
+            if (t_len > 0.0001 && b_len > 0.0001) {
+                let t_vec = t_ortho / t_len;
+                let b_vec = b_ortho / b_len;
+                let vz = max(dot(v_dir, n_geom), 0.32);
+                let v_tan = vec2<f32>(dot(v_dir, t_vec), dot(v_dir, b_vec)) / vz;
+                // Strictly bounded UV shift (<= 0.0020) keeps POM inside Zero Hour's 64x64 terrain atlas cells.
+                let parallax_amp = 0.0022 * t_pom_fade * smoothstep(0.20, 0.58, vz);
+                let max_uv_shift = clamp(v_tan * parallax_amp, vec2<f32>(-0.0020), vec2<f32>(0.0020));
+
+                let step_uv = max_uv_shift * 0.25;
+                var cur_uv = in.uv0;
+                var prev_uv = in.uv0;
+                var cur_layer = 0.0;
+                var prev_diff = 0.0;
+                var cur_h = dot(tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                for (var s: u32 = 0u; s < 4u; s = s + 1u) {
+                    if (cur_layer >= (1.0 - cur_h)) {
+                        break;
+                    }
+                    prev_uv = cur_uv;
+                    prev_diff = (1.0 - cur_h) - cur_layer;
+                    cur_uv = cur_uv - step_uv;
+                    cur_layer = cur_layer + 0.25;
+                    let s_rgb = textureSampleGrad(t_diffuse, s_diffuse, cur_uv, duv_dx, duv_dy).rgb;
+                    cur_h = dot(s_rgb, vec3<f32>(0.299, 0.587, 0.114));
+                }
+                let after_diff = cur_layer - (1.0 - cur_h);
+                let denom_p = max(after_diff + prev_diff, 0.0001);
+                let weight = clamp(after_diff / denom_p, 0.0, 1.0);
+                let pom_uv = mix(cur_uv, prev_uv, weight);
+                let pom_tex0 = textureSampleGrad(t_diffuse, s_diffuse, pom_uv, duv_dx, duv_dy);
+                t_col = eval_combiner(in.raw_color, pom_tex0, tex1).rgb;
+
+                // Atlas-safe 1-2 texel finite-difference relief normal + gentle micro-cavity AO.
+                let texel_step = clamp(max(length(duv_dx), length(duv_dy)) * 1.15, 0.0008, 0.0032);
+                let h_r = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_l = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_u = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_d = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_c = dot(pom_tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let relief_str = 0.85 * t_pom_fade;
+                let gx = clamp((h_r - h_l) * relief_str, -0.46, 0.46);
+                let gy = clamp((h_u - h_d) * relief_str, -0.46, 0.46);
+                n_bump = normalize(n_geom - t_vec * gx - b_vec * gy);
+                used_terrain_pom = true;
+                let local_avg = 0.25 * (h_r + h_l + h_u + h_d);
+                t_cavity = clamp(1.0 + (h_c - local_avg) * 0.48 * t_pom_fade, 0.89, 1.02);
+            }
+        }
+
+        if (!used_terrain_pom) {
+            let r1 = cross(dpos_dy, n_geom);
+            let r2 = cross(n_geom, dpos_dx);
+            let det = dot(dpos_dx, r1);
+            if (abs(det) > 0.00001) {
+                let surf_grad = sign(det) * (dl_dx * r1 + dl_dy * r2);
+                let grad_len = length(surf_grad);
+                n_bump = normalize(abs(det) * n_geom - 0.18 * (surf_grad / max(1.0, grad_len * 0.5)));
+            }
+        }
+        let relief = clamp(dot(n_bump, sun_dir) - dot(n_geom, sun_dir), -0.22, 0.14);
+        col = vec4<f32>(t_col * t_cavity * (1.0 + relief * 0.45), col.a);
     } else if (pbr_active && u.render_flags.y > 0.5) {
         // 3D additive VFX (explosions, fireballs, lasers, muzzle flashes): push bright core into HDR for soft bloom.
         let luma = max(col.r, max(col.g, col.b));

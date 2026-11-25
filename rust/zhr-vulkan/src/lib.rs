@@ -39,9 +39,9 @@ use crate::types::{
 };
 
 const FRAMES_IN_FLIGHT: usize = 2;
-const DYNAMIC_UNIFORM_BYTES: usize = 8 * 1024 * 1024; // 8 MiB / frame (>20k draws)
-const DYNAMIC_VERTEX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB / frame
-const DYNAMIC_INDEX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB / frame
+const DYNAMIC_UNIFORM_BYTES: usize = 12 * 1024 * 1024; // 12 MiB / frame (>30k draws)
+const DYNAMIC_VERTEX_BYTES: usize = 96 * 1024 * 1024; // 96 MiB / frame (>1.5M tessellated verts)
+const DYNAMIC_INDEX_BYTES: usize = 24 * 1024 * 1024; // 24 MiB / frame (>12M indices)
 const MAX_TEXTURES: u32 = 16384;
 
 /// Renderer configuration.
@@ -1275,13 +1275,15 @@ impl VulkanRenderer {
         let is_stencil_only_pass = !self.shader.color_write()
             || !self.shader.depth_write()
             || (self.stencil.enabled && self.stencil.func == shader::DepthCompare::Never);
+        let is_terrain_wire = self.material_hint == 4 && is_opaque_blend;
+        let is_mesh_wire = self.material_hint == 0
+            && is_opaque_blend
+            && self.uniforms.ambient_and_lighting[3] > 0.5;
         let draw_wireframe = self.wireframe
             && self.ctx.fill_mode_non_solid
             && is_3d_pass
-            && self.material_hint == 0
             && !is_stencil_only_pass
-            && is_opaque_blend
-            && self.uniforms.ambient_and_lighting[3] > 0.5;
+            && (is_mesh_wire || is_terrain_wire);
 
         let pso = self.pipelines.get_or_create(
             &self.ctx.device,
@@ -1379,8 +1381,8 @@ impl VulkanRenderer {
             } else {
                 2.0
             }
-        } else if is_3d_pass {
-            self.material_hint as f32
+        } else if is_3d_pass && self.material_hint == 1 {
+            1.0
         } else {
             0.0
         };
