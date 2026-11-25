@@ -446,6 +446,9 @@ struct DrawUniforms {
     camera_pos_and_pbr: vec4<f32>,
     render_flags: vec4<f32>,
     water_params: vec4<f32>,
+    tex_matrix0: mat4x4<f32>,
+    tex_matrix1: mat4x4<f32>,
+    tex_gen_params: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> u: DrawUniforms;
@@ -473,6 +476,20 @@ struct VsOut {
     @location(6) raw_color: vec4<f32>,
     @location(7) view_z: f32,
 };
+
+fn eval_tex_gen(mode: u32, src_idx: u32, tex_mat: mat4x4<f32>, view_pos: vec4<f32>, raw_uv0: vec2<f32>, raw_uv1: vec2<f32>) -> vec2<f32> {
+    if (mode == 3u) {
+        return (tex_mat * vec4<f32>(view_pos.xyz, 1.0)).xy;
+    }
+    if (mode == 2u) {
+        return view_pos.xy;
+    }
+    let base_uv = select(raw_uv0, raw_uv1, src_idx == 1u);
+    if (mode == 1u) {
+        return (tex_mat * vec4<f32>(base_uv.x, base_uv.y, 1.0, 1.0)).xy;
+    }
+    return base_uv;
+}
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -514,9 +531,9 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = clip_pos;
     out.color = vec4<f32>(lit_rgb, in.color.a);
-    out.uv0 = in.uv0;
+    out.uv0 = eval_tex_gen(u.tex_gen_params.x, u.tex_gen_params.y, u.tex_matrix0, view_pos, in.uv0, in.uv1);
     out.view_dist = length(view_pos.xyz);
-    out.uv1 = in.uv1;
+    out.uv1 = eval_tex_gen(u.tex_gen_params.z, u.tex_gen_params.w, u.tex_matrix1, view_pos, in.uv0, in.uv1);
     out.world_pos = world_pos.xyz;
     out.world_normal = n_world;
     out.raw_color = in.color;
@@ -882,21 +899,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let parallax_amp = 0.0075 * pom_fade * smoothstep(0.18, 0.55, vz);
                 let max_uv_shift = clamp(v_tan * parallax_amp, vec2<f32>(-0.011), vec2<f32>(0.011));
 
-                // 4-step Steep Parallax Occlusion march + linear intersection refinement.
-                let step_uv = max_uv_shift * 0.25;
+                // Fast 2-step Parallax Occlusion march + linear intersection refinement (2x fewer texture taps at 4K).
+                let step_uv = max_uv_shift * 0.5;
                 var cur_uv = in.uv0;
                 var prev_uv = in.uv0;
                 var cur_layer = 0.0;
                 var prev_diff = 0.0;
                 var cur_h = dot(tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
-                for (var s: u32 = 0u; s < 4u; s = s + 1u) {
+                for (var s: u32 = 0u; s < 2u; s = s + 1u) {
                     if (cur_layer >= (1.0 - cur_h)) {
                         break;
                     }
                     prev_uv = cur_uv;
                     prev_diff = (1.0 - cur_h) - cur_layer;
                     cur_uv = cur_uv - step_uv;
-                    cur_layer = cur_layer + 0.25;
+                    cur_layer = cur_layer + 0.5;
                     let s_rgb = textureSampleGrad(t_diffuse, s_diffuse, cur_uv, duv_dx, duv_dy).rgb;
                     cur_h = dot(s_rgb, vec3<f32>(0.299, 0.587, 0.114));
                 }
@@ -906,21 +923,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 pom_uv = mix(cur_uv, prev_uv, weight);
                 pom_tex0 = textureSampleGrad(t_diffuse, s_diffuse, pom_uv, duv_dx, duv_dy);
 
-                // 4-tap finite-difference relief normal + gentle micro-cavity self-shadowing (bloom-safe).
+                // 2-tap forward-difference relief normal reusing center sample `h_c` (same crisp detail, half the fetches).
                 let texel_step = clamp(max(length(duv_dx), length(duv_dy)) * 1.15, 0.0012, 0.010);
-                let h_r = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
-                let h_l = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
-                let h_u = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
-                let h_d = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
                 let h_c = dot(pom_tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_r = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_u = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let dh_x = (h_r - h_c) * 1.85;
+                let dh_y = (h_u - h_c) * 1.85;
                 let relief_str = 0.92 * pom_fade;
-                let gx = clamp((h_r - h_l) * relief_str, -0.52, 0.52);
-                let gy = clamp((h_u - h_d) * relief_str, -0.52, 0.52);
-                pom_grad_mag = length(vec2<f32>(h_r - h_l, h_u - h_d));
+                let gx = clamp(dh_x * relief_str, -0.52, 0.52);
+                let gy = clamp(dh_y * relief_str, -0.52, 0.52);
+                pom_grad_mag = length(vec2<f32>(dh_x, dh_y));
                 pom_normal = normalize(n_geom - t_vec * gx - b_vec * gy);
                 used_pom_normal = true;
-                let local_avg = 0.25 * (h_r + h_l + h_u + h_d);
-                pom_cavity = clamp(1.0 + (h_c - local_avg) * 0.45 * pom_fade, 0.88, 1.015);
+                let local_avg = 0.5 * (h_r + h_u);
+                pom_cavity = clamp(1.0 + (h_c - local_avg) * 0.50 * pom_fade, 0.88, 1.015);
             }
         }
 
@@ -1017,7 +1034,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         var used_terrain_pom = false;
 
         let uv_det = duv_dx.x * duv_dy.y - duv_dx.y * duv_dy.x;
-        let t_pom_fade = smoothstep(460.0, 115.0, cam_dist);
+        let t_pom_fade = smoothstep(380.0, 110.0, cam_dist);
         if (u.fog_and_shader_params.w > 0.5 && t_pom_fade > 0.02 && abs(uv_det) > 0.0000001) {
             let inv_uv_det = 1.0 / uv_det;
             let t_raw = (dpos_dx * duv_dy.y - dpos_dy * duv_dx.y) * inv_uv_det;
@@ -1031,48 +1048,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let b_vec = b_ortho / b_len;
                 let vz = max(dot(v_dir, n_geom), 0.32);
                 let v_tan = vec2<f32>(dot(v_dir, t_vec), dot(v_dir, b_vec)) / vz;
-                // Strictly bounded UV shift (<= 0.0020) keeps POM inside Zero Hour's 64x64 terrain atlas cells.
+                // Strictly bounded single-step height-weighted parallax keeps POM inside 64x64 atlas cells
+                // while cutting terrain texture fetches by 3x at 4K (3 extra taps vs 9).
                 let parallax_amp = 0.0022 * t_pom_fade * smoothstep(0.20, 0.58, vz);
                 let max_uv_shift = clamp(v_tan * parallax_amp, vec2<f32>(-0.0020), vec2<f32>(0.0020));
-
-                let step_uv = max_uv_shift * 0.25;
-                var cur_uv = in.uv0;
-                var prev_uv = in.uv0;
-                var cur_layer = 0.0;
-                var prev_diff = 0.0;
-                var cur_h = dot(tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
-                for (var s: u32 = 0u; s < 4u; s = s + 1u) {
-                    if (cur_layer >= (1.0 - cur_h)) {
-                        break;
-                    }
-                    prev_uv = cur_uv;
-                    prev_diff = (1.0 - cur_h) - cur_layer;
-                    cur_uv = cur_uv - step_uv;
-                    cur_layer = cur_layer + 0.25;
-                    let s_rgb = textureSampleGrad(t_diffuse, s_diffuse, cur_uv, duv_dx, duv_dy).rgb;
-                    cur_h = dot(s_rgb, vec3<f32>(0.299, 0.587, 0.114));
-                }
-                let after_diff = cur_layer - (1.0 - cur_h);
-                let denom_p = max(after_diff + prev_diff, 0.0001);
-                let weight = clamp(after_diff / denom_p, 0.0, 1.0);
-                let pom_uv = mix(cur_uv, prev_uv, weight);
+                let h0 = dot(tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let pom_uv = in.uv0 - max_uv_shift * (1.0 - h0);
                 let pom_tex0 = textureSampleGrad(t_diffuse, s_diffuse, pom_uv, duv_dx, duv_dy);
                 t_col = eval_combiner(in.raw_color, pom_tex0, tex1).rgb;
 
-                // Atlas-safe 1-2 texel finite-difference relief normal + gentle micro-cavity AO.
+                // Atlas-safe 2-tap forward-difference relief normal reusing center `h_c` + micro-cavity AO.
                 let texel_step = clamp(max(length(duv_dx), length(duv_dy)) * 1.15, 0.0008, 0.0032);
-                let h_r = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
-                let h_l = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
-                let h_u = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
-                let h_d = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
                 let h_c = dot(pom_tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
-                let relief_str = 0.85 * t_pom_fade;
-                let gx = clamp((h_r - h_l) * relief_str, -0.46, 0.46);
-                let gy = clamp((h_u - h_d) * relief_str, -0.46, 0.46);
+                let h_r = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_u = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let relief_str = 1.55 * t_pom_fade;
+                let gx = clamp((h_r - h_c) * relief_str, -0.46, 0.46);
+                let gy = clamp((h_u - h_c) * relief_str, -0.46, 0.46);
                 n_bump = normalize(n_geom - t_vec * gx - b_vec * gy);
                 used_terrain_pom = true;
-                let local_avg = 0.25 * (h_r + h_l + h_u + h_d);
-                t_cavity = clamp(1.0 + (h_c - local_avg) * 0.48 * t_pom_fade, 0.89, 1.02);
+                let local_avg = 0.5 * (h_r + h_u);
+                t_cavity = clamp(1.0 + (h_c - local_avg) * 0.52 * t_pom_fade, 0.89, 1.02);
             }
         }
 

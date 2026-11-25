@@ -173,6 +173,18 @@ void zhr_vk_set_stage_state(
     uint32_t color_args,
     uint32_t alpha_op,
     uint32_t alpha_args);
+// stage: 0 or 1; mode: 0=passthrough, 1=transform UV, 2=camera-space pos, 3=camera-space pos * matrix
+void zhr_vk_set_tex_gen(uint32_t stage, uint32_t mode, uint32_t src_idx, const float* matrix16);
+
+uint32_t zhr_vk_create_vertex_buffer(const ZhrVertexWw3d* vertices, size_t vertex_count);
+uint32_t zhr_vk_create_index_buffer(const uint16_t* indices, size_t index_count);
+void zhr_vk_destroy_buffer(uint32_t buffer_id);
+int32_t zhr_vk_draw_indexed(
+    uint32_t vb_id,
+    uint32_t ib_id,
+    uint32_t index_count,
+    uint32_t first_index,
+    int32_t vertex_offset);
 
 int32_t zhr_vk_draw_dynamic(
     const ZhrVertexWw3d* vertices,

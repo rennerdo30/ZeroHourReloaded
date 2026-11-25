@@ -175,6 +175,13 @@ pub struct DrawUniforms {
     pub render_flags: [f32; 4],
     /// x = elapsed_time_sec, y = material_hint (0=default, 1=animated water), z/w = reserved.
     pub water_params: [f32; 4],
+    /// Stage 0 texture transform matrix (column-major, identity when unused).
+    pub tex_matrix0: [[f32; 4]; 4],
+    /// Stage 1 texture transform matrix (column-major, identity when unused).
+    pub tex_matrix1: [[f32; 4]; 4],
+    /// `[s0_mode, s0_src_idx, s1_mode, s1_src_idx]`
+    /// mode: 0 = passthrough, 1 = transform raw UV, 2 = camera-space pos, 3 = camera-space pos * tex_matrix.
+    pub tex_gen_params: [u32; 4],
 }
 
 impl Default for DrawUniforms {
@@ -193,6 +200,9 @@ impl Default for DrawUniforms {
             camera_pos_and_pbr: [0.0, 0.0, 100.0, 0.0],
             render_flags: [0.0, 0.0, 0.0, 0.0],
             water_params: [0.0, 0.0, 0.0, 0.0],
+            tex_matrix0: Mat4::IDENTITY.to_cols_array_2d(),
+            tex_matrix1: Mat4::IDENTITY.to_cols_array_2d(),
+            tex_gen_params: [0, 0, 0, 1],
         }
     }
 }

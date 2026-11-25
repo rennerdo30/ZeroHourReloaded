@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,8 @@ namespace {
 std::atomic<bool> g_zhr_mesh_smoothing_enabled{true};
 std::atomic<bool> g_zhr_title_banner_dirty{true};
 std::atomic<bool> g_zhr_terrain_pass_active{false};
+std::atomic<uint64_t> g_zhr_next_buf_id{1};
+std::atomic<uint64_t> g_zhr_frame_counter{1};
 
 struct ZhrTerrainHeightmapState
 {
@@ -1171,6 +1174,7 @@ public:
         if ((Flags & D3DLOCK_READONLY) == 0)
         {
             ++m_generation;
+            m_last_mutated_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
         }
         *ppbData = m_data.data() + OffsetToLock;
         return D3D_OK;
@@ -1193,7 +1197,10 @@ public:
     size_t Size() const { return m_data.size(); }
     DWORD FVF() const { return m_fvf; }
     DWORD Usage() const { return m_usage; }
+    bool IsDynamic() const { return (m_usage & D3DUSAGE_DYNAMIC) != 0; }
+    uint64_t Id() const { return m_id; }
     uint64_t Generation() const { return m_generation; }
+    uint64_t LastMutatedFrame() const { return m_last_mutated_frame; }
 
 private:
     std::atomic<ULONG> m_ref_count{1};
@@ -1202,7 +1209,9 @@ private:
     DWORD m_fvf;
     D3DPOOL m_pool;
     DWORD m_priority{0};
+    uint64_t m_id{g_zhr_next_buf_id.fetch_add(1, std::memory_order_relaxed)};
     uint64_t m_generation{1};
+    uint64_t m_last_mutated_frame{0};
     std::vector<uint8_t> m_data;
 };
 
@@ -1234,6 +1243,7 @@ public:
         if ((Flags & D3DLOCK_READONLY) == 0)
         {
             ++m_generation;
+            m_last_mutated_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
         }
         *ppbData = m_data.data() + OffsetToLock;
         return D3D_OK;
@@ -1254,7 +1264,10 @@ public:
     const uint16_t* Data16() const { return reinterpret_cast<const uint16_t*>(m_data.data()); }
     size_t Count16() const { return m_data.size() / sizeof(uint16_t); }
     DWORD Usage() const { return m_usage; }
+    bool IsDynamic() const { return (m_usage & D3DUSAGE_DYNAMIC) != 0; }
+    uint64_t Id() const { return m_id; }
     uint64_t Generation() const { return m_generation; }
+    uint64_t LastMutatedFrame() const { return m_last_mutated_frame; }
 
 private:
     std::atomic<ULONG> m_ref_count{1};
@@ -1263,8 +1276,67 @@ private:
     D3DFORMAT m_format;
     D3DPOOL m_pool;
     DWORD m_priority{0};
+    uint64_t m_id{g_zhr_next_buf_id.fetch_add(1, std::memory_order_relaxed)};
     uint64_t m_generation{1};
+    uint64_t m_last_mutated_frame{0};
     std::vector<uint8_t> m_data;
+};
+
+struct StaticDrawKey
+{
+    uint64_t vb_id{0};
+    uint64_t vb_gen{0};
+    uint64_t ib_id{0};
+    uint64_t ib_gen{0};
+    uint32_t base_vertex{0};
+    uint32_t start_index{0};
+    uint32_t prim_count{0};
+    uint32_t prim_type{0};
+    uint32_t fvf{0};
+    uint32_t stride{0};
+    uint32_t mat_rgba{0};
+    uint32_t tess_mode{0};
+    uint64_t extra_key{0};
+
+    bool operator==(const StaticDrawKey& o) const noexcept
+    {
+        return vb_id == o.vb_id && vb_gen == o.vb_gen &&
+               ib_id == o.ib_id && ib_gen == o.ib_gen &&
+               base_vertex == o.base_vertex && start_index == o.start_index &&
+               prim_count == o.prim_count && prim_type == o.prim_type &&
+               fvf == o.fvf && stride == o.stride &&
+               mat_rgba == o.mat_rgba && tess_mode == o.tess_mode &&
+               extra_key == o.extra_key;
+    }
+};
+
+struct StaticDrawKeyHash
+{
+    size_t operator()(const StaticDrawKey& k) const noexcept
+    {
+        uint64_t h = 14695981039346656037ULL;
+        auto mix = [&](uint64_t v) {
+            h = (h ^ v) * 1099511628211ULL;
+        };
+        mix(k.vb_id);
+        mix(k.vb_gen);
+        mix(k.ib_id);
+        mix(k.ib_gen);
+        mix((static_cast<uint64_t>(k.base_vertex) << 32) | k.start_index);
+        mix((static_cast<uint64_t>(k.prim_count) << 32) | k.prim_type);
+        mix((static_cast<uint64_t>(k.fvf) << 32) | k.stride);
+        mix((static_cast<uint64_t>(k.mat_rgba) << 32) | k.tess_mode);
+        mix(k.extra_key);
+        return static_cast<size_t>(h);
+    }
+};
+
+struct CachedGpuMesh
+{
+    uint32_t gpu_vb{0};
+    uint32_t gpu_ib{0};
+    uint32_t index_count{0};
+    uint64_t last_used_frame{0};
 };
 
 // ============================================================================
@@ -1323,6 +1395,12 @@ public:
         std::memset(&m_material, 0, sizeof(m_material));
         m_material.Diffuse = {1.0f, 1.0f, 1.0f, 1.0f};
         m_material.Ambient = {1.0f, 1.0f, 1.0f, 1.0f};
+
+        if (const char* plog = std::getenv("ZHR_PERF_LOG"); plog != nullptr && plog[0] != '\0')
+        {
+            std::snprintf(m_perf_log_path, sizeof(m_perf_log_path), "%s", plog);
+            m_perf_enabled = true;
+        }
     }
 
     ~ZhrVkD3DDevice8()
@@ -1331,6 +1409,7 @@ public:
         {
             zhr_vk_end_frame();
         }
+        ClearStaticGpuCache();
         for (auto*& tex : m_textures)
         {
             if (tex) { tex->Release(); tex = nullptr; }
@@ -1414,10 +1493,30 @@ public:
     STDMETHOD(Present)(CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*) override
     {
         PollGraphicsHotkeys();
+        const auto t_end0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (zhr_vk_is_frame_active())
         {
             zhr_vk_end_frame();
         }
+        if (m_perf_enabled)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            m_perf_present_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_end0).count());
+            if (m_perf_has_prev_frame)
+            {
+                m_perf_frame_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_perf_prev_frame).count());
+                ++m_perf_frames;
+                if (m_perf_frames % 30u == 0u)
+                {
+                    FlushPerfLog();
+                }
+            }
+            m_perf_prev_frame = now;
+            m_perf_has_prev_frame = true;
+        }
+        g_zhr_frame_counter.fetch_add(1, std::memory_order_relaxed);
         return D3D_OK;
     }
     STDMETHOD(GetBackBuffer)(UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface8** ppBackBuffer) override
@@ -1885,6 +1984,123 @@ public:
             return D3D_OK;
         }
 
+        const auto t_sub0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const DWORD pos_flags = fvf & D3DFVF_POSITION_MASK;
+        const bool is_rhw = (pos_flags == D3DFVF_XYZRHW);
+        const bool is_dynamic_vb = m_streams[0]->IsDynamic() || m_index_buffer->IsDynamic();
+        const uint64_t cur_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
+        const bool buffers_stable =
+            !is_dynamic_vb &&
+            (m_streams[0]->Generation() <= 2u || m_streams[0]->LastMutatedFrame() + 1u < cur_frame) &&
+            (m_index_buffer->Generation() <= 2u || m_index_buffer->LastMutatedFrame() + 1u < cur_frame);
+
+        StaticDrawKey static_key{};
+        const StaticDrawKey* static_key_ptr = nullptr;
+
+        if (!is_rhw && buffers_stable)
+        {
+            const bool has_normal = (fvf & D3DFVF_NORMAL) != 0;
+            const bool has_diffuse = (fvf & D3DFVF_DIFFUSE) != 0;
+            const uint32_t tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+            const bool use_material_color =
+                (m_render_states[D3DRS_LIGHTING] != 0) &&
+                (!has_diffuse ||
+                 m_render_states[D3DRS_COLORVERTEX] == 0 ||
+                 m_render_states[D3DRS_DIFFUSEMATERIALSOURCE] == D3DMCS_MATERIAL);
+
+            static const bool s_mesh_env_init = []() -> bool {
+                const char* e = std::getenv("ZHR_MESH_SMOOTHING");
+                if (e != nullptr && e[0] != '\0')
+                {
+                    g_zhr_mesh_smoothing_enabled.store(e[0] != '0', std::memory_order_relaxed);
+                }
+                return true;
+            }();
+            (void)s_mesh_env_init;
+
+            const uint32_t gfx_packed = zhr_vk_get_graphics_mode();
+            const bool remaster_active = (gfx_packed & 0x3u) != 0u;
+            const bool mesh_smooth_on = g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) && remaster_active;
+            const bool terrain_pass_active = g_zhr_terrain_pass_active.load(std::memory_order_relaxed);
+            const bool is_stencil_only_pass =
+                (m_render_states[D3DRS_COLORWRITEENABLE] & 0x7u) == 0 ||
+                (m_render_states[D3DRS_ZWRITEENABLE] == 0) ||
+                (m_render_states[D3DRS_STENCILENABLE] != 0 &&
+                 m_render_states[D3DRS_STENCILFUNC] == D3DCMP_NEVER);
+
+            uint32_t tess_mode = 0u;
+            uint64_t extra_key = 0u;
+            if (mesh_smooth_on && terrain_pass_active &&
+                g_zhr_terrain_hm.data != nullptr &&
+                g_zhr_terrain_hm.width >= 4 &&
+                g_zhr_terrain_hm.height >= 4 &&
+                PrimitiveType == D3DPT_TRIANGLELIST &&
+                primCount >= 2u && primCount <= 4096u)
+            {
+                tess_mode = 2u;
+                extra_key = g_zhr_terrain_hm.generation;
+            }
+            else if (mesh_smooth_on && !terrain_pass_active &&
+                     has_normal &&
+                     (m_render_states[D3DRS_LIGHTING] != 0) &&
+                     !is_stencil_only_pass &&
+                     (m_render_states[D3DRS_ALPHABLENDENABLE] == 0) &&
+                     PrimitiveType == D3DPT_TRIANGLELIST &&
+                     primCount >= 6u && primCount <= 4000u)
+            {
+                tess_mode = 1u;
+                ZhrVkTexture8* diffuse_tex =
+                    (m_textures[0] != nullptr && m_textures[0]->GetType() == D3DRTYPE_TEXTURE)
+                        ? static_cast<ZhrVkTexture8*>(m_textures[0])
+                        : nullptr;
+                extra_key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(diffuse_tex));
+            }
+
+            uint32_t mat_rgba = 0u;
+            if (use_material_color)
+            {
+                const uint32_t mr = static_cast<uint32_t>(std::clamp(m_material.Diffuse.r, 0.0f, 1.0f) * 255.0f + 0.5f);
+                const uint32_t mg = static_cast<uint32_t>(std::clamp(m_material.Diffuse.g, 0.0f, 1.0f) * 255.0f + 0.5f);
+                const uint32_t mb = static_cast<uint32_t>(std::clamp(m_material.Diffuse.b, 0.0f, 1.0f) * 255.0f + 0.5f);
+                const uint32_t ma = static_cast<uint32_t>(std::clamp(m_material.Diffuse.a, 0.0f, 1.0f) * 255.0f + 0.5f);
+                mat_rgba = 0x80000000u | (mr << 24) | (mg << 16) | (mb << 8) | ma;
+                // Distinct flag in tess_mode high bit so 0x00000000 material color never collides with unused.
+                tess_mode |= 0x80u;
+            }
+
+            static_key.vb_id = m_streams[0]->Id();
+            static_key.vb_gen = m_streams[0]->Generation();
+            static_key.ib_id = m_index_buffer->Id();
+            static_key.ib_gen = m_index_buffer->Generation();
+            static_key.base_vertex = m_base_vertex_index;
+            static_key.start_index = startIndex;
+            static_key.prim_count = primCount;
+            static_key.prim_type = static_cast<uint32_t>(PrimitiveType);
+            static_key.fvf = fvf;
+            static_key.stride = stride;
+            static_key.mat_rgba = mat_rgba;
+            static_key.tess_mode = tess_mode;
+            static_key.extra_key = extra_key;
+
+            auto it = m_static_gpu_cache.find(static_key);
+            if (it != m_static_gpu_cache.end())
+            {
+                it->second.last_used_frame = cur_frame;
+                EnsureFrameBegun();
+                SyncDrawState(false, tex_count);
+                zhr_vk_draw_indexed(it->second.gpu_vb, it->second.gpu_ib, it->second.index_count, 0u, 0);
+                if (m_perf_enabled)
+                {
+                    ++m_perf_static_hits;
+                    const auto t_sub1 = std::chrono::steady_clock::now();
+                    m_perf_submit_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_sub1 - t_sub0).count());
+                }
+                return D3D_OK;
+            }
+            static_key_ptr = &static_key;
+        }
+
         const uint16_t* raw_indices = m_index_buffer->Data16() + startIndex;
 
         // Compute tight vertex range referenced by indices to avoid unpacking unused vertices.
@@ -1909,7 +2125,7 @@ public:
             return D3D_OK;
         }
 
-        return SubmitDraw(
+        const HRESULT hr = SubmitDraw(
             PrimitiveType,
             primCount,
             m_streams[0]->Data() + start_byte,
@@ -1917,7 +2133,16 @@ public:
             fvf,
             vert_span,
             raw_indices,
-            v_min);
+            v_min,
+            static_key_ptr,
+            is_dynamic_vb);
+        if (m_perf_enabled)
+        {
+            const auto t_sub1 = std::chrono::steady_clock::now();
+            m_perf_submit_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t_sub1 - t_sub0).count());
+        }
+        return hr;
     }
 
     STDMETHOD(DrawPrimitiveUP)(
@@ -2194,7 +2419,7 @@ private:
         return 0;
     }
 
-    void SyncDrawState(bool is_rhw)
+    void SyncDrawState(bool is_rhw, uint32_t tex_count)
     {
         const bool z_enable = m_render_states[D3DRS_ZENABLE] != D3DZB_FALSE;
         const uint32_t depth_cmp = z_enable ? MapD3DCmpToShaderDepth(m_render_states[D3DRS_ZFUNC]) : 7u;
@@ -2331,6 +2556,51 @@ private:
         {
             zhr_vk_set_fog(false, 0.0f, 0.0f, 0.0f, 0.0f, 1000.0f);
         }
+
+        // Push GPU vertex-shader UV generation & texture transform matrices (moves TCI_CAMERASPACEPOSITION
+        // & scrolling cloud/shroud transforms off the CPU so all terrain passes share one GPU VB/IB).
+        if (is_rhw)
+        {
+            zhr_vk_set_tex_gen(0u, 0u, 0u, nullptr);
+            zhr_vk_set_tex_gen(1u, 0u, 1u, nullptr);
+        }
+        else
+        {
+            const bool stage1_active = (s0_cop != 0u) && (s1_cop != 0u);
+            auto sync_stage_uv = [&](uint32_t stage, bool active) {
+                if (!active)
+                {
+                    zhr_vk_set_tex_gen(stage, 0u, stage, nullptr);
+                    return;
+                }
+                const DWORD tci = m_tss[stage][D3DTSS_TEXCOORDINDEX];
+                const DWORD tci_mode = tci & 0xFFFF0000u;
+                const DWORD tci_index = tci & 0x7u;
+                const bool use_xform =
+                    (m_tss[stage][D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFFu) != D3DTTFF_DISABLE;
+                if (tci_mode == D3DTSS_TCI_CAMERASPACEPOSITION)
+                {
+                    const uint32_t mode = use_xform ? 3u : 2u;
+                    zhr_vk_set_tex_gen(
+                        stage,
+                        mode,
+                        0u,
+                        use_xform ? &m_tex_matrix[stage].m[0][0] : nullptr);
+                }
+                else
+                {
+                    const uint32_t src_idx = (tci_index == 1u && tex_count >= 2u) ? 1u : 0u;
+                    const uint32_t mode = use_xform ? 1u : 0u;
+                    zhr_vk_set_tex_gen(
+                        stage,
+                        mode,
+                        src_idx,
+                        use_xform ? &m_tex_matrix[stage].m[0][0] : nullptr);
+                }
+            };
+            sync_stage_uv(0u, true);
+            sync_stage_uv(1u, stage1_active);
+        }
     }
 
     HRESULT SubmitDraw(
@@ -2341,7 +2611,9 @@ private:
         DWORD fvf,
         uint32_t vertex_count,
         const uint16_t* raw_indices,
-        uint32_t index_rebase)
+        uint32_t index_rebase,
+        const StaticDrawKey* static_key = nullptr,
+        bool is_dynamic_vb = true)
     {
         if (vertex_count == 0 || prim_count == 0) return D3D_OK;
 
@@ -2382,58 +2654,10 @@ private:
              m_render_states[D3DRS_COLORVERTEX] == 0 ||
              m_render_states[D3DRS_DIFFUSEMATERIALSOURCE] == D3DMCS_MATERIAL);
 
-        const DWORD tci0 = m_tss[0][D3DTSS_TEXCOORDINDEX];
-        const DWORD tci0_mode = tci0 & 0xFFFF0000u;
-        const DWORD tci0_index = tci0 & 0x7u;
-        const bool use_tex0_xform = (m_tss[0][D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFFu) != D3DTTFF_DISABLE;
-
-        const DWORD tci1 = m_tss[1][D3DTSS_TEXCOORDINDEX];
-        const DWORD tci1_mode = tci1 & 0xFFFF0000u;
-        const DWORD tci1_index = tci1 & 0x7u;
-        const bool use_tex1_xform = (m_tss[1][D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFFu) != D3DTTFF_DISABLE;
-        const bool stage1_active = (m_tss[0][D3DTSS_COLOROP] != D3DTOP_DISABLE) &&
-                                   (m_tss[1][D3DTSS_COLOROP] != D3DTOP_DISABLE);
-
         const float vp_x = static_cast<float>(m_viewport.X);
         const float vp_y = static_cast<float>(m_viewport.Y);
         const float vp_w = static_cast<float>(m_viewport.Width > 0 ? m_viewport.Width : 1);
         const float vp_h = static_cast<float>(m_viewport.Height > 0 ? m_viewport.Height : 1);
-
-        auto eval_stage_uv = [&](int stage, DWORD mode, DWORD index, bool xform,
-                                 const float* p, float raw_u0, float raw_v0, float raw_u1, float raw_v1,
-                                 float out_uv[2]) {
-            if (!is_rhw && mode == D3DTSS_TCI_CAMERASPACEPOSITION)
-            {
-                float wp[4], cp[4], tc[4];
-                TransformPointRowMajor(m_world, p[0], p[1], p[2], 1.0f, wp);
-                TransformPointRowMajor(m_view, wp[0], wp[1], wp[2], 1.0f, cp);
-                if (xform)
-                {
-                    TransformPointRowMajor(m_tex_matrix[stage], cp[0], cp[1], cp[2], 1.0f, tc);
-                    out_uv[0] = tc[0];
-                    out_uv[1] = tc[1];
-                }
-                else
-                {
-                    out_uv[0] = cp[0];
-                    out_uv[1] = cp[1];
-                }
-            }
-            else
-            {
-                float u = (index == 1 && tex_count >= 2) ? raw_u1 : raw_u0;
-                float v = (index == 1 && tex_count >= 2) ? raw_v1 : raw_v0;
-                if (xform)
-                {
-                    float tc[4];
-                    TransformPointRowMajor(m_tex_matrix[stage], u, v, 1.0f, 1.0f, tc);
-                    u = tc[0];
-                    v = tc[1];
-                }
-                out_uv[0] = u;
-                out_uv[1] = v;
-            }
-        };
 
         m_scratch_verts.resize(vertex_count);
         for (uint32_t i = 0; i < vertex_count; ++i)
@@ -2492,30 +2716,27 @@ private:
                 dst.color[3] = 1.0f;
             }
 
-            float raw_u0 = 0.0f, raw_v0 = 0.0f;
-            float raw_u1 = 0.0f, raw_v1 = 0.0f;
             if (tex_count >= 1 && uv0_off + 8 <= stride)
             {
                 const float* uv = reinterpret_cast<const float*>(vptr + uv0_off);
-                raw_u0 = uv[0];
-                raw_v0 = uv[1];
+                dst.uv0[0] = uv[0];
+                dst.uv0[1] = uv[1];
+            }
+            else
+            {
+                dst.uv0[0] = 0.0f;
+                dst.uv0[1] = 0.0f;
             }
             if (tex_count >= 2 && uv1_off + 8 <= stride)
             {
                 const float* uv = reinterpret_cast<const float*>(vptr + uv1_off);
-                raw_u1 = uv[0];
-                raw_v1 = uv[1];
-            }
-
-            eval_stage_uv(0, tci0_mode, tci0_index, use_tex0_xform, p, raw_u0, raw_v0, raw_u1, raw_v1, dst.uv0);
-            if (stage1_active)
-            {
-                eval_stage_uv(1, tci1_mode, tci1_index, use_tex1_xform, p, raw_u0, raw_v0, raw_u1, raw_v1, dst.uv1);
+                dst.uv1[0] = uv[0];
+                dst.uv1[1] = uv[1];
             }
             else
             {
-                dst.uv1[0] = raw_u1;
-                dst.uv1[1] = raw_v1;
+                dst.uv1[0] = 0.0f;
+                dst.uv1[1] = 0.0f;
             }
         }
 
@@ -2574,7 +2795,7 @@ private:
             return D3D_OK;
         }
 
-        SyncDrawState(is_rhw);
+        SyncDrawState(is_rhw, tex_count);
 
         const uint32_t gfx_packed = zhr_vk_get_graphics_mode();
         const bool remaster_active = (gfx_packed & 0x3u) != 0u;
@@ -2607,8 +2828,11 @@ private:
             prim_count <= 4096u &&
             m_scratch_verts.size() <= 16384u;
 
+        // Only tessellate static rigid .W3D meshes (buildings, vents, vehicles, rocks, props);
+        // skip dynamic skinned buffers (D3DUSAGE_DYNAMIC) whose vertices mutate every frame.
         const bool can_smooth_mesh =
             !terrain_pass_active &&
+            !is_dynamic_vb &&
             g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) &&
             remaster_active &&
             !is_rhw &&
@@ -2626,12 +2850,94 @@ private:
                 ? static_cast<ZhrVkTexture8*>(m_textures[0])
                 : nullptr;
 
+        // Static VB/IB cache miss path: tessellate once (if eligible), upload into persistent
+        // GPU vertex & index buffers, and draw directly via `zhr_vk_draw_indexed` forever after.
+        if (static_key != nullptr)
+        {
+            const ZhrVertexWw3d* upload_verts = m_scratch_verts.data();
+            size_t upload_vcount = m_scratch_verts.size();
+            const uint16_t* upload_indices = m_scratch_indices.data();
+            size_t upload_icount = m_scratch_indices.size();
+
+            if (can_smooth_terrain)
+            {
+                const auto t0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const bool ok = ApplySmartTerrainTessellation();
+                if (m_perf_enabled)
+                {
+                    m_perf_tess_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+                }
+                if (ok)
+                {
+                    upload_verts = m_subdiv_verts.data();
+                    upload_vcount = m_subdiv_verts.size();
+                    upload_indices = m_subdiv_indices.data();
+                    upload_icount = m_subdiv_indices.size();
+                }
+            }
+            else if (can_smooth_mesh)
+            {
+                const auto t0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const bool ok = ApplySmartAdaptiveTessellation(diffuse_tex);
+                if (m_perf_enabled)
+                {
+                    m_perf_tess_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+                }
+                if (ok)
+                {
+                    upload_verts = m_subdiv_verts.data();
+                    upload_vcount = m_subdiv_verts.size();
+                    upload_indices = m_subdiv_indices.data();
+                    upload_icount = m_subdiv_indices.size();
+                }
+            }
+
+            if (m_perf_enabled)
+            {
+                ++m_perf_static_misses;
+            }
+
+            if (m_static_gpu_cache.size() >= 2048u)
+            {
+                EvictStaticGpuCacheLru(256u);
+            }
+
+            const uint32_t gpu_vb = zhr_vk_create_vertex_buffer(upload_verts, upload_vcount);
+            const uint32_t gpu_ib = zhr_vk_create_index_buffer(upload_indices, upload_icount);
+            if (gpu_vb != 0u && gpu_ib != 0u)
+            {
+                CachedGpuMesh cached{};
+                cached.gpu_vb = gpu_vb;
+                cached.gpu_ib = gpu_ib;
+                cached.index_count = static_cast<uint32_t>(upload_icount);
+                cached.last_used_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
+                m_static_gpu_cache.emplace(*static_key, cached);
+                zhr_vk_draw_indexed(gpu_vb, gpu_ib, cached.index_count, 0u, 0);
+                return D3D_OK;
+            }
+            if (gpu_vb != 0u) zhr_vk_destroy_buffer(gpu_vb);
+            if (gpu_ib != 0u) zhr_vk_destroy_buffer(gpu_ib);
+
+            zhr_vk_draw_dynamic(upload_verts, upload_vcount, upload_indices, upload_icount);
+            return D3D_OK;
+        }
+
+        if (m_perf_enabled)
+        {
+            ++m_perf_dynamic_draws;
+        }
+
+        // Dynamic terrain draws (3-way extra blend tiles, roads, or momentarily muzzle-lit tiles):
+        // keep a dedicated small LRU cache so they stay crack-free without ever evicting static GPU buffers.
         if (can_smooth_terrain)
         {
             const TessCacheKey cache_key = ComputeTessCacheKey(diffuse_tex, true);
             auto cache_it = m_tess_cache.find(cache_key);
             if (cache_it != m_tess_cache.end())
             {
+                cache_it->second.last_used_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
                 zhr_vk_draw_dynamic(
                     cache_it->second.verts.data(),
                     cache_it->second.verts.size(),
@@ -2640,15 +2946,23 @@ private:
                 return D3D_OK;
             }
 
-            if (ApplySmartTerrainTessellation())
+            const auto t0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool ok = ApplySmartTerrainTessellation();
+            if (m_perf_enabled)
             {
-                if (m_tess_cache.size() >= 1024u)
+                m_perf_tess_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            }
+            if (ok)
+            {
+                if (m_tess_cache.size() >= 256u)
                 {
-                    m_tess_cache.clear();
+                    EvictDynamicTessCacheLru(64u);
                 }
                 CachedTessMesh entry;
                 entry.verts = m_subdiv_verts;
                 entry.indices = m_subdiv_indices;
+                entry.last_used_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
                 auto inserted = m_tess_cache.emplace(cache_key, std::move(entry));
                 zhr_vk_draw_dynamic(
                     inserted.first->second.verts.data(),
@@ -2665,6 +2979,7 @@ private:
             auto cache_it = m_tess_cache.find(cache_key);
             if (cache_it != m_tess_cache.end())
             {
+                cache_it->second.last_used_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
                 zhr_vk_draw_dynamic(
                     cache_it->second.verts.data(),
                     cache_it->second.verts.size(),
@@ -2673,15 +2988,23 @@ private:
                 return D3D_OK;
             }
 
-            if (ApplySmartAdaptiveTessellation(diffuse_tex))
+            const auto t0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool ok = ApplySmartAdaptiveTessellation(diffuse_tex);
+            if (m_perf_enabled)
             {
-                if (m_tess_cache.size() >= 1024u)
+                m_perf_tess_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            }
+            if (ok)
+            {
+                if (m_tess_cache.size() >= 256u)
                 {
-                    m_tess_cache.clear();
+                    EvictDynamicTessCacheLru(64u);
                 }
                 CachedTessMesh entry;
                 entry.verts = m_subdiv_verts;
                 entry.indices = m_subdiv_indices;
+                entry.last_used_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
                 auto inserted = m_tess_cache.emplace(cache_key, std::move(entry));
                 zhr_vk_draw_dynamic(
                     inserted.first->second.verts.data(),
@@ -2742,8 +3065,12 @@ private:
         m_subdiv_indices = m_scratch_indices;
 
         // Per-vertex elevation bias above linear terrain (0.0 for base/blend/shroud, ~+0.15 for roads).
+        // Also track whether any vertex has non-flat curvature/slope so 100% flat buildable plains
+        // exit immediately with zero Red-Green subdivision overhead.
         std::vector<float> v_bias(in_verts, 0.0f);
         v_bias.reserve(in_verts * 3);
+        bool any_non_flat = false;
+        float first_z = 0.0f;
         for (size_t i = 0; i < in_verts; ++i)
         {
             ZhrVertexWw3d& v = m_subdiv_verts[i];
@@ -2756,6 +3083,23 @@ private:
             float smooth_z = v.position[2];
             SampleTerrainSmooth(hm, v.position[0], v.position[1], smooth_z, v.normal);
             v.position[2] = smooth_z + bias;
+            if (i == 0)
+            {
+                first_z = smooth_z;
+            }
+            else if (std::fabs(smooth_z - first_z) > 0.01f)
+            {
+                any_non_flat = true;
+            }
+            if (v.normal[2] < 0.9995f)
+            {
+                any_non_flat = true;
+            }
+        }
+
+        if (!any_non_flat)
+        {
+            return true;
         }
 
         auto run_red_green_pass = [&](float min_dist_sq, float curv_thresh, float norm_thresh, float slope_thresh) {
@@ -2766,10 +3110,22 @@ private:
             }
             std::vector<uint16_t> out_indices;
             out_indices.reserve(m_subdiv_indices.size() * 2);
-            m_edge_midpoints.clear();
-            m_edge_midpoints.reserve(cur_tris);
+            m_terrain_edge_state.clear();
+            m_terrain_edge_state.reserve(cur_tris * 2);
 
-            auto should_split = [&](uint16_t ia, uint16_t ib) -> bool {
+            // Unified single-evaluation edge test + midpoint cache:
+            // - Every edge is tested AT MOST ONCE (even when shared by 2 triangles).
+            // - SampleTerrainSmooth() is evaluated AT MOST ONCE per edge (reused directly for the midpoint).
+            // Returns midpoint vertex index >= 0 if split, or -1 if edge stays unsplit.
+            auto eval_edge = [&](uint16_t ia, uint16_t ib) -> int32_t {
+                const uint32_t lo = ia < ib ? ia : ib;
+                const uint32_t hi = ia < ib ? ib : ia;
+                const uint32_t key = (lo << 16) | hi;
+                auto it = m_terrain_edge_state.find(key);
+                if (it != m_terrain_edge_state.end())
+                {
+                    return it->second;
+                }
                 const ZhrVertexWw3d& va = m_subdiv_verts[ia];
                 const ZhrVertexWw3d& vb = m_subdiv_verts[ib];
                 const float dx = vb.position[0] - va.position[0];
@@ -2777,58 +3133,52 @@ private:
                 const float dist_sq = dx * dx + dy * dy;
                 if (dist_sq < min_dist_sq || dist_sq > 2500.0f)
                 {
-                    return false;
+                    m_terrain_edge_state.emplace(key, -1);
+                    return -1;
                 }
-                // Symmetric global world-space edge test -> guaranteed identical decision across every tile & overlay!
                 const float za = va.position[2] - v_bias[ia];
                 const float zb = vb.position[2] - v_bias[ib];
-                if (std::fabs(za - zb) > slope_thresh)
+                bool split = std::fabs(za - zb) > slope_thresh;
+                if (!split)
                 {
-                    return true;
-                }
-                const float dot_n = va.normal[0] * vb.normal[0] +
-                                    va.normal[1] * vb.normal[1] +
-                                    va.normal[2] * vb.normal[2];
-                if (1.0f - dot_n > norm_thresh)
-                {
-                    return true;
+                    const float dot_n = va.normal[0] * vb.normal[0] +
+                                        va.normal[1] * vb.normal[1] +
+                                        va.normal[2] * vb.normal[2];
+                    split = (1.0f - dot_n) > norm_thresh;
                 }
                 const float mx = 0.5f * (va.position[0] + vb.position[0]);
                 const float my = 0.5f * (va.position[1] + vb.position[1]);
                 float zm = 0.0f;
                 float nm[3];
                 SampleTerrainSmooth(hm, mx, my, zm, nm);
-                return std::fabs(zm - 0.5f * (za + zb)) > curv_thresh;
-            };
-
-            auto get_mid = [&](uint16_t ia, uint16_t ib) -> uint16_t {
-                const uint32_t lo = ia < ib ? ia : ib;
-                const uint32_t hi = ia < ib ? ib : ia;
-                const uint32_t key = (lo << 16) | hi;
-                auto it = m_edge_midpoints.find(key);
-                if (it != m_edge_midpoints.end())
+                if (!split)
                 {
-                    return it->second;
+                    split = std::fabs(zm - 0.5f * (za + zb)) > curv_thresh;
                 }
-                const ZhrVertexWw3d& va = m_subdiv_verts[ia];
-                const ZhrVertexWw3d& vb = m_subdiv_verts[ib];
+                if (!split || m_subdiv_verts.size() >= 62000)
+                {
+                    m_terrain_edge_state.emplace(key, -1);
+                    return -1;
+                }
+
                 ZhrVertexWw3d mid{};
-                mid.position[0] = 0.5f * (va.position[0] + vb.position[0]);
-                mid.position[1] = 0.5f * (va.position[1] + vb.position[1]);
+                mid.position[0] = mx;
+                mid.position[1] = my;
                 const float mid_bias = 0.5f * (v_bias[ia] + v_bias[ib]);
-                float smooth_z = 0.0f;
-                SampleTerrainSmooth(hm, mid.position[0], mid.position[1], smooth_z, mid.normal);
-                mid.position[2] = smooth_z + mid_bias;
+                mid.position[2] = zm + mid_bias;
+                mid.normal[0] = nm[0];
+                mid.normal[1] = nm[1];
+                mid.normal[2] = nm[2];
                 for (int c = 0; c < 4; ++c) mid.color[c] = 0.5f * (va.color[c] + vb.color[c]);
                 mid.uv0[0] = 0.5f * (va.uv0[0] + vb.uv0[0]);
                 mid.uv0[1] = 0.5f * (va.uv0[1] + vb.uv0[1]);
                 mid.uv1[0] = 0.5f * (va.uv1[0] + vb.uv1[0]);
                 mid.uv1[1] = 0.5f * (va.uv1[1] + vb.uv1[1]);
 
-                const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
+                const int32_t new_idx = static_cast<int32_t>(m_subdiv_verts.size());
                 m_subdiv_verts.push_back(mid);
                 v_bias.push_back(mid_bias);
-                m_edge_midpoints.emplace(key, new_idx);
+                m_terrain_edge_state.emplace(key, new_idx);
                 return new_idx;
             };
 
@@ -2841,20 +3191,20 @@ private:
                 {
                     continue;
                 }
-                const bool s01 = should_split(i0, i1);
-                const bool s12 = should_split(i1, i2);
-                const bool s20 = should_split(i2, i0);
-                const int mask = (s01 ? 1 : 0) | (s12 ? 2 : 0) | (s20 ? 4 : 0);
+                const int32_t e01 = eval_edge(i0, i1);
+                const int32_t e12 = eval_edge(i1, i2);
+                const int32_t e20 = eval_edge(i2, i0);
+                const int mask = (e01 >= 0 ? 1 : 0) | (e12 >= 0 ? 2 : 0) | (e20 >= 0 ? 4 : 0);
 
-                if (mask == 0 || m_subdiv_verts.size() + 3 >= 62000)
+                if (mask == 0)
                 {
                     out_indices.push_back(i0); out_indices.push_back(i1); out_indices.push_back(i2);
                 }
                 else if (mask == 7)
                 {
-                    const uint16_t m01 = get_mid(i0, i1);
-                    const uint16_t m12 = get_mid(i1, i2);
-                    const uint16_t m20 = get_mid(i2, i0);
+                    const uint16_t m01 = static_cast<uint16_t>(e01);
+                    const uint16_t m12 = static_cast<uint16_t>(e12);
+                    const uint16_t m20 = static_cast<uint16_t>(e20);
                     out_indices.push_back(i0);  out_indices.push_back(m01); out_indices.push_back(m20);
                     out_indices.push_back(m01); out_indices.push_back(i1);  out_indices.push_back(m12);
                     out_indices.push_back(m20); out_indices.push_back(m12); out_indices.push_back(i2);
@@ -2863,19 +3213,19 @@ private:
                 else if (mask == 1 || mask == 2 || mask == 4)
                 {
                     uint16_t a = i0, b = i1, c = i2;
-                    if (mask == 2) { a = i1; b = i2; c = i0; }
-                    else if (mask == 4) { a = i2; b = i0; c = i1; }
-                    const uint16_t mab = get_mid(a, b);
+                    uint16_t mab = static_cast<uint16_t>(e01);
+                    if (mask == 2) { a = i1; b = i2; c = i0; mab = static_cast<uint16_t>(e12); }
+                    else if (mask == 4) { a = i2; b = i0; c = i1; mab = static_cast<uint16_t>(e20); }
                     out_indices.push_back(a);   out_indices.push_back(mab); out_indices.push_back(c);
                     out_indices.push_back(mab); out_indices.push_back(b);   out_indices.push_back(c);
                 }
                 else
                 {
                     uint16_t a = i0, b = i1, c = i2;
-                    if (mask == 3) { a = i1; b = i2; c = i0; }
-                    else if (mask == 6) { a = i2; b = i0; c = i1; }
-                    const uint16_t mab = get_mid(a, b);
-                    const uint16_t mca = get_mid(c, a);
+                    uint16_t mab = static_cast<uint16_t>(e01);
+                    uint16_t mca = static_cast<uint16_t>(e20);
+                    if (mask == 3) { a = i1; b = i2; c = i0; mab = static_cast<uint16_t>(e12); mca = static_cast<uint16_t>(e01); }
+                    else if (mask == 6) { a = i2; b = i0; c = i1; mab = static_cast<uint16_t>(e20); mca = static_cast<uint16_t>(e12); }
                     out_indices.push_back(a);   out_indices.push_back(mab); out_indices.push_back(mca);
                     out_indices.push_back(mab); out_indices.push_back(b);   out_indices.push_back(c);
                     out_indices.push_back(mab); out_indices.push_back(c);   out_indices.push_back(mca);
@@ -3872,6 +4222,103 @@ private:
     IDirect3DSurface8* m_current_rt{nullptr};
     IDirect3DSurface8* m_current_depth{nullptr};
 
+    void ClearStaticGpuCache()
+    {
+        for (const auto& kv : m_static_gpu_cache)
+        {
+            if (kv.second.gpu_vb != 0u) zhr_vk_destroy_buffer(kv.second.gpu_vb);
+            if (kv.second.gpu_ib != 0u) zhr_vk_destroy_buffer(kv.second.gpu_ib);
+        }
+        m_static_gpu_cache.clear();
+        m_tess_cache.clear();
+    }
+
+    void EvictStaticGpuCacheLru(size_t count)
+    {
+        if (m_static_gpu_cache.empty()) return;
+        std::vector<std::pair<uint64_t, StaticDrawKey>> order;
+        order.reserve(m_static_gpu_cache.size());
+        for (const auto& kv : m_static_gpu_cache)
+        {
+            order.emplace_back(kv.second.last_used_frame, kv.first);
+        }
+        const size_t n = std::min(count, order.size());
+        std::nth_element(
+            order.begin(),
+            order.begin() + static_cast<ptrdiff_t>(n),
+            order.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < n; ++i)
+        {
+            auto it = m_static_gpu_cache.find(order[i].second);
+            if (it != m_static_gpu_cache.end())
+            {
+                if (it->second.gpu_vb != 0u) zhr_vk_destroy_buffer(it->second.gpu_vb);
+                if (it->second.gpu_ib != 0u) zhr_vk_destroy_buffer(it->second.gpu_ib);
+                m_static_gpu_cache.erase(it);
+            }
+        }
+    }
+
+    void EvictDynamicTessCacheLru(size_t count)
+    {
+        if (m_tess_cache.empty()) return;
+        std::vector<std::pair<uint64_t, TessCacheKey>> order;
+        order.reserve(m_tess_cache.size());
+        for (const auto& kv : m_tess_cache)
+        {
+            order.emplace_back(kv.second.last_used_frame, kv.first);
+        }
+        const size_t n = std::min(count, order.size());
+        std::nth_element(
+            order.begin(),
+            order.begin() + static_cast<ptrdiff_t>(n),
+            order.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < n; ++i)
+        {
+            m_tess_cache.erase(order[i].second);
+        }
+    }
+
+    void FlushPerfLog()
+    {
+        if (!m_perf_enabled || m_perf_frames == 0u) return;
+        const double inv_f = 1.0 / static_cast<double>(m_perf_frames);
+        const double avg_frame_ms = (static_cast<double>(m_perf_frame_ns) * 1e-6) * inv_f;
+        const double avg_submit_ms = (static_cast<double>(m_perf_submit_ns) * 1e-6) * inv_f;
+        const double avg_tess_ms = (static_cast<double>(m_perf_tess_ns) * 1e-6) * inv_f;
+        const double avg_present_ms = (static_cast<double>(m_perf_present_ns) * 1e-6) * inv_f;
+        const double fps = avg_frame_ms > 0.001 ? (1000.0 / avg_frame_ms) : 0.0;
+        if (FILE* f = std::fopen(m_perf_log_path, "a"))
+        {
+            std::fprintf(
+                f,
+                "res=%ux%u frames=%llu fps=%.1f frame_ms=%.2f submit_ms=%.2f tess_ms=%.2f present_ms=%.2f static_hits=%.1f/f static_misses=%llu dyn_draws=%.1f/f cache=%zu\n",
+                m_width,
+                m_height,
+                static_cast<unsigned long long>(m_perf_frames),
+                fps,
+                avg_frame_ms,
+                avg_submit_ms,
+                avg_tess_ms,
+                avg_present_ms,
+                static_cast<double>(m_perf_static_hits) * inv_f,
+                static_cast<unsigned long long>(m_perf_static_misses),
+                static_cast<double>(m_perf_dynamic_draws) * inv_f,
+                m_static_gpu_cache.size());
+            std::fclose(f);
+        }
+        m_perf_frames = 0u;
+        m_perf_frame_ns = 0u;
+        m_perf_submit_ns = 0u;
+        m_perf_tess_ns = 0u;
+        m_perf_present_ns = 0u;
+        m_perf_static_hits = 0u;
+        m_perf_static_misses = 0u;
+        m_perf_dynamic_draws = 0u;
+    }
+
     struct TessCacheKey
     {
         uint64_t hash_a{0};
@@ -3900,10 +4347,10 @@ private:
     {
         std::vector<ZhrVertexWw3d> verts;
         std::vector<uint16_t> indices;
+        uint64_t last_used_frame{0};
     };
 
-    // Fast 128-bit content hash over object-space vertices & indices (~1.5us per draw) so static
-    // .W3D meshes & terrain tiles are tessellated + heightmap-displaced ONCE and replayed at 0ms/frame.
+    // Fast 128-bit content hash over object-space vertices & indices (~1.5us per draw) for dynamic terrain overlays.
     TessCacheKey ComputeTessCacheKey(ZhrVkTexture8* diffuse_tex, bool is_terrain = false) const
     {
         TessCacheKey k{};
@@ -3948,7 +4395,22 @@ private:
     std::vector<ZhrVertexWw3d> m_subdiv_verts;
     std::vector<uint16_t> m_subdiv_indices;
     std::unordered_map<uint32_t, uint16_t> m_edge_midpoints;
+    std::unordered_map<uint32_t, int32_t> m_terrain_edge_state;
+    std::unordered_map<StaticDrawKey, CachedGpuMesh, StaticDrawKeyHash> m_static_gpu_cache;
     std::unordered_map<TessCacheKey, CachedTessMesh, TessCacheKeyHash> m_tess_cache;
+
+    bool m_perf_enabled{false};
+    bool m_perf_has_prev_frame{false};
+    char m_perf_log_path[512]{};
+    std::chrono::steady_clock::time_point m_perf_prev_frame{};
+    uint64_t m_perf_frames{0};
+    uint64_t m_perf_frame_ns{0};
+    uint64_t m_perf_submit_ns{0};
+    uint64_t m_perf_tess_ns{0};
+    uint64_t m_perf_present_ns{0};
+    uint64_t m_perf_static_hits{0};
+    uint64_t m_perf_static_misses{0};
+    uint64_t m_perf_dynamic_draws{0};
 };
 
 HRESULT STDMETHODCALLTYPE ZhrVkSurface8::GetDevice(IDirect3DDevice8** ppDevice)

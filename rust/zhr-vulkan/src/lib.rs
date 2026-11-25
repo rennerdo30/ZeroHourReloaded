@@ -82,6 +82,7 @@ struct FrameSlot {
     dynamic_vb: DynamicRingBuffer,
     dynamic_ib: DynamicRingBuffer,
     retired_textures: Vec<GpuTexture>,
+    retired_buffers: Vec<GpuBuffer>,
 }
 
 struct ActiveFrame {
@@ -141,6 +142,7 @@ pub struct VulkanRenderer {
     // WW3D2-compatible render state
     uniforms: DrawUniforms,
     view_matrix: Mat4,
+    cached_cam_pos: Vec3,
     proj_matrix: Mat4,
     graphics: GraphicsSettings,
     material_hint: u32,
@@ -291,6 +293,7 @@ impl VulkanRenderer {
                 dynamic_vb,
                 dynamic_ib,
                 retired_textures: Vec::new(),
+                retired_buffers: Vec::new(),
             });
         }
 
@@ -385,6 +388,7 @@ impl VulkanRenderer {
             default_white_texture,
             uniforms: DrawUniforms::default(),
             view_matrix: Mat4::IDENTITY,
+            cached_cam_pos: Vec3::new(0.0, 0.0, 100.0),
             proj_matrix: Mat4::IDENTITY,
             graphics,
             material_hint: 0,
@@ -526,8 +530,48 @@ impl VulkanRenderer {
         Ok(id)
     }
 
+    /// Creates a persistent GPU vertex buffer directly in host-visible/ReBAR VRAM (zero `submit_immediate` stall).
+    pub fn create_vertex_buffer_cached(&mut self, vertices: &[VertexWw3d]) -> Result<BufferId> {
+        let bytes = bytemuck::cast_slice(vertices);
+        let id = BufferId(self.next_buffer_id);
+        self.next_buffer_id += 1;
+        let mut buf = GpuBuffer::new(
+            &mut self.ctx,
+            &format!("zhr_cvb_{}", id.0),
+            bytes.len() as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        )?;
+        buf.write_bytes(0, bytes)?;
+        self.buffers.insert(id, buf);
+        Ok(id)
+    }
+
+    /// Creates a persistent GPU 16-bit index buffer directly in host-visible/ReBAR VRAM (zero `submit_immediate` stall).
+    pub fn create_index_buffer_u16_cached(&mut self, indices: &[u16]) -> Result<BufferId> {
+        let bytes = bytemuck::cast_slice(indices);
+        let id = BufferId(self.next_buffer_id);
+        self.next_buffer_id += 1;
+        let mut buf = GpuBuffer::new(
+            &mut self.ctx,
+            &format!("zhr_cib_{}", id.0),
+            bytes.len() as u64,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        )?;
+        buf.write_bytes(0, bytes)?;
+        self.buffers.insert(id, buf);
+        Ok(id)
+    }
+
     pub fn destroy_buffer(&mut self, id: BufferId) -> Result<()> {
-        // SAFETY: Ensure GPU work referencing this buffer has completed.
+        if let Some(af) = &self.active_frame {
+            if let Some(buf) = self.buffers.remove(&id) {
+                self.frames[af.slot_index].retired_buffers.push(buf);
+            }
+            return Ok(());
+        }
+        // SAFETY: Outside an active frame, ensure GPU work referencing this buffer has completed.
         unsafe { self.ctx.device.device_wait_idle()? };
         if let Some(buf) = self.buffers.remove(&id) {
             buf.destroy(&mut self.ctx);
@@ -713,6 +757,11 @@ impl VulkanRenderer {
 
     pub fn set_view(&mut self, m: Mat4) {
         self.view_matrix = m;
+        self.cached_cam_pos = if m.determinant().abs() > 1e-6 {
+            m.inverse().w_axis.truncate()
+        } else {
+            Vec3::new(0.0, 0.0, 100.0)
+        };
         self.uniforms.set_view(m);
     }
 
@@ -731,6 +780,7 @@ impl VulkanRenderer {
 
     pub fn set_view_identity(&mut self) {
         self.view_matrix = Mat4::IDENTITY;
+        self.cached_cam_pos = Vec3::new(0.0, 0.0, 100.0);
         self.uniforms.set_view(Mat4::IDENTITY);
     }
 
@@ -807,6 +857,26 @@ impl VulkanRenderer {
         match stage {
             0 => self.uniforms.stage0_ops = ops,
             1 => self.uniforms.stage1_ops = ops,
+            _ => {}
+        }
+    }
+
+    pub fn set_tex_gen(&mut self, stage: u32, mode: u32, src_idx: u32, matrix: Option<Mat4>) {
+        match stage {
+            0 => {
+                self.uniforms.tex_gen_params[0] = mode;
+                self.uniforms.tex_gen_params[1] = src_idx;
+                if let Some(m) = matrix {
+                    self.uniforms.tex_matrix0 = m.to_cols_array_2d();
+                }
+            }
+            1 => {
+                self.uniforms.tex_gen_params[2] = mode;
+                self.uniforms.tex_gen_params[3] = src_idx;
+                if let Some(m) = matrix {
+                    self.uniforms.tex_matrix1 = m.to_cols_array_2d();
+                }
+            }
             _ => {}
         }
     }
@@ -896,7 +966,11 @@ impl VulkanRenderer {
         slot.dynamic_vb.reset();
         slot.dynamic_ib.reset();
         let retired: Vec<GpuTexture> = std::mem::take(&mut slot.retired_textures);
+        let retired_bufs: Vec<GpuBuffer> = std::mem::take(&mut slot.retired_buffers);
         let cmd = slot.cmd;
+        for buf in retired_bufs {
+            buf.destroy(&mut self.ctx);
+        }
         for tex in retired {
             let ds = tex.descriptor_set;
             tex.destroy(&mut self.ctx);
@@ -1338,11 +1412,7 @@ impl VulkanRenderer {
         } else {
             1.0
         };
-        let cam_pos = if self.view_matrix.determinant().abs() > 1e-6 {
-            self.view_matrix.inverse().w_axis.truncate()
-        } else {
-            Vec3::new(0.0, 0.0, 100.0)
-        };
+        let cam_pos = self.cached_cam_pos;
         draw_uniforms.camera_pos_and_pbr = [cam_pos.x, cam_pos.y, cam_pos.z, pbr_mode];
 
         let is_additive = self.shader.dst_blend() == DstBlend::One
@@ -1928,6 +1998,9 @@ impl Drop for VulkanRenderer {
         for frame in self.frames.drain(..) {
             for tex in frame.retired_textures {
                 tex.destroy(&mut self.ctx);
+            }
+            for buf in frame.retired_buffers {
+                buf.destroy(&mut self.ctx);
             }
             frame.uniform_ring.destroy(&mut self.ctx);
             frame.dynamic_vb.destroy(&mut self.ctx);

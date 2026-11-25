@@ -7,8 +7,8 @@ use glam::{Mat4, Vec3};
 use zhr_audio::{AudioEngine, VoiceKind};
 use zhr_vulkan::shader::{DepthCompare, ShaderKey, StencilOp, StencilState};
 use zhr_vulkan::types::{
-    ClearState, FogState, GpuLight, GraphicsMode, GraphicsSettings, SamplerDesc, TextureFormat,
-    TextureId, VertexWw3d, Viewport,
+    BufferId, ClearState, FogState, GpuLight, GraphicsMode, GraphicsSettings, SamplerDesc,
+    TextureFormat, TextureId, VertexWw3d, Viewport,
 };
 use zhr_vulkan::{RendererConfig, VulkanRenderer};
 
@@ -842,6 +842,116 @@ pub extern "C" fn zhr_vk_set_stage_state(
     if let Some(ren) = guard.renderer.as_mut() {
         ren.set_stage_state(stage, color_op, color_args, alpha_op, alpha_args);
     }
+}
+
+/// Configures GPU vertex-shader UV generation & texture transform for `stage` (0 or 1).
+///
+/// # Safety
+/// If `matrix16` is non-null, it must point to at least 16 readable `f32` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_vk_set_tex_gen(
+    stage: u32,
+    mode: u32,
+    src_idx: u32,
+    matrix16: *const f32,
+) {
+    let mat = if matrix16.is_null() {
+        None
+    } else {
+        // SAFETY: Caller guarantees `matrix16` points to 16 contiguous f32s when non-null.
+        let slice = unsafe { std::slice::from_raw_parts(matrix16, 16) };
+        Some(Mat4::from_cols_slice(slice))
+    };
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_tex_gen(stage, mode, src_idx, mat);
+    }
+}
+
+/// Creates a persistent GPU vertex buffer (zero-stall ReBAR/host-visible upload) and returns its ID (0 on failure).
+///
+/// # Safety
+/// `vertices` must point to `vertex_count` valid elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_vk_create_vertex_buffer(
+    vertices: *const VertexWw3d,
+    vertex_count: usize,
+) -> u32 {
+    if vertices.is_null() || vertex_count == 0 {
+        return 0;
+    }
+    // SAFETY: Caller guarantees valid slice.
+    let verts = unsafe { std::slice::from_raw_parts(vertices, vertex_count) };
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    let Some(ren) = guard.renderer.as_mut() else {
+        return 0;
+    };
+    ren.create_vertex_buffer_cached(verts)
+        .map(|id| id.0)
+        .unwrap_or(0)
+}
+
+/// Creates a persistent GPU 16-bit index buffer (zero-stall ReBAR/host-visible upload) and returns its ID (0 on failure).
+///
+/// # Safety
+/// `indices` must point to `index_count` valid elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_vk_create_index_buffer(
+    indices: *const u16,
+    index_count: usize,
+) -> u32 {
+    if indices.is_null() || index_count == 0 {
+        return 0;
+    }
+    // SAFETY: Caller guarantees valid slice.
+    let inds = unsafe { std::slice::from_raw_parts(indices, index_count) };
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    let Some(ren) = guard.renderer.as_mut() else {
+        return 0;
+    };
+    ren.create_index_buffer_u16_cached(inds)
+        .map(|id| id.0)
+        .unwrap_or(0)
+}
+
+/// Schedules deferred GPU buffer destruction (zero pipeline stalls when called mid-frame).
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_destroy_buffer(buffer_id: u32) {
+    if buffer_id == 0 {
+        return;
+    }
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        let _ = ren.destroy_buffer(BufferId(buffer_id));
+    }
+}
+
+/// Draws indexed triangles directly from persistent GPU vertex and index buffers.
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_draw_indexed(
+    vb_id: u32,
+    ib_id: u32,
+    index_count: u32,
+    first_index: u32,
+    vertex_offset: i32,
+) -> i32 {
+    if vb_id == 0 || ib_id == 0 || index_count == 0 {
+        return 0;
+    }
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    let Some(ren) = guard.renderer.as_mut() else {
+        return 0;
+    };
+    i32::from(
+        ren.draw_indexed(
+            BufferId(vb_id),
+            BufferId(ib_id),
+            index_count,
+            first_index,
+            vertex_offset,
+        )
+        .is_ok(),
+    )
 }
 
 /// Submits transient indexed vertices directly through the dynamic ring buffer.
