@@ -49,6 +49,7 @@ set(GAMEENGINEDEVICE_SRC
     Include/W3DDevice/GameClient/W3DGameWindow.h
     Include/W3DDevice/GameClient/W3DGameWindowManager.h
     Include/W3DDevice/GameClient/W3DGUICallbacks.h
+    Include/W3DDevice/GameClient/ZhrMenuStyle.h
 #    Include/W3DDevice/GameClient/W3DInGameUI.h
 #    Include/W3DDevice/GameClient/W3DMirror.h
     Include/W3DDevice/GameClient/W3DMouse.h
@@ -133,6 +134,7 @@ set(GAMEENGINEDEVICE_SRC
     Source/W3DDevice/GameClient/GUI/W3DGameFont.cpp
     Source/W3DDevice/GameClient/GUI/W3DGameWindow.cpp
     Source/W3DDevice/GameClient/GUI/W3DGameWindowManager.cpp
+    Source/W3DDevice/GameClient/GUI/ZhrMenuStyle.cpp
     Source/W3DDevice/GameClient/HeightMap.cpp
 #    Source/W3DDevice/GameClient/Shadow/W3DBufferManager.cpp
 #    Source/W3DDevice/GameClient/Shadow/W3DProjectedShadow.cpp
@@ -216,6 +218,9 @@ target_link_libraries(corei_gameenginedevice_private INTERFACE
 
 if(ZHR_BUILD_RUST)
     target_include_directories(corei_gameenginedevice_private INTERFACE "${CMAKE_SOURCE_DIR}/rust/zhr-ffi/include")
+    if(ZHR_USE_VULKAN)
+        target_compile_definitions(corei_gameenginedevice_private INTERFACE ZHR_VULKAN_BACKEND)
+    endif()
 endif()
 
 target_link_libraries(corei_gameenginedevice_public INTERFACE

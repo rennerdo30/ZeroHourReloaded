@@ -106,7 +106,7 @@ public:
 
 	int Get_Extra_Overlap() {return PixelOverlap;}
 
-	void	Blit_Char( WCHAR ch, uint16 *dest_ptr, int dest_stride, int x, int y );
+	void	Blit_Char( WCHAR ch, uint32 *dest_ptr, int dest_stride, int x, int y );
 
 	void	Free_Glyph_Cache();
 
@@ -281,7 +281,7 @@ private:
 	bool												ParseHotKey;
 	bool												useHardWordWrap;
 
-	uint16 *										LockedPtr;
+	uint32 *										LockedPtr;
 	int													LockedStride;
 	TextureClass *							CurTexture;
 	ShaderClass									Shader;

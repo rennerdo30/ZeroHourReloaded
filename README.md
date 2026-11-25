@@ -63,7 +63,23 @@ Legacy 32-bit `binkw32.dll` and `mss32.dll` cannot load in a 64-bit process. Zer
 
 ---
 
-### 5. Native Cross-Platform SDL3 Window & Input (`rust/zhr-platform`)
+### 5. Modern Frosted-Glass Main Menu, Shell UI & 8-Bit HD Typography (`F9`)
+Replaces the stretched 2003 full-screen blue grid border, blurry bitmap button frames, and 4-bit quantized (`A4R4G4B4`) fonts with a crisp, resolution-independent tactical UI — **live-toggleable via `F9`**:
+- **Real-Time Vulkan 1.3 Frosted Glass:** Quarter-resolution separable Gaussian blur of the live 3D shell battle (or 2D `-quickstart` backdrop) sampled directly behind menu panels (`PostProcessPipeline::capture_ui_backdrop` + `WW3D2_UBER_WGSL`).
+- **Crisp Tactical Buttons & Clean Widescreen Framing (`ZhrMenuStyle`):** Soft cinematic edge vignettes, minimal perimeter brackets, dark-slate translucent gradient buttons with luminous cyan/gold/crimson accent rails, and a live bottom-left engine/hotkey status pill.
+- **Full 8-Bit Antialiased HD Fonts (`render2dsentence.cpp`):** Upgraded glyph atlases from 4-bit `A4R4G4B4` (16 alpha levels) to full 8-bit `A8R8G8B8` (256 alpha levels) with modern `Segoe UI Semibold` proportions — preserving 100% of original hitboxes, transitions, sub-menus, and in-game HUD cameos.
+
+![Live 50/50 Split-Screen Main Menu — Classic 2003 (Left) vs. Modern Frosted-Glass UI (Right)](docs/screenshots/ab_menu_split.png)
+
+| Classic 2003 Main Menu | ZeroHourReloaded Modern Main Menu |
+| :---: | :---: |
+| ![Classic 2003 Main Menu](docs/screenshots/a_menu_classic.png) | ![ZeroHourReloaded Modern Main Menu](docs/screenshots/b_menu_remastered.png) |
+| ![Classic Menu Buttons](docs/screenshots/a_menu_buttons_classic.png) | ![Modern Frosted-Glass Buttons & 8-Bit Fonts](docs/screenshots/b_menu_buttons_remastered.png) |
+| *Stretched blue grid ruler, blurry bitmap outlines, flat opaque boxes* | *Clean widescreen framing, real-time Vulkan frosted glass, tactical accent rails, 8-bit antialiased HD typography, live status pill* |
+
+---
+
+### 6. Native Cross-Platform SDL3 Window & Input (`rust/zhr-platform`)
 Replaces legacy Win32 `CreateWindow`/`WndProc` boilerplate and `DirectInput8` (`dinput8.dll`) with **SDL3 3.4.20** (`Core/GameEngineDevice/Source/SDLDevice/`) backed by a Rust USB HID `SDL_Scancode` → Zero Hour `KeyDefType` mapping crate (`rust/zhr-platform`):
 - Resizable Vulkan-ready SDL3 window with automatic swapchain sizing (`-xres`/`-yres` respected immediately).
 - Full RTS keyboard & hotkey support (control groups, camera controls, modifiers, `F7`–`F11` remaster toggles) with zero `DirectInput8` dependency.
@@ -81,6 +97,7 @@ Replaces legacy Win32 `CreateWindow`/`WndProc` boilerplate and `DirectInput8` (`
 | Bink Video (`binkw32.dll`) | `FFmpegVideoPlayer` + `FFmpegFile` (FFmpeg 8.1 LGPL) + `zhr-audio` `VideoAudioQueue` | **Working** |
 | Win32 Window + `DirectInput8` | SDL3 3.4.20 (`SDL3Platform` + `SDL3Keyboard`) + `rust/zhr-platform` | **Working** |
 | 2003 Low-Res Visuals | PBR/GGX/IBL, Animated Water, Volumetric Stencil Shadows, Bilateral SSAO, HDR Bloom/ACES/CAS, Phong `.W3D` Smoothing (`F7`), Async 2× `zhr-remaster` (`F8`) | **Working** |
+| 2003 Stretched Menu UI & 4-bit Fonts | Real-time Vulkan frosted-glass backdrop (`PostProcessPipeline`), `ZhrMenuStyle` tactical panels/buttons, full 8-bit `A8R8G8B8` HD typography (`F9` toggleable) | **Working** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for deeper technical details on the hybrid C++20/Rust FFI architecture and local asset remastering pipeline.
 

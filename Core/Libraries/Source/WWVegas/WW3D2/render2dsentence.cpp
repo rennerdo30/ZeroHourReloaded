@@ -351,9 +351,9 @@ Render2DSentenceClass::Build_Textures ()
 		curr_surface->Get_Description (desc);
 
 		//
-		//	Create the new texture
+		//	Create the new texture (full 8-bit alpha for crisp HD/4K antialiased typography)
 		//
-		TextureClass *new_texture = W3DNEW TextureClass (desc.Width, desc.Width, WW3D_FORMAT_A4R4G4B4, MIP_LEVELS_1);
+		TextureClass *new_texture = W3DNEW TextureClass (desc.Width, desc.Width, WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_1);
 		SurfaceClass *texture_surface = new_texture->Get_Surface_Level ();
 
 		new_texture->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
@@ -702,9 +702,9 @@ Render2DSentenceClass::Allocate_New_Surface (const WCHAR *text, bool justCalcExt
 		REF_PTR_RELEASE (CurSurface);
 
 		//
-		//	Create the new surface
+		//	Create the new surface (full 8-bit alpha instead of quantized 4-bit A4R4G4B4)
 		//
-		CurSurface = NEW_REF (SurfaceClass, (CurrTextureSize, CurrTextureSize, WW3D_FORMAT_A4R4G4B4));
+		CurSurface = NEW_REF (SurfaceClass, (CurrTextureSize, CurrTextureSize, WW3D_FORMAT_A8R8G8B8));
 		WWASSERT (CurSurface != nullptr);
 		CurSurface->Add_Ref ();
 
@@ -937,7 +937,7 @@ void	Render2DSentenceClass::Build_Sentence_Centered (const WCHAR *text, int *hkX
 				//	Ensure the surface is locked
 				//
 				if (LockedPtr == nullptr) {
-					LockedPtr = (uint16 *)CurSurface->Lock (&LockedStride);
+					LockedPtr = (uint32 *)CurSurface->Lock (&LockedStride);
 					WWASSERT (LockedPtr != nullptr);
 				}
 
@@ -1134,7 +1134,7 @@ Vector2	Render2DSentenceClass::Build_Sentence_Not_Centered (const WCHAR *text, i
 			if (!justCalcExtents)
 			{
 				if (LockedPtr == nullptr) {
-					LockedPtr = (uint16 *)CurSurface->Lock (&LockedStride);
+					LockedPtr = (uint32 *)CurSurface->Lock (&LockedStride);
 					WWASSERT (LockedPtr != nullptr);
 				}
 			}
@@ -1372,15 +1372,15 @@ FontCharsClass::Get_Char_Spacing (WCHAR ch)
 //
 ////////////////////////////////////////////////////////////////////////////////////
 void
-FontCharsClass::Blit_Char (WCHAR ch, uint16 *dest_ptr, int dest_stride, int x, int y)
+FontCharsClass::Blit_Char (WCHAR ch, uint32 *dest_ptr, int dest_stride, int x, int y)
 {
 	const FontCharsClassCharDataStruct	* data = Get_Char_Data( ch );
 	if ( data != nullptr && data->Width != 0 ) {
 
 		//
-		//	Setup the src and destination pointers
+		//	Setup the src and destination pointers (32-bit A8R8G8B8 texels)
 		//
-		int dest_inc		= (dest_stride >> 1);
+		int dest_inc		= (dest_stride >> 2);
 		const uint8 *src_ptr = data->Buffer;
 		dest_ptr				+= (dest_inc * y) + x;
 
@@ -1395,16 +1395,18 @@ FontCharsClass::Blit_Char (WCHAR ch, uint16 *dest_ptr, int dest_stride, int x, i
 		int row;
 
 		//
-		//	Copy the data from the src buffer to the destination, rebuilding the A4R4G4B4 texel
-		//	from the stored coverage value the same way Store_GDI_Char used to compose it.
+		//	Copy the data from the src buffer to the destination with full 8-bit antialiased alpha.
 		//
 		for ( row = 0; row < glyph_rows; row ++ ) {
 			for ( int col = 0; col < data->Width; col ++ ) {
-				const uint8 coverage = *src_ptr;
-				uint16 curData = (coverage != 0 ? 0x0FFF : 0) | ((uint16)(coverage >> 4) << 12);
-				if (col<PixelOverlap) {
-					curData |= dest_ptr[col];
+				uint8 coverage = *src_ptr;
+				if (col < PixelOverlap) {
+					const uint8 prev_alpha = static_cast<uint8>(dest_ptr[col] >> 24);
+					if (prev_alpha > coverage) {
+						coverage = prev_alpha;
+					}
 				}
+				const uint32 curData = (coverage != 0 ? 0x00FFFFFFu : 0u) | (static_cast<uint32>(coverage) << 24);
 				dest_ptr[col] = curData;
 				src_ptr++;
 			}
@@ -1415,7 +1417,7 @@ FontCharsClass::Blit_Char (WCHAR ch, uint16 *dest_ptr, int dest_stride, int x, i
 		//	The remaining rows are empty.
 		//
 		for ( ; row < CharHeight; row ++ ) {
-			::memset( dest_ptr, 0, data->Width * sizeof( uint16 ) );
+			::memset( dest_ptr, 0, data->Width * sizeof( uint32 ) );
 			dest_ptr	+= dest_inc;
 		}
 	}
@@ -1620,7 +1622,7 @@ FontCharsClass::Create_GDI_Font (const char *font_name)
 {
 	HDC screen_dc = ::GetDC ((HWND)WW3D::Get_Window());
 
-	const char *fontToUseForGenerals = "Arial";
+	const char *fontToUseForGenerals = "Segoe UI Semibold";
 	bool doingGenerals = false;
 	if (strcmp(font_name, "Generals")==0) {
 		font_name = fontToUseForGenerals;
@@ -1633,11 +1635,7 @@ FontCharsClass::Create_GDI_Font (const char *font_name)
 	const int dotsPerInch = 96; // always use 96.	jba.
 	int font_height = -MulDiv (PointSize, dotsPerInch, 72);
 
-	int fontWidth = 0; // use font default.
-	if (doingGenerals) {
-		//fontWidth = -font_height*0.35f; //2 pixels tighter.
-		fontWidth = -font_height*0.40f; // one pixel tighter
-	}
+	int fontWidth = 0; // use crisp native glyph proportions.
 	PixelOverlap = (-font_height)/8;
 
 	// Sanity check in case of perversion. :)
@@ -1646,7 +1644,7 @@ FontCharsClass::Create_GDI_Font (const char *font_name)
 	//
 	//	Create the Windows font
 	//
-	DWORD bold		= IsBold ? FW_BOLD : FW_NORMAL;
+	DWORD bold		= IsBold ? FW_BOLD : (doingGenerals ? FW_SEMIBOLD : FW_NORMAL);
 	DWORD italic	= 0;
 	GDIFont			= ::CreateFont (font_height, fontWidth, 0, 0, bold, italic,
 								FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,

@@ -67,6 +67,7 @@
 #include "GameClient/GadgetPushButton.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DGadget.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 #include "GameClient/GUICallbacks.h"
 
@@ -149,7 +150,29 @@ static void advancePosition(GameWindow *window, const Image *image, UnsignedInt 
 void W3DShellMenuSchemeDraw( GameWindow *window, WinInstanceData *instData )
 {
 	if(TheShell && TheShell->isShellActive())
+	{
+		if (ZhrMenuStyle::isActive())
+		{
+			if (ZhrMenuStyle::isSplitScreen() && TheDisplay)
+			{
+				IRegion2D leftHalf;
+				leftHalf.lo.x = 0;
+				leftHalf.lo.y = 0;
+				leftHalf.hi.x = TheDisplay->getWidth() / 2;
+				leftHalf.hi.y = TheDisplay->getHeight();
+				TheDisplay->setClipRegion(&leftHalf);
+				TheShell->getShellMenuSchemeManager()->draw();
+				TheDisplay->enableClipping(FALSE);
+				ZhrMenuStyle::drawShellBackdropFrame(TRUE);
+			}
+			else
+			{
+				ZhrMenuStyle::drawShellBackdropFrame(FALSE);
+			}
+			return;
+		}
 		TheShell->getShellMenuSchemeManager()->draw();
+	}
 }
 
 void W3DMainMenuDraw( GameWindow *window, WinInstanceData *instData )
@@ -409,6 +432,13 @@ void W3DMainMenuMapBorder( GameWindow *window, WinInstanceData *instData )
 	window->winGetScreenPosition(&x, &y);
 	window->winGetSize(&width,&height);
 
+	if (ZhrMenuStyle::isActive())
+	{
+		ZhrMenuStyle::drawGlassPanel(x, y, width, height, FALSE);
+		TheDisplay->enableClipping(FALSE);
+		return;
+	}
+
 //	TheDisplay->setClipRegion(&clipRegion);
 	Int originalX = x;
 	Int originalY = y;
@@ -557,6 +587,12 @@ void W3DMainMenuMapBorder( GameWindow *window, WinInstanceData *instData )
 void W3DMainMenuButtonDropShadowDraw( GameWindow *window,
 																	 WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellButton(window, instData))
+	{
+		ZhrMenuStyle::drawTacticalButton(window, instData);
+		return;
+	}
+
 	const Image *leftImage, *rightImage, *centerImage;
 	ICoord2D origin, size, start, end;
 	Int xOffset, yOffset;

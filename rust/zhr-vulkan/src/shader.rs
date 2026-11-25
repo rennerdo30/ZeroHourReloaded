@@ -630,6 +630,8 @@ fn ggx_specular(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, roughness: f32, f0: ve
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex0 = textureSample(t_diffuse, s_diffuse, in.uv0);
     let tex1 = textureSample(t_diffuse1, s_diffuse1, in.uv1);
+    let backdrop_uv = clamp(in.clip_pos.xy * u.water_params.zw, vec2<f32>(0.002), vec2<f32>(0.998));
+    let backdrop_sample = textureSample(t_diffuse1, s_diffuse1, backdrop_uv);
 
     // Compute screen-space derivatives in uniform control flow before any branches.
     let dpos_dx = dpdx(in.world_pos);
@@ -648,7 +650,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    if (pbr_active && u.water_params.y > 0.5) {
+    if (u.water_params.y > 1.5) {
+        // Modern Vulkan 1.3 Frosted-Glass UI Backdrop (respects F9 split-screen wipe).
+        let glass_active = (u.water_params.y < 2.5) || (in.clip_pos.x >= u.render_flags.z);
+        if (glass_active) {
+            let blurred = backdrop_sample.rgb;
+            let blur_luma = dot(blurred, vec3<f32>(0.299, 0.587, 0.114));
+            let frosted_bg = mix(vec3<f32>(blur_luma), blurred, 0.62) * 0.54;
+            let screen_y = clamp(in.clip_pos.y * u.water_params.w, 0.0, 1.0);
+            let sheen = (1.0 - screen_y) * 0.045;
+            let glass_rgb = mix(frosted_bg, col.rgb, clamp(col.a, 0.48, 0.86))
+                + vec3<f32>(sheen * 0.55, sheen * 0.82, sheen * 1.15);
+            col = vec4<f32>(glass_rgb, 0.96);
+        }
+    } else if (pbr_active && u.water_params.y > 0.5) {
         // Modern Vulkan 1.3 Animated Water: domain-warped organic multi-wave normals + Fresnel sky reflection + GGX sun glints.
         let t = u.water_params.x;
         // Domain-warp world XY coordinates smoothly so wave trains never form periodic grids.

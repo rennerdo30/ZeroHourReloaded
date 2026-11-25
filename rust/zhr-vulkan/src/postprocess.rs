@@ -13,7 +13,7 @@ use crate::types::{GraphicsMode, GraphicsSettings};
 
 pub const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-const SLOTS_PER_FRAME: usize = 8;
+const SLOTS_PER_FRAME: usize = 11;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -213,6 +213,17 @@ fn fs_ssao_apply(in: VsOut) -> @location(0) vec4<f32> {
 // ============================================================================
 
 @fragment
+fn fs_backdrop_copy(in: VsOut) -> @location(0) vec4<f32> {
+    let texel = vec2<f32>(u.params0.z, u.params0.w);
+    let c0 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>(-1.0, -1.0)).rgb;
+    let c1 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>( 1.0, -1.0)).rgb;
+    let c2 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>(-1.0,  1.0)).rgb;
+    let c3 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>( 1.0,  1.0)).rgb;
+    let c = clamp((c0 + c1 + c2 + c3) * 0.25, vec3<f32>(0.0), vec3<f32>(2.5));
+    return vec4<f32>(c, 1.0);
+}
+
+@fragment
 fn fs_bloom_extract(in: VsOut) -> @location(0) vec4<f32> {
     let texel = vec2<f32>(u.params0.z, u.params0.w);
     let c0 = textureSample(t_src0, s_samp, in.uv + texel * vec2<f32>(-1.0, -1.0)).rgb;
@@ -362,6 +373,7 @@ pub struct PostProcessPipeline {
     hdr_scene: ImageTarget,
     bloom_a: ImageTarget,
     bloom_b: ImageTarget,
+    ui_backdrop: ImageTarget,
     ssao_a: ImageTarget,
     ssao_b: ImageTarget,
     depth_sample_view: vk::ImageView,
@@ -381,12 +393,14 @@ pub struct PostProcessPipeline {
     params_ubo: GpuBuffer,
     slot_stride: usize,
     vs_module: vk::ShaderModule,
+    fs_backdrop_copy_module: vk::ShaderModule,
     fs_extract_module: vk::ShaderModule,
     fs_blur_module: vk::ShaderModule,
     fs_composite_module: vk::ShaderModule,
     fs_ssao_raw_module: vk::ShaderModule,
     fs_ssao_blur_module: vk::ShaderModule,
     fs_ssao_apply_module: vk::ShaderModule,
+    backdrop_copy_pipeline: vk::Pipeline,
     extract_pipeline: vk::Pipeline,
     blur_pipeline: vk::Pipeline,
     composite_pipeline: vk::Pipeline,
@@ -415,12 +429,19 @@ impl PostProcessPipeline {
         let hdr_scene = ImageTarget::new(ctx, "zhr_hdr_scene", w, h)?;
         let bloom_a = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let bloom_b = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
+        let ui_backdrop = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
         let ssao_a = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let ssao_b = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
 
         transition_images_to_shader_read(
             ctx,
-            &[bloom_a.image, bloom_b.image, ssao_a.image, ssao_b.image],
+            &[
+                bloom_a.image,
+                bloom_b.image,
+                ui_backdrop.image,
+                ssao_a.image,
+                ssao_b.image,
+            ],
         )?;
 
         let linear_info = vk::SamplerCreateInfo::default()
@@ -516,6 +537,11 @@ impl PostProcessPipeline {
 
         let vs_spv =
             compile_wgsl_to_spirv(POSTPROCESS_WGSL, naga::ShaderStage::Vertex, "vs_fullscreen")?;
+        let fs_backdrop_copy_spv = compile_wgsl_to_spirv(
+            POSTPROCESS_WGSL,
+            naga::ShaderStage::Fragment,
+            "fs_backdrop_copy",
+        )?;
         let fs_extract_spv = compile_wgsl_to_spirv(
             POSTPROCESS_WGSL,
             naga::ShaderStage::Fragment,
@@ -545,6 +571,7 @@ impl PostProcessPipeline {
         )?;
 
         let vs_module = create_shader_module(&ctx.device, &vs_spv)?;
+        let fs_backdrop_copy_module = create_shader_module(&ctx.device, &fs_backdrop_copy_spv)?;
         let fs_extract_module = create_shader_module(&ctx.device, &fs_extract_spv)?;
         let fs_blur_module = create_shader_module(&ctx.device, &fs_blur_spv)?;
         let fs_composite_module = create_shader_module(&ctx.device, &fs_comp_spv)?;
@@ -552,6 +579,15 @@ impl PostProcessPipeline {
         let fs_ssao_blur_module = create_shader_module(&ctx.device, &fs_ssao_blur_spv)?;
         let fs_ssao_apply_module = create_shader_module(&ctx.device, &fs_ssao_apply_spv)?;
 
+        let backdrop_copy_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_backdrop_copy_module,
+            c"fs_backdrop_copy",
+            HDR_FORMAT,
+            false,
+        )?;
         let extract_pipeline = create_fullscreen_pipeline(
             &ctx.device,
             pipeline_layout,
@@ -611,6 +647,7 @@ impl PostProcessPipeline {
             hdr_scene,
             bloom_a,
             bloom_b,
+            ui_backdrop,
             ssao_a,
             ssao_b,
             depth_sample_view,
@@ -630,12 +667,14 @@ impl PostProcessPipeline {
             params_ubo,
             slot_stride,
             vs_module,
+            fs_backdrop_copy_module,
             fs_extract_module,
             fs_blur_module,
             fs_composite_module,
             fs_ssao_raw_module,
             fs_ssao_blur_module,
             fs_ssao_apply_module,
+            backdrop_copy_pipeline,
             extract_pipeline,
             blur_pipeline,
             composite_pipeline,
@@ -656,6 +695,14 @@ impl PostProcessPipeline {
         self.hdr_scene.view
     }
 
+    pub fn ui_backdrop_view(&self) -> vk::ImageView {
+        self.ui_backdrop.view
+    }
+
+    pub fn linear_sampler(&self) -> vk::Sampler {
+        self.linear_sampler
+    }
+
     pub fn resize(
         &mut self,
         ctx: &mut VkContext,
@@ -674,21 +721,30 @@ impl PostProcessPipeline {
         let new_hdr = ImageTarget::new(ctx, "zhr_hdr_scene", w, h)?;
         let new_ba = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let new_bb = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
+        let new_ui = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
         let new_sa = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let new_sb = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
         transition_images_to_shader_read(
             ctx,
-            &[new_ba.image, new_bb.image, new_sa.image, new_sb.image],
+            &[
+                new_ba.image,
+                new_bb.image,
+                new_ui.image,
+                new_sa.image,
+                new_sb.image,
+            ],
         )?;
 
         let old_hdr = std::mem::replace(&mut self.hdr_scene, new_hdr);
         let old_ba = std::mem::replace(&mut self.bloom_a, new_ba);
         let old_bb = std::mem::replace(&mut self.bloom_b, new_bb);
+        let old_ui = std::mem::replace(&mut self.ui_backdrop, new_ui);
         let old_sa = std::mem::replace(&mut self.ssao_a, new_sa);
         let old_sb = std::mem::replace(&mut self.ssao_b, new_sb);
         old_hdr.destroy(ctx);
         old_ba.destroy(ctx);
         old_bb.destroy(ctx);
+        old_ui.destroy(ctx);
         old_sa.destroy(ctx);
         old_sb.destroy(ctx);
 
@@ -1055,6 +1111,188 @@ impl PostProcessPipeline {
         Ok(())
     }
 
+    /// Captures and Gaussian-blurs the finished 3D `hdr_scene` into quarter-res `ui_backdrop`
+    /// for real-time frosted-glass UI panels. Expects `hdr_scene` in `COLOR_ATTACHMENT_OPTIMAL`
+    /// outside dynamic rendering, and returns it in `COLOR_ATTACHMENT_OPTIMAL` with `ui_backdrop`
+    /// in `SHADER_READ_ONLY_OPTIMAL`.
+    pub fn capture_ui_backdrop(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+    ) -> Result<()> {
+        let base_slot = frame_slot * SLOTS_PER_FRAME + 8;
+        let off_copy = (base_slot * self.slot_stride) as u32;
+        let off_bh = ((base_slot + 1) * self.slot_stride) as u32;
+        let off_bv = ((base_slot + 2) * self.slot_stride) as u32;
+
+        let inv_w = 1.0 / (self.hdr_scene.width.max(1) as f32);
+        let inv_h = 1.0 / (self.hdr_scene.height.max(1) as f32);
+        let inv_bw = 1.0 / (self.bloom_a.width.max(1) as f32);
+        let inv_bh = 1.0 / (self.bloom_a.height.max(1) as f32);
+
+        let p_copy = PostParams {
+            params0: [1.0, -1.0, inv_w, inv_h],
+            params1: [0.0; 4],
+            params2: [0.0; 4],
+        };
+        let p_bh = PostParams {
+            params0: [1.0, -1.0, inv_bw, inv_bh],
+            params1: [inv_bw * 1.65, 0.0, 0.0, 0.0],
+            params2: [0.0; 4],
+        };
+        let p_bv = PostParams {
+            params0: [1.0, -1.0, inv_bw, inv_bh],
+            params1: [0.0, inv_bh * 1.65, 0.0, 0.0],
+            params2: [0.0; 4],
+        };
+
+        self.params_ubo
+            .write_bytes(off_copy as usize, bytemuck::bytes_of(&p_copy))?;
+        self.params_ubo
+            .write_bytes(off_bh as usize, bytemuck::bytes_of(&p_bh))?;
+        self.params_ubo
+            .write_bytes(off_bv as usize, bytemuck::bytes_of(&p_bv))?;
+
+        let blur_extent = vk::Extent2D {
+            width: self.bloom_a.width,
+            height: self.bloom_a.height,
+        };
+
+        // 1. hdr_scene -> SHADER_READ_ONLY_OPTIMAL.
+        cmd_barrier(
+            device,
+            cmd,
+            self.hdr_scene.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // 2. Downsample hdr_scene -> bloom_a.
+        cmd_barrier(
+            device,
+            cmd,
+            self.bloom_a.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.bloom_a.view,
+            blur_extent,
+            self.backdrop_copy_pipeline,
+            self.pipeline_layout,
+            self.set_extract,
+            off_copy,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.bloom_a.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // 3. Horizontal Gaussian blur bloom_a -> bloom_b.
+        cmd_barrier(
+            device,
+            cmd,
+            self.bloom_b.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.bloom_b.view,
+            blur_extent,
+            self.blur_pipeline,
+            self.pipeline_layout,
+            self.set_blur_h,
+            off_bh,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.bloom_b.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // 4. Vertical Gaussian blur bloom_b -> ui_backdrop.
+        cmd_barrier(
+            device,
+            cmd,
+            self.ui_backdrop.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.ui_backdrop.view,
+            blur_extent,
+            self.blur_pipeline,
+            self.pipeline_layout,
+            self.set_blur_v,
+            off_bv,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.ui_backdrop.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // 5. Restore hdr_scene -> COLOR_ATTACHMENT_OPTIMAL for 2D UI drawing.
+        cmd_barrier(
+            device,
+            cmd,
+            self.hdr_scene.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+
+        Ok(())
+    }
+
     /// Runs HDR bloom (if enabled) and composites the HDR scene into `target_image`/`target_view`.
     /// Leaves `target_image` in `COLOR_ATTACHMENT_OPTIMAL`.
     #[allow(clippy::too_many_arguments)]
@@ -1276,11 +1514,14 @@ impl PostProcessPipeline {
         self.hdr_scene.destroy(ctx);
         self.bloom_a.destroy(ctx);
         self.bloom_b.destroy(ctx);
+        self.ui_backdrop.destroy(ctx);
         self.ssao_a.destroy(ctx);
         self.ssao_b.destroy(ctx);
         self.params_ubo.destroy(ctx);
         // SAFETY: Caller ensures GPU is idle.
         unsafe {
+            ctx.device
+                .destroy_pipeline(self.backdrop_copy_pipeline, None);
             ctx.device.destroy_pipeline(self.extract_pipeline, None);
             ctx.device.destroy_pipeline(self.blur_pipeline, None);
             ctx.device.destroy_pipeline(self.composite_pipeline, None);
@@ -1288,6 +1529,8 @@ impl PostProcessPipeline {
             ctx.device.destroy_pipeline(self.ssao_blur_pipeline, None);
             ctx.device.destroy_pipeline(self.ssao_apply_pipeline, None);
             ctx.device.destroy_shader_module(self.vs_module, None);
+            ctx.device
+                .destroy_shader_module(self.fs_backdrop_copy_module, None);
             ctx.device
                 .destroy_shader_module(self.fs_extract_module, None);
             ctx.device.destroy_shader_module(self.fs_blur_module, None);

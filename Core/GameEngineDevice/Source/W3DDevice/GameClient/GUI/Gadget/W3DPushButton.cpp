@@ -56,6 +56,7 @@
 #include "W3DDevice/GameClient/W3DGameWindow.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DGadget.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 
 
@@ -147,6 +148,12 @@ static void drawButtonText( GameWindow *window, WinInstanceData *instData )
 //=============================================================================
 void W3DGadgetPushButtonDraw( GameWindow *window, WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellButton(window, instData))
+	{
+		ZhrMenuStyle::drawTacticalButton(window, instData);
+		return;
+	}
+
 	Color color, border;
 	ICoord2D origin, size, start, end;
 
@@ -313,6 +320,12 @@ void W3DGadgetPushButtonImageDraw( GameWindow *window,
 void W3DGadgetPushButtonImageDrawOne( GameWindow *window,
 																	 WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellButton(window, instData))
+	{
+		ZhrMenuStyle::drawTacticalButton(window, instData);
+		return;
+	}
+
 	const Image *image = nullptr;
 	ICoord2D size, start, end;
 
@@ -486,6 +499,11 @@ void W3DGadgetPushButtonImageDrawOne( GameWindow *window,
 
 void W3DGadgetPushButtonImageDrawThree(GameWindow *window, WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellButton(window, instData))
+	{
+		ZhrMenuStyle::drawTacticalButton(window, instData);
+		return;
+	}
 
 	const Image *leftImage, *rightImage, *centerImage;
 	ICoord2D origin, size, start, end;

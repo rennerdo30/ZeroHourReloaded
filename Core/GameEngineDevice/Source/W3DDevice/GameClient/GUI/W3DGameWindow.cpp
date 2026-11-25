@@ -52,6 +52,7 @@
 #include "W3DDevice/GameClient/W3DGameWindow.h"
 #include "W3DDevice/GameClient/W3DGameWindowManager.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 // DEFINES ////////////////////////////////////////////////////////////////////
 enum
@@ -125,6 +126,12 @@ static void initBorders()
 //=============================================================================
 void W3DGameWindow::blitBorderRect( Int x, Int y, Int width, Int height )
 {
+	if (ZhrMenuStyle::isActive())
+	{
+		ZhrMenuStyle::drawPanelBorder(x, y, width, height);
+		return;
+	}
+
 	Int Offset = 15;
 	Int OffsetLower = 5;
 	// init image loc if needed
@@ -306,6 +313,61 @@ void W3DGameWinDefaultDraw( GameWindow *window, WinInstanceData *instData )
 
 	// get size of window
 	w3dWindow->winGetSize( &size.x, &size.y );
+
+	if (ZhrMenuStyle::isActive())
+	{
+		if (ZhrMenuStyle::isShellRulerWindow(window, instData))
+		{
+			if (ZhrMenuStyle::isSplitScreen() && TheDisplay)
+			{
+				IRegion2D leftHalf;
+				leftHalf.lo.x = 0;
+				leftHalf.lo.y = 0;
+				leftHalf.hi.x = TheDisplay->getWidth() / 2;
+				leftHalf.hi.y = TheDisplay->getHeight();
+				TheDisplay->setClipRegion(&leftHalf);
+				if (BitIsSet(window->winGetStatus(), WIN_STATUS_IMAGE))
+				{
+					const Image *rulerImg = window->winGetEnabledImage(0);
+					if (rulerImg)
+					{
+						TheWindowManager->winDrawImage(
+							rulerImg,
+							origin.x + instData->m_imageOffset.x,
+							origin.y + instData->m_imageOffset.y,
+							origin.x + instData->m_imageOffset.x + size.x,
+							origin.y + instData->m_imageOffset.y + size.y);
+					}
+				}
+				TheDisplay->enableClipping(FALSE);
+				ZhrMenuStyle::drawShellBackdropFrame(TRUE);
+			}
+			else
+			{
+				ZhrMenuStyle::drawShellBackdropFrame(FALSE);
+			}
+			return;
+		}
+		if (ZhrMenuStyle::shouldStyleShellPanel(window, instData))
+		{
+			ZhrMenuStyle::drawGlassPanel(
+				origin.x,
+				origin.y,
+				size.x,
+				size.y,
+				BitIsSet(instData->getState(), WIN_STATE_HILITED));
+			if (instData->m_videoBuffer)
+			{
+				TheDisplay->drawVideoBuffer(
+					instData->m_videoBuffer,
+					origin.x,
+					origin.y,
+					origin.x + size.x,
+					origin.y + size.y);
+			}
+			return;
+		}
+	}
 
 	// image drawing vs color drawing
 	if( BitIsSet( window->winGetStatus(), WIN_STATUS_IMAGE ) )

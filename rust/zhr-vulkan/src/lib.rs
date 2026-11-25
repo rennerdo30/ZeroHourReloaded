@@ -99,6 +99,7 @@ struct ActiveFrame {
     rendering_begun: bool,
     has_3d_depth_writes: bool,
     ssao_applied: bool,
+    backdrop_captured: bool,
     last_3d_proj: Mat4,
     last_pipeline: Option<vk::Pipeline>,
     last_texture: Option<(TextureId, bool)>,
@@ -110,6 +111,7 @@ pub struct VulkanRenderer {
     ctx: VkContext,
     target: Option<RenderTarget>,
     postprocess: Option<PostProcessPipeline>,
+    ui_backdrop_set: vk::DescriptorSet,
     hdr_initialized: bool,
     pipelines: PipelineCache,
     samplers: SamplerCache,
@@ -299,6 +301,18 @@ impl VulkanRenderer {
             depth_sample_view,
             FRAMES_IN_FLIGHT,
         )?;
+        let backdrop_layouts = [pipelines.set1_texture_layout];
+        let backdrop_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(texture_pool)
+            .set_layouts(&backdrop_layouts);
+        // SAFETY: Pool has plenty of sets (`MAX_TEXTURES`).
+        let ui_backdrop_set = unsafe { ctx.device.allocate_descriptor_sets(&backdrop_alloc)?[0] };
+        write_sampled_texture_set(
+            &ctx.device,
+            ui_backdrop_set,
+            postprocess.ui_backdrop_view(),
+            postprocess.linear_sampler(),
+        );
         let graphics = GraphicsSettings::from_env(default_remastered);
 
         // Built-in 1x1 opaque white texture so untextured draws always have a valid descriptor.
@@ -333,6 +347,7 @@ impl VulkanRenderer {
             ctx,
             target: Some(target),
             postprocess: Some(postprocess),
+            ui_backdrop_set,
             hdr_initialized: false,
             pipelines,
             samplers,
@@ -446,6 +461,12 @@ impl VulkanRenderer {
                 output_format,
                 depth_sample_view,
             )?;
+            write_sampled_texture_set(
+                &self.ctx.device,
+                self.ui_backdrop_set,
+                pp.ui_backdrop_view(),
+                pp.linear_sampler(),
+            );
             self.hdr_initialized = false;
         }
         self.viewport = Viewport::full(actual_w.max(1), actual_h.max(1));
@@ -956,6 +977,7 @@ impl VulkanRenderer {
             rendering_begun: false,
             has_3d_depth_writes: false,
             ssao_applied: false,
+            backdrop_captured: false,
             last_3d_proj: Mat4::IDENTITY,
             last_pipeline: None,
             last_texture: None,
@@ -1099,20 +1121,32 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    fn flush_ssao_if_ready(&mut self) -> Result<()> {
-        let should_run = self.active_frame.as_ref().is_some_and(|af| {
+    fn flush_ssao_if_ready(&mut self, capture_backdrop: bool) -> Result<()> {
+        let do_ssao = self.active_frame.as_ref().is_some_and(|af| {
             af.rendering_begun
                 && af.has_3d_depth_writes
                 && !af.ssao_applied
                 && self.graphics.mode != GraphicsMode::Classic
                 && self.graphics.pbr_lighting
         });
-        if !should_run {
+        let do_backdrop = capture_backdrop
+            && self.graphics.mode != GraphicsMode::Classic
+            && self.active_frame.as_ref().is_some_and(|af| {
+                af.rendering_begun
+                    && !af.backdrop_captured
+                    && (af.has_3d_depth_writes || self.material_hint == 2)
+            });
+        if !do_ssao && !do_backdrop {
             return Ok(());
         }
         let (slot_index, depth_image, depth_format, last_3d_proj) = {
             let af = self.active_frame.as_mut().expect("active frame");
-            af.ssao_applied = true;
+            if do_ssao {
+                af.ssao_applied = true;
+            }
+            if do_backdrop {
+                af.backdrop_captured = true;
+            }
             af.rendering_begun = false;
             af.last_pipeline = None;
             af.last_texture = None;
@@ -1128,15 +1162,20 @@ impl VulkanRenderer {
         // SAFETY: `cmd_begin_rendering` was active for the 3D scene pass.
         unsafe { self.ctx.device.cmd_end_rendering(cmd) };
         if let Some(pp) = &mut self.postprocess {
-            pp.apply_ssao(
-                &self.ctx.device,
-                cmd,
-                slot_index,
-                depth_image,
-                depth_format,
-                last_3d_proj,
-                self.graphics,
-            )?;
+            if do_ssao {
+                pp.apply_ssao(
+                    &self.ctx.device,
+                    cmd,
+                    slot_index,
+                    depth_image,
+                    depth_format,
+                    last_3d_proj,
+                    self.graphics,
+                )?;
+            }
+            if do_backdrop {
+                pp.capture_ui_backdrop(&self.ctx.device, cmd, slot_index)?;
+            }
         }
         Ok(())
     }
@@ -1145,9 +1184,9 @@ impl VulkanRenderer {
         let is_3d_pass =
             self.shader.depth_compare() != DepthCompare::Always || self.shader.depth_write();
         // When transitioning from 3D world (including stencil shadows) to 2D HUD/UI,
-        // apply depth-based bilateral SSAO to the finished 3D scene before UI draws on top.
+        // apply depth-based bilateral SSAO and capture the frosted-glass backdrop before UI draws on top.
         if !is_3d_pass && !self.stencil.enabled {
-            self.flush_ssao_if_ready()?;
+            self.flush_ssao_if_ready(true)?;
         }
 
         self.ensure_rendering_begun()?;
@@ -1241,11 +1280,26 @@ impl VulkanRenderer {
             split_x_pixels,
             if is_3d_unlit_surface { 1.0 } else { 0.0 },
         ];
+        let use_ui_glass = !is_3d_pass
+            && self.material_hint == 2
+            && self.graphics.mode != GraphicsMode::Classic
+            && af.backdrop_captured;
+        let glass_hint = if use_ui_glass {
+            if self.graphics.mode == GraphicsMode::SplitScreen {
+                3.0
+            } else {
+                2.0
+            }
+        } else if is_3d_pass {
+            self.material_hint as f32
+        } else {
+            0.0
+        };
         draw_uniforms.water_params = [
             self.start_time.elapsed().as_secs_f32(),
-            self.material_hint as f32,
-            0.0,
-            0.0,
+            glass_hint,
+            1.0 / (af.extent.width.max(1) as f32),
+            1.0 / (af.extent.height.max(1) as f32),
         ];
 
         let alignment = self.ctx.min_uniform_offset_alignment as usize;
@@ -1300,33 +1354,52 @@ impl VulkanRenderer {
             self.stats.texture_binds += 1;
         }
 
-        let tex1_id = if self.uniforms.stage1_ops[0] != 0 {
-            self.active_texture1
+        if use_ui_glass {
+            let glass_sentinel = TextureId(u32::MAX);
+            if af.last_texture1 != Some((glass_sentinel, false)) {
+                // SAFETY: `ui_backdrop_set` is valid and `ui_backdrop` is in SHADER_READ_ONLY_OPTIMAL.
+                unsafe {
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.pipeline_layout,
+                        2,
+                        &[self.ui_backdrop_set],
+                        &[],
+                    );
+                }
+                af.last_texture1 = Some((glass_sentinel, false));
+                self.stats.texture_binds += 1;
+            }
         } else {
-            self.default_white_texture
-        };
-        let tex1_has_remaster =
-            use_remastered_tex && self.remastered_textures.contains_key(&tex1_id);
-        if af.last_texture1 != Some((tex1_id, tex1_has_remaster)) {
-            let tex1 = if tex1_has_remaster {
-                self.remastered_textures.get(&tex1_id)
+            let tex1_id = if self.uniforms.stage1_ops[0] != 0 {
+                self.active_texture1
             } else {
-                self.textures.get(&tex1_id)
+                self.default_white_texture
+            };
+            let tex1_has_remaster =
+                use_remastered_tex && self.remastered_textures.contains_key(&tex1_id);
+            if af.last_texture1 != Some((tex1_id, tex1_has_remaster)) {
+                let tex1 = if tex1_has_remaster {
+                    self.remastered_textures.get(&tex1_id)
+                } else {
+                    self.textures.get(&tex1_id)
+                }
+                .ok_or(VkError::InvalidHandle("texture1"))?;
+                // SAFETY: Texture descriptor set is valid for this frame.
+                unsafe {
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.pipeline_layout,
+                        2,
+                        &[tex1.descriptor_set],
+                        &[],
+                    );
+                }
+                af.last_texture1 = Some((tex1_id, tex1_has_remaster));
+                self.stats.texture_binds += 1;
             }
-            .ok_or(VkError::InvalidHandle("texture1"))?;
-            // SAFETY: Texture descriptor set is valid for this frame.
-            unsafe {
-                self.ctx.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.pipeline_layout,
-                    2,
-                    &[tex1.descriptor_set],
-                    &[],
-                );
-            }
-            af.last_texture1 = Some((tex1_id, tex1_has_remaster));
-            self.stats.texture_binds += 1;
         }
 
         Ok((cmd, slot_index))
@@ -1417,7 +1490,7 @@ impl VulkanRenderer {
         }
 
         // For pure-3D frames with no 2D UI draws, apply SSAO before bloom + composite.
-        self.flush_ssao_if_ready()?;
+        self.flush_ssao_if_ready(false)?;
 
         let af = self.active_frame.take().ok_or(VkError::State(
             "end_frame called without matching begin_frame",
@@ -1731,6 +1804,32 @@ impl Drop for VulkanRenderer {
             }
         }
     }
+}
+
+fn write_sampled_texture_set(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+) {
+    let img_info = [vk::DescriptorImageInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let samp_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
+    let writes = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&img_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .image_info(&samp_info),
+    ];
+    // SAFETY: `set`, `view`, and `sampler` belong to `device`.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
 fn apply_viewport_and_scissor(device: &ash::Device, cmd: vk::CommandBuffer, vp: Viewport) {

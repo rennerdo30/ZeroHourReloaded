@@ -85,6 +85,7 @@ static void drawFramerateBar();
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
 #include "W3DDevice/GameClient/W3DScreenshot.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 #include "WWMath/wwmath.h"
 #include "WWLib/registry.h"
 #include "WW3D2/ww3d.h"
@@ -999,6 +1000,7 @@ void W3DDisplay::reset()
 {
 
 	Display::reset();
+	ZhrMenuStyle::reset();
 
 	// TheSuperHackers @tweak Discard the current glyphs and start with a clean slate.
 	// This can reduce the memory overhead from glyphs that are no longer needed from here on.
