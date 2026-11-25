@@ -33,6 +33,8 @@
 #include "Common/BuildAssistant.h"
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
+#include "Common/FrameRateLimit.h"
+#include "Common/OptionPreferences.h"
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Team.h"
@@ -639,7 +641,30 @@ void GameEngine::init()
 
 		TheSubsystemList->postProcessLoadAll();
 
-		TheFramePacer->setFramesPerSecondLimit(TheGlobalData->m_framesPerSecondLimit);
+		// ZeroHourReloaded: decouple high-FPS rendering (default 144 FPS, configurable in Options -> Graphics)
+		// from authentic 30 Hz RTS logic simulation so menus, camera, water, and gameplay run silky-smooth.
+		{
+			OptionPreferences zhrFpsPrefs;
+			UnsignedInt maxRenderFps = TheGlobalData->m_useFpsLimit
+				? zhrFpsPrefs.getZhrMaxRenderFps()
+				: RenderFpsPreset::UncappedFpsValue;
+			if (maxRenderFps >= RenderFpsPreset::UncappedFpsValue)
+			{
+				TheWritableGlobalData->m_framesPerSecondLimit = RenderFpsPreset::UncappedFpsValue;
+				TheWritableGlobalData->m_useFpsLimit = FALSE;
+				TheFramePacer->setFramesPerSecondLimit(RenderFpsPreset::UncappedFpsValue);
+				TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
+				TheFramePacer->enableLogicTimeScale(TRUE);
+			}
+			else
+			{
+				TheWritableGlobalData->m_framesPerSecondLimit = (Int)maxRenderFps;
+				TheWritableGlobalData->m_useFpsLimit = TRUE;
+				TheFramePacer->setFramesPerSecondLimit((Int)maxRenderFps);
+				TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
+				TheFramePacer->enableLogicTimeScale(maxRenderFps > LOGICFRAMES_PER_SECOND);
+			}
+		}
 
 		TheAudio->setOn(TheGlobalData->m_audioOn && TheGlobalData->m_musicOn, AudioAffect_Music);
 		TheAudio->setOn(TheGlobalData->m_audioOn && TheGlobalData->m_soundsOn, AudioAffect_Sound);

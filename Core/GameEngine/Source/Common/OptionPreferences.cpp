@@ -32,6 +32,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/AudioSettings.h"
+#include "Common/FrameRateLimit.h"
 #include "Common/GameAudio.h"
 #include "Common/GameLOD.h"
 #include "Common/GlobalData.h"
@@ -949,4 +950,21 @@ Bool OptionPreferences::getZhrMeshSmoothingEnabled() const
 		return TRUE;
 
 	return (stricmp(it->second.str(), "yes") == 0 || stricmp(it->second.str(), "true") == 0 || strcmp(it->second.str(), "1") == 0) ? TRUE : FALSE;
+}
+
+UnsignedInt OptionPreferences::getZhrMaxRenderFps() const
+{
+	OptionPreferences::const_iterator it = find("ZhrMaxFps");
+	if (it == end())
+		return 144u; // Default: smooth 144 FPS rendering with 30 Hz decoupled game logic
+
+	if (stricmp(it->second.str(), "uncapped") == 0)
+		return RenderFpsPreset::UncappedFpsValue;
+
+	const Int val = atoi(it->second.str());
+	if (val <= 0 || val >= (Int)RenderFpsPreset::UncappedFpsValue)
+		return RenderFpsPreset::UncappedFpsValue;
+	if (val < LOGICFRAMES_PER_SECOND)
+		return LOGICFRAMES_PER_SECOND;
+	return (UnsignedInt)val;
 }

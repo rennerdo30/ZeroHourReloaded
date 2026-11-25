@@ -34,6 +34,8 @@
 
 #include "Common/AudioAffect.h"
 #include "Common/AudioSettings.h"
+#include "Common/FramePacer.h"
+#include "Common/FrameRateLimit.h"
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
 #include "Common/OptionPreferences.h"
@@ -246,6 +248,9 @@ static Bool s_zhrCurPostFx = TRUE;
 static Bool s_zhrCurRemasterTex = TRUE;
 static Bool s_zhrCurMeshSmooth = TRUE;
 
+static UnsignedInt s_zhrSavedMaxFps = 144u;
+static UnsignedInt s_zhrCurMaxFps = 144u;
+
 // Dynamic ZHR controls (owned as children of OptionsMenuParent; destroyed with layout)
 static NameKeyType s_zhrTabIDs[ZHR_TAB_COUNT] = { NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID };
 static GameWindow *s_zhrTabButtons[ZHR_TAB_COUNT] = { nullptr, nullptr, nullptr, nullptr };
@@ -260,6 +265,9 @@ static GameWindow *s_zhrCardVulkan = nullptr;
 static GameWindow *s_zhrLblDisplayHdr = nullptr;
 static GameWindow *s_zhrLblResolution = nullptr;
 static GameWindow *s_zhrLblDetail = nullptr;
+static GameWindow *s_zhrLblMaxFps = nullptr;
+static NameKeyType s_zhrComboMaxFpsID = NAMEKEY_INVALID;
+static GameWindow *s_zhrComboMaxFps = nullptr;
 static GameWindow *s_zhrLblBrightness = nullptr;
 static NameKeyType s_zhrBtnCustomDetailID = NAMEKEY_INVALID;
 static GameWindow *s_zhrBtnCustomDetail = nullptr;
@@ -319,6 +327,8 @@ static void clearZhrOptionsWidgets()
 	s_zhrLblDisplayHdr = nullptr;
 	s_zhrLblResolution = nullptr;
 	s_zhrLblDetail = nullptr;
+	s_zhrLblMaxFps = nullptr;
+	s_zhrComboMaxFps = nullptr;
 	s_zhrLblBrightness = nullptr;
 	s_zhrBtnCustomDetail = nullptr;
 
@@ -399,6 +409,50 @@ static void applyLiveVulkanRemasterSettings()
 		s_zhrCurPostFx,
 		s_zhrCurRemasterTex,
 		s_zhrCurMeshSmooth);
+}
+
+static const UnsignedInt s_zhrFpsChoices[] = {
+	30u, 60u, 120u, 144u, 240u, RenderFpsPreset::UncappedFpsValue
+};
+
+static Int zhrFpsToComboIdx(UnsignedInt fps)
+{
+	if (fps >= RenderFpsPreset::UncappedFpsValue) return 5;
+	if (fps >= 200u) return 4;
+	if (fps >= 132u) return 3;
+	if (fps >= 90u) return 2;
+	if (fps >= 45u) return 1;
+	return 0;
+}
+
+static UnsignedInt zhrComboIdxToFps(Int idx)
+{
+	if (idx < 0 || idx >= 6) return 144u;
+	return s_zhrFpsChoices[idx];
+}
+
+static void applyLiveMaxRenderFps(UnsignedInt maxFps)
+{
+	if (!TheFramePacer || !TheWritableGlobalData)
+		return;
+	if (maxFps >= RenderFpsPreset::UncappedFpsValue)
+	{
+		TheWritableGlobalData->m_framesPerSecondLimit = RenderFpsPreset::UncappedFpsValue;
+		TheWritableGlobalData->m_useFpsLimit = FALSE;
+		TheFramePacer->setFramesPerSecondLimit(RenderFpsPreset::UncappedFpsValue);
+		TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
+		TheFramePacer->enableLogicTimeScale(TRUE);
+	}
+	else
+	{
+		if (maxFps < LOGICFRAMES_PER_SECOND)
+			maxFps = LOGICFRAMES_PER_SECOND;
+		TheWritableGlobalData->m_framesPerSecondLimit = (Int)maxFps;
+		TheWritableGlobalData->m_useFpsLimit = TRUE;
+		TheFramePacer->setFramesPerSecondLimit((Int)maxFps);
+		TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
+		TheFramePacer->enableLogicTimeScale(maxFps > LOGICFRAMES_PER_SECOND);
+	}
 }
 
 static void placeComboBox(GameWindow *combo, Int x, Int y, Int w, Int h)
@@ -703,6 +757,7 @@ static void selectZhrOptionsTab(Int tabIndex)
 	// Close any open dropdown list before switching tabs
 	if (comboBoxResolution) GadgetComboBoxHideList(comboBoxResolution);
 	if (comboBoxDetail) GadgetComboBoxHideList(comboBoxDetail);
+	if (s_zhrComboMaxFps) GadgetComboBoxHideList(s_zhrComboMaxFps);
 	if (s_zhrComboVisualMode) GadgetComboBoxHideList(s_zhrComboVisualMode);
 	if (comboBoxOnlineIP) GadgetComboBoxHideList(comboBoxOnlineIP);
 	if (comboBoxLANIP) GadgetComboBoxHideList(comboBoxLANIP);
@@ -737,6 +792,8 @@ static void selectZhrOptionsTab(Int tabIndex)
 	showZhrWidget(s_zhrLblDetail, isGfx);
 	showZhrWidget(comboBoxDetail, isGfx);
 	showZhrWidget(s_zhrBtnCustomDetail, isGfx);
+	showZhrWidget(s_zhrLblMaxFps, isGfx);
+	showZhrWidget(s_zhrComboMaxFps, isGfx);
 	showZhrWidget(s_zhrLblBrightness, isGfx);
 	showZhrWidget(sliderGamma, isGfx);
 
@@ -1023,40 +1080,64 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 	GameWindow *ctlParent = s_zhrControlsGroup ? s_zhrControlsGroup : host;
 	GameWindow *netParent = s_zhrNetworkGroup ? s_zhrNetworkGroup : host;
 
-	// Left card: DISPLAY
+	// Left card: DISPLAY (Resolution, Detail Preset + Custom button, Max Render FPS, Brightness)
+	const Int leftRowGap = static_cast<Int>(bodyH * 0.024f);
+	const Int leftComboH = static_cast<Int>(bodyH * 0.084f);
 	Int cy = bodyY + cPadY;
 	s_zhrLblDisplayHdr = createZhrLabel(
 		gfxParent, "OptionsMenu.wnd:ZhrLblDisplayHdr", UnicodeString(L"DISPLAY"),
 		leftCardX + cPadX, cy, ctrlW, secHdrH, sectionFont, colAccent);
-	cy += secHdrH + rowGap;
+	cy += secHdrH + leftRowGap;
 
 	s_zhrLblResolution = createZhrLabel(
 		gfxParent, "OptionsMenu.wnd:ZhrLblResolution", UnicodeString(L"Resolution"),
 		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
-	cy += lblH + 4;
-	placeComboBox(comboBoxResolution, leftCardX + cPadX, cy, ctrlW, comboH);
-	cy += comboH + rowGap;
+	cy += lblH + 2;
+	placeComboBox(comboBoxResolution, leftCardX + cPadX, cy, ctrlW, leftComboH);
+	cy += leftComboH + leftRowGap;
 
 	s_zhrLblDetail = createZhrLabel(
 		gfxParent, "OptionsMenu.wnd:ZhrLblDetail", UnicodeString(L"Detail Preset"),
 		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
-	cy += lblH + 4;
+	cy += lblH + 2;
 	if (comboBoxDetail)
 		GadgetComboBoxSetMaxDisplay(comboBoxDetail, 5);
-	placeComboBox(comboBoxDetail, leftCardX + cPadX, cy, ctrlW, comboH);
-	cy += comboH + rowGap;
-
+	const Int customBtnW = static_cast<Int>(ctrlW * 0.36f);
+	const Int detailComboW = ctrlW - customBtnW - 8;
+	placeComboBox(comboBoxDetail, leftCardX + cPadX, cy, detailComboW, leftComboH);
 	s_zhrBtnCustomDetail = createZhrButton(
-		gfxParent, "OptionsMenu.wnd:ZhrButtonCustomDetail", UnicodeString(L"Custom Detail Settings..."),
-		leftCardX + cPadX, cy, ctrlW, comboH, bodyFont, s_zhrBtnCustomDetailID);
+		gfxParent, "OptionsMenu.wnd:ZhrButtonCustomDetail", UnicodeString(L"Custom..."),
+		leftCardX + cPadX + ctrlW - customBtnW, cy, customBtnW, leftComboH, bodyFont, s_zhrBtnCustomDetailID);
 	if (s_zhrBtnCustomDetail && comboBoxDetail && !comboBoxDetail->winGetEnabled())
 		s_zhrBtnCustomDetail->winEnable(FALSE);
-	cy += comboH + rowGap;
+	cy += leftComboH + leftRowGap;
+
+	s_zhrLblMaxFps = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblMaxFps", UnicodeString(L"Max Render FPS (30 Hz Logic)"),
+		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 2;
+	s_zhrComboMaxFps = createZhrComboBox(
+		gfxParent, "OptionsMenu.wnd:ZhrComboMaxFps",
+		leftCardX + cPadX, cy, ctrlW, leftComboH, bodyFont, s_zhrComboMaxFpsID);
+	if (s_zhrComboMaxFps)
+	{
+		const Color entryCol = GameMakeColor(236, 246, 255, 255);
+		GadgetComboBoxReset(s_zhrComboMaxFps);
+		GadgetComboBoxSetMaxDisplay(s_zhrComboMaxFps, 6);
+		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"30 FPS (Classic)"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"60 FPS"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"120 FPS"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"144 FPS"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"240 FPS"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"Uncapped"), entryCol);
+		GadgetComboBoxSetSelectedPos(s_zhrComboMaxFps, zhrFpsToComboIdx(s_zhrCurMaxFps));
+	}
+	cy += leftComboH + leftRowGap;
 
 	s_zhrLblBrightness = createZhrLabel(
 		gfxParent, "OptionsMenu.wnd:ZhrLblBrightness", UnicodeString(L"Brightness"),
 		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
-	cy += lblH + 4;
+	cy += lblH + 2;
 	placeSlider(sliderGamma, leftCardX + cPadX, cy, ctrlW, sliderH);
 
 	// Right card: VULKAN 1.3 REMASTER
@@ -1254,6 +1335,7 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 	bringTop(s_zhrNetworkGroup);
 
 	bringTop(sliderGamma);
+	bringTop(s_zhrComboMaxFps);
 	bringTop(s_zhrBtnCustomDetail);
 	bringTop(comboBoxDetail);
 	bringTop(comboBoxResolution);
@@ -1376,7 +1458,17 @@ static void setDefaults()
  	GadgetSliderSetPosition(sliderGamma, ((valMax - valMin) / 2 + valMin));
 
 	//-------------------------------------------------------------------------------------------------
-	// ZeroHourReloaded Vulkan 1.3 Remaster defaults (Remastered, all enhancements ON)
+	// ZeroHourReloaded Vulkan 1.3 Remaster & Frame Pacing defaults (Remastered all-ON, 144 FPS)
+	s_zhrCurMaxFps = 144u;
+	if (s_zhrComboMaxFps)
+	{
+		const Bool prevIgn = ignoreSelected;
+		ignoreSelected = TRUE;
+		GadgetComboBoxSetSelectedPos(s_zhrComboMaxFps, zhrFpsToComboIdx(s_zhrCurMaxFps));
+		ignoreSelected = prevIgn;
+	}
+	applyLiveMaxRenderFps(s_zhrCurMaxFps);
+
 	if (s_zhrHasVulkan)
 	{
 		s_zhrCurMode = 1u;
@@ -1931,7 +2023,22 @@ static void saveOptions()
 	}
 
 	//-------------------------------------------------------------------------------------------------
-	// ZeroHourReloaded Vulkan 1.3 Remaster settings
+	// ZeroHourReloaded Max Render FPS & Vulkan 1.3 Remaster settings
+	{
+		if (s_zhrCurMaxFps >= RenderFpsPreset::UncappedFpsValue)
+		{
+			(*pref)["ZhrMaxFps"] = "uncapped";
+		}
+		else
+		{
+			AsciiString fpsStr;
+			fpsStr.format("%u", s_zhrCurMaxFps);
+			(*pref)["ZhrMaxFps"] = fpsStr;
+		}
+		applyLiveMaxRenderFps(s_zhrCurMaxFps);
+		s_zhrSavedMaxFps = s_zhrCurMaxFps;
+	}
+
 	if (s_zhrHasVulkan && TheDisplay)
 	{
 		const char *modeStr =
@@ -2074,7 +2181,19 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 		pref = NEW OptionPreferences;
 	}
 
-	// Snapshot live Vulkan 1.3 Remaster settings for instant preview + Cancel revert
+	// Snapshot live Max Render FPS + Vulkan 1.3 Remaster settings for instant preview + Cancel revert
+	if (TheFramePacer)
+	{
+		s_zhrSavedMaxFps = TheFramePacer->isActualFramesPerSecondLimitEnabled()
+			? static_cast<UnsignedInt>(TheFramePacer->getFramesPerSecondLimit())
+			: RenderFpsPreset::UncappedFpsValue;
+	}
+	else
+	{
+		s_zhrSavedMaxFps = pref->getZhrMaxRenderFps();
+	}
+	s_zhrCurMaxFps = s_zhrSavedMaxFps;
+
 	s_zhrHasVulkan = (TheDisplay && TheDisplay->hasVulkanRemasterBackend()) ? TRUE : FALSE;
 	if (s_zhrHasVulkan)
 	{
@@ -2733,6 +2852,13 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 
 					showAdvancedOptions();
 				}
+				else if (controlID == s_zhrComboMaxFpsID)
+				{
+					Int index = 3;
+					GadgetComboBoxGetSelectedPos(s_zhrComboMaxFps, &index);
+					s_zhrCurMaxFps = zhrComboIdxToFps(index);
+					applyLiveMaxRenderFps(s_zhrCurMaxFps);
+				}
 				else if (controlID == s_zhrComboVisualModeID && s_zhrHasVulkan)
 				{
 					Int index = 0;
@@ -2753,7 +2879,8 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 
 			if( controlID == buttonBack )
 			{
-				// Revert live Vulkan 1.3 Remaster preview back to the snapshot taken on open
+				// Revert live Max Render FPS & Vulkan 1.3 Remaster preview back to the snapshot taken on open
+				applyLiveMaxRenderFps(s_zhrSavedMaxFps);
 				if (s_zhrHasVulkan && TheDisplay)
 				{
 					TheDisplay->setVulkanRemasterSettings(

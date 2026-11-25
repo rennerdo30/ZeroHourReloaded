@@ -132,10 +132,11 @@ public:
 
 	Real getGameWindowTransitionSpeedMultiplier() const;
 
-	// ZeroHourReloaded Vulkan 1.3 Remaster settings
+	// ZeroHourReloaded Vulkan 1.3 Remaster & Frame Pacing settings
 	UnsignedInt getZhrGraphicsMode() const;
 	Bool getZhrPbrWaterSsaoEnabled() const;
 	Bool getZhrHdrPostFxEnabled() const;
 	Bool getZhrRemasterTexturesEnabled() const;
 	Bool getZhrMeshSmoothingEnabled() const;
+	UnsignedInt getZhrMaxRenderFps() const;
 };

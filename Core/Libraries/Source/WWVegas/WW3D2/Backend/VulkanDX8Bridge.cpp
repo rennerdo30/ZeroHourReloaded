@@ -2912,7 +2912,8 @@ public:
         int32_t ok = 0;
         if (hwnd != nullptr)
         {
-            ok = zhr_vk_init_win32(hwnd, GetModuleHandle(nullptr), w, h, true, validation);
+            // Prefer tear-free MAILBOX / IMMEDIATE so FramePacer controls render FPS (60/120/144/240/Uncapped) cleanly.
+            ok = zhr_vk_init_win32(hwnd, GetModuleHandle(nullptr), w, h, false, validation);
         }
         else
         {
