@@ -3089,7 +3089,10 @@ void ControlBar::setLowControlBarConfig()
 	m_currentControlBarStage = CONTROL_BAR_STAGE_LOW;
 	ICoord2D pos;
 	pos.x = m_defaultControlBarPosition.x;
-	pos.y = TheDisplay->getHeight() - .1 * TheDisplay->getHeight();
+	const Real uiFrac = (TheDisplay && !TheDisplay->isUiScaleClassicStretched())
+		? TheDisplay->getEffectiveUiScale()
+		: 1.0f;
+	pos.y = TheDisplay->getHeight() - REAL_TO_INT_FLOOR(0.1f * TheDisplay->getHeight() * uiFrac + 0.5f);
 	setFullViewportHeight();
 	m_contextParent[ CP_MASTER ]->winSetPosition(pos.x, pos.y);
 	m_contextParent[ CP_MASTER ]->winHide(FALSE);
@@ -3827,5 +3830,21 @@ void ControlBar::setFullViewportHeight()
 
 void ControlBar::setScaledViewportHeight()
 {
+	// When the Control Bar is aspect-correct / narrower than the widescreen display, render the 3D
+	// battlefield at full viewport height so terrain & units remain visible cleanly on both sides.
+	if (TheDisplay && !TheDisplay->isUiScaleClassicStretched())
+	{
+		Real sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
+		TheDisplay->getUiTransform(
+			DEFAULT_DISPLAY_WIDTH,
+			DEFAULT_DISPLAY_HEIGHT,
+			Display::UI_ANCHOR_BOTTOM_CENTER,
+			sx, sy, ox, oy);
+		if (ox > 1.0f)
+		{
+			TheTacticalView->setHeight(TheDisplay->getHeight());
+			return;
+		}
+	}
 	TheTacticalView->setHeight(TheDisplay->getHeight() * TheGlobalData->m_viewportHeightScale);
 }

@@ -32,4 +32,7 @@ namespace ZhrSDL3Platform
 
 	/// Returns whether the SDL3 window is currently minimized.
 	Bool isMinimized();
+
+	/// Returns the OS display DPI scale factor for the active window (e.g. 1.0, 1.25, 1.5, 2.0).
+	Real getDisplayDpiScale();
 }

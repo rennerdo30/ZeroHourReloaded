@@ -2890,7 +2890,10 @@ public:
         HWND hwnd = pPresentationParameters->hDeviceWindow ? pPresentationParameters->hDeviceWindow : hFocusWindow;
         const bool validation = IsValidationRequested();
 
-        if (hwnd != nullptr && pPresentationParameters->Windowed)
+        const char* headlessEnv = std::getenv("ZHR_HEADLESS_RENDER");
+        const bool headlessRender = (headlessEnv != nullptr && headlessEnv[0] != '\0' && headlessEnv[0] != '0');
+
+        if (!headlessRender && hwnd != nullptr && pPresentationParameters->Windowed)
         {
             RECT curClient{};
             GetClientRect(hwnd, &curClient);
@@ -2910,13 +2913,14 @@ public:
         }
 
         int32_t ok = 0;
-        if (hwnd != nullptr)
+        if (!headlessRender && hwnd != nullptr)
         {
             // Prefer tear-free MAILBOX / IMMEDIATE so FramePacer controls render FPS (60/120/144/240/Uncapped) cleanly.
             ok = zhr_vk_init_win32(hwnd, GetModuleHandle(nullptr), w, h, false, validation);
         }
         else
         {
+            // Offscreen GPU headless UI & 3D render target (zero OS window/focus interruption; supports any resolution).
             ok = zhr_vk_init_headless(w, h, validation);
         }
 

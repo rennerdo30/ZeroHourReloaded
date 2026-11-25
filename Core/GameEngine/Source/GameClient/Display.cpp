@@ -62,6 +62,99 @@ Display::Display()
 	m_currentlyPlayingMovie.clear();
 	m_letterBoxFadeStartTime = 0;
 	m_isBatching = FALSE;
+	m_dpiScale = 1.0f;
+	m_uiScalePref = 0.0f; // Default: Auto (DPI-Aware aspect-correct UI scaling)
+}
+
+void Display::setDpiScale(Real scale)
+{
+	if (scale < 1.0f) scale = 1.0f;
+	if (scale > 3.0f) scale = 3.0f;
+	m_dpiScale = scale;
+}
+
+void Display::setUiScalePreference(Real pref)
+{
+	if (pref < -0.5f)
+		m_uiScalePref = -1.0f;
+	else if (pref <= 0.01f)
+		m_uiScalePref = 0.0f;
+	else
+		m_uiScalePref = clamp(0.55f, pref, 1.00f);
+}
+
+Real Display::getEffectiveUiScale() const
+{
+	if (isUiScaleClassicStretched())
+		return 1.0f;
+
+	if (m_uiScalePref > 0.01f)
+		return clamp(0.55f, m_uiScalePref, 1.00f);
+
+	// Auto (DPI-Aware):
+	// Compute logical display height in 96-DPI desktop units so a 4K monitor at 150% DPI
+	// (logical 2560x1440) receives the exact same crisp physical UI proportion as 1440p @ 100%,
+	// and a 4K monitor at 200% DPI matches 1080p @ 100%, while scaling down cleanly on high-res displays.
+	const Real sh = static_cast<Real>(m_height > 0 ? m_height : DEFAULT_DISPLAY_HEIGHT);
+	const Real dpi = (m_dpiScale >= 1.0f) ? m_dpiScale : 1.0f;
+	const Real logicalH = sh / dpi;
+	const Real ratio = (logicalH > 600.0f) ? (logicalH / 600.0f) : 1.0f;
+	const Real targetLogicalUiH = 600.0f * powf(ratio, 0.55f);
+	const Real frac = (targetLogicalUiH * dpi) / sh;
+	return clamp(0.58f, frac, 0.88f);
+}
+
+void Display::getUiTransform(
+	Int createW,
+	Int createH,
+	UiScaleAnchor anchor,
+	Real &outScaleX,
+	Real &outScaleY,
+	Real &outOffsetX,
+	Real &outOffsetY) const
+{
+	const Real sw = static_cast<Real>(m_width > 0 ? m_width : DEFAULT_DISPLAY_WIDTH);
+	const Real sh = static_cast<Real>(m_height > 0 ? m_height : DEFAULT_DISPLAY_HEIGHT);
+	const Real cw = static_cast<Real>(createW > 0 ? createW : DEFAULT_DISPLAY_WIDTH);
+	const Real ch = static_cast<Real>(createH > 0 ? createH : DEFAULT_DISPLAY_HEIGHT);
+
+	if (anchor == UI_ANCHOR_STRETCH || isUiScaleClassicStretched())
+	{
+		outScaleX = sw / cw;
+		outScaleY = sh / ch;
+		outOffsetX = 0.0f;
+		outOffsetY = 0.0f;
+		return;
+	}
+
+	const Real frac = getEffectiveUiScale();
+	Real s = (sh * frac) / ch;
+	if (cw * s > sw)
+	{
+		s = sw / cw;
+	}
+
+	const Real virtualW = cw * s;
+	const Real virtualH = ch * s;
+	outScaleX = s;
+	outScaleY = s;
+
+	switch (anchor)
+	{
+	case UI_ANCHOR_BOTTOM_CENTER:
+		outOffsetX = (sw - virtualW) * 0.5f;
+		outOffsetY = sh - virtualH;
+		break;
+	case UI_ANCHOR_RIGHT_CENTER:
+		outOffsetX = sw - virtualW;
+		outOffsetY = (sh - virtualH) * 0.5f;
+		break;
+	case UI_ANCHOR_CENTER:
+	default:
+		outOffsetX = (sw - virtualW) * 0.5f;
+		outOffsetY = (sh - virtualH) * 0.5f;
+		break;
+	}
 }
 
 /**

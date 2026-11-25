@@ -968,3 +968,25 @@ UnsignedInt OptionPreferences::getZhrMaxRenderFps() const
 		return LOGICFRAMES_PER_SECOND;
 	return (UnsignedInt)val;
 }
+
+Real OptionPreferences::getZhrUiScale() const
+{
+	OptionPreferences::const_iterator it = find("ZhrUiScale");
+	if (it == end())
+		return 0.0f; // Default: Auto (DPI-Aware aspect-correct UI scaling)
+
+	const char *s = it->second.str();
+	if (stricmp(s, "auto") == 0)
+		return 0.0f;
+	if (stricmp(s, "classic") == 0 || stricmp(s, "stretched") == 0)
+		return -1.0f;
+
+	Real val = static_cast<Real>(atof(s));
+	if (val < -0.5f)
+		return -1.0f;
+	if (val == 0.0f)
+		return 0.0f;
+	if (val > 2.0f)
+		val *= 0.01f; // Accept percentage format like "75" -> 0.75f
+	return clamp(0.55f, val, 1.00f);
+}

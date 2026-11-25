@@ -274,6 +274,7 @@ public:
 private:
 	ControlBarScheme *m_currentScheme;													///< the current scheme that everythign uses
 	Coord2D m_multiplier;
+	ICoord2D m_origin;																	///< DPI-aware aspect-correct bottom-center screen origin
 
 	typedef std::list< ControlBarScheme* > ControlBarSchemeList;			///< list of control bar schemes
 	ControlBarSchemeList m_schemeList;

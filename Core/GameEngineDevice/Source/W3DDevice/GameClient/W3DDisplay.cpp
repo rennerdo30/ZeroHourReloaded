@@ -54,6 +54,9 @@ static void drawFramerateBar();
 #include "Common/ThingTemplate.h"
 #include "Common/GameLOD.h"
 #include "Common/OptionPreferences.h"
+#ifdef ZHR_USE_SDL3
+#include "SDLDevice/SDL3Platform.h"
+#endif
 #include "Common/DrawModule.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/Module/PhysicsUpdate.h"
@@ -602,6 +605,14 @@ Bool W3DDisplay::setDisplayMode( UnsignedInt xres, UnsignedInt yres, UnsignedInt
 	return FALSE;	//did not change to a new mode.
 }
 
+void W3DDisplay::flushFontGlyphCaches()
+{
+	if (WW3DAssetManager::Get_Instance())
+	{
+		WW3DAssetManager::Get_Instance()->Free_All_FontChars_Glyph_Caches();
+	}
+}
+
 /** Set width of display */
 //=============================================================================
 void W3DDisplay::setWidth( UnsignedInt width )
@@ -861,6 +872,41 @@ void W3DDisplay::init()
 #endif
 
 		setWindowed( TheGlobalData->m_windowed );
+
+		// Initialize DPI awareness scale and user UI scale preference before any .wnd layouts load
+		{
+			Real dpiScale = 1.0f;
+#ifdef ZHR_USE_SDL3
+			dpiScale = ZhrSDL3Platform::getDisplayDpiScale();
+#elif defined(_WIN32)
+			extern HWND ApplicationHWnd;
+			if (ApplicationHWnd)
+			{
+				const UINT dpi = GetDpiForWindow(ApplicationHWnd);
+				if (dpi >= 72u && dpi <= 384u)
+					dpiScale = static_cast<Real>(dpi) / 96.0f;
+			}
+#endif
+			setDpiScale(dpiScale);
+
+			OptionPreferences uiPref;
+			Real uiScalePref = uiPref.getZhrUiScale();
+			if (const char* envUiScale = getenv("ZHR_UI_SCALE"))
+			{
+				if (stricmp(envUiScale, "auto") == 0)
+					uiScalePref = 0.0f;
+				else if (stricmp(envUiScale, "classic") == 0 || stricmp(envUiScale, "stretched") == 0)
+					uiScalePref = -1.0f;
+				else
+				{
+					Real parsed = static_cast<Real>(atof(envUiScale));
+					if (parsed > 2.0f) parsed *= 0.01f;
+					if (parsed >= 0.50f && parsed <= 1.20f)
+						uiScalePref = parsed;
+				}
+			}
+			setUiScalePreference(uiScalePref);
+		}
 
 		// create a 2D renderer helper
 		m_2DRender = NEW Render2DClass;

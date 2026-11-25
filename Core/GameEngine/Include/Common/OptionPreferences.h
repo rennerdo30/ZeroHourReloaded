@@ -132,11 +132,13 @@ public:
 
 	Real getGameWindowTransitionSpeedMultiplier() const;
 
-	// ZeroHourReloaded Vulkan 1.3 Remaster & Frame Pacing settings
+	// ZeroHourReloaded Vulkan 1.3 Remaster, Frame Pacing & DPI-Aware UI Scaling settings
 	UnsignedInt getZhrGraphicsMode() const;
 	Bool getZhrPbrWaterSsaoEnabled() const;
 	Bool getZhrHdrPostFxEnabled() const;
 	Bool getZhrRemasterTexturesEnabled() const;
 	Bool getZhrMeshSmoothingEnabled() const;
 	UnsignedInt getZhrMaxRenderFps() const;
+	/// Returns 0.0f for Auto (DPI-Aware), -1.0f for Classic 2003 stretched, or [0.55f..1.00f] explicit height fraction.
+	Real getZhrUiScale() const;
 };

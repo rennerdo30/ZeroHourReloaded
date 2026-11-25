@@ -901,7 +901,10 @@ pub extern "C" fn zhr_audio_init(headless: bool) -> i32 {
     if guard.engine.is_none() {
         let env_headless = std::env::var("ZHR_AUDIO_HEADLESS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || std::env::var("ZHR_HEADLESS_RENDER")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false);
         let engine = AudioEngine::new(headless || env_headless);
         let name =
             CString::new(engine.device_name()).unwrap_or_else(|_| c"Audio Device".to_owned());

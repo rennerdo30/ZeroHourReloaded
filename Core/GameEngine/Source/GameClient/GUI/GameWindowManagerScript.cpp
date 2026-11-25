@@ -523,6 +523,52 @@ static Bool parseTooltip( const char *token, WinInstanceData *instData,
 
 }
 
+static Display::UiScaleAnchor s_zhrCurrentScriptAnchor = Display::UI_ANCHOR_CENTER;
+
+static Bool zhrContainsNoCase(const char *haystack, const char *needle)
+{
+	if (!haystack || !needle || !*needle)
+		return FALSE;
+	const size_t nlen = strlen(needle);
+	for (const char *p = haystack; *p; ++p)
+	{
+		size_t i = 0;
+		while (i < nlen && p[i] &&
+			   tolower(static_cast<unsigned char>(p[i])) == tolower(static_cast<unsigned char>(needle[i])))
+		{
+			++i;
+		}
+		if (i == nlen)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static Display::UiScaleAnchor zhrClassifyScriptAnchor(const char *filename)
+{
+	if (!filename || !*filename)
+		return Display::UI_ANCHOR_CENTER;
+	if (zhrContainsNoCase(filename, "LoadScreen") ||
+		zhrContainsNoCase(filename, "BlankWindow") ||
+		zhrContainsNoCase(filename, "CreditsMenu") ||
+		zhrContainsNoCase(filename, "OptionsMenu"))
+	{
+		return Display::UI_ANCHOR_STRETCH;
+	}
+	if (zhrContainsNoCase(filename, "ControlBar") ||
+		zhrContainsNoCase(filename, "ReplayControl") ||
+		zhrContainsNoCase(filename, "IdleWorker"))
+	{
+		return Display::UI_ANCHOR_BOTTOM_CENTER;
+	}
+	if (zhrContainsNoCase(filename, "MainMenu") ||
+		zhrContainsNoCase(filename, "SpecialPowerShortcut"))
+	{
+		return Display::UI_ANCHOR_RIGHT_CENTER;
+	}
+	return Display::UI_ANCHOR_CENTER;
+}
+
 // parseScreenRect ============================================================
 /** Parse the screen rect entry which tells us the position and size
 	* of window.  Note we scale for the current resolution if needed
@@ -557,15 +603,15 @@ static Bool parseScreenRect( const char *token, char *buffer,
 	scanInt( c, createRes.y );
 
 	//
-	// shrink or expand the screen region by the ratio of the current
-	// resolution divided by the creation resolution
+	// Scale and anchor the screen region cleanly using ZeroHourReloaded's DPI-aware UI transform
+	// (aspect-correct by default, or Classic 2003 stretched if selected).
 	//
-	Real xScale = (Real)TheDisplay->getWidth() / (Real)createRes.x;
-	Real yScale = (Real)TheDisplay->getHeight() / (Real)createRes.y;
-	screenRegion.lo.x = (Int)((Real)screenRegion.lo.x * xScale);
-	screenRegion.lo.y = (Int)((Real)screenRegion.lo.y * yScale);
-	screenRegion.hi.x = (Int)((Real)screenRegion.hi.x * xScale);
-	screenRegion.hi.y = (Int)((Real)screenRegion.hi.y * yScale);
+	Real xScale = 1.0f, yScale = 1.0f, offsetX = 0.0f, offsetY = 0.0f;
+	TheDisplay->getUiTransform(createRes.x, createRes.y, s_zhrCurrentScriptAnchor, xScale, yScale, offsetX, offsetY);
+	screenRegion.lo.x = REAL_TO_INT_FLOOR((Real)screenRegion.lo.x * xScale + offsetX + 0.5f);
+	screenRegion.lo.y = REAL_TO_INT_FLOOR((Real)screenRegion.lo.y * yScale + offsetY + 0.5f);
+	screenRegion.hi.x = REAL_TO_INT_FLOOR((Real)screenRegion.hi.x * xScale + offsetX + 0.5f);
+	screenRegion.hi.y = REAL_TO_INT_FLOOR((Real)screenRegion.hi.y * yScale + offsetY + 0.5f);
 
 	//
 	// given the screen region upper left compute the upper left that we
@@ -2745,9 +2791,19 @@ GameWindow *GameWindowManager::winCreateFromScript( AsciiString filenameString,
 	// zero info struct
 	//memset( &scriptInfo, 0, sizeof( WindowLayoutInfo ) ); // it's a class - use a constructor
 
-  // Reset the window stack
-  resetWindowStack();
+	// Reset the window stack
+	resetWindowStack();
 	resetWindowDefaults();
+
+	struct ScopedScriptAnchor
+	{
+		Display::UiScaleAnchor prev;
+		explicit ScopedScriptAnchor(Display::UiScaleAnchor next) : prev(s_zhrCurrentScriptAnchor)
+		{
+			s_zhrCurrentScriptAnchor = next;
+		}
+		~ScopedScriptAnchor() { s_zhrCurrentScriptAnchor = prev; }
+	} scopedAnchor(zhrClassifyScriptAnchor(filename));
 
 	//
 	// get the filename from the parameter, if it doesn't contain a '\' it is

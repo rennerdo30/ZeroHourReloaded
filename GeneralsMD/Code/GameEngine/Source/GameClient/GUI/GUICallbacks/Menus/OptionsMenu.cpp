@@ -39,12 +39,14 @@
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
 #include "Common/OptionPreferences.h"
+#include "Common/PlayerList.h"
 #include "Common/GameLOD.h"
 #include "Common/Recorder.h"
 #include "Common/Registry.h"
 #include "Common/version.h"
 
 #include "GameClient/ClientInstance.h"
+#include "GameClient/ControlBar.h"
 #include "GameClient/GameClient.h"
 #include "GameClient/InGameUI.h"
 #include "GameClient/LookAtXlat.h"
@@ -251,6 +253,9 @@ static Bool s_zhrCurMeshSmooth = TRUE;
 static UnsignedInt s_zhrSavedMaxFps = 144u;
 static UnsignedInt s_zhrCurMaxFps = 144u;
 
+static Real s_zhrSavedUiScale = 0.0f;
+static Real s_zhrCurUiScale = 0.0f;
+
 // Dynamic ZHR controls (owned as children of OptionsMenuParent; destroyed with layout)
 static NameKeyType s_zhrTabIDs[ZHR_TAB_COUNT] = { NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID };
 static GameWindow *s_zhrTabButtons[ZHR_TAB_COUNT] = { nullptr, nullptr, nullptr, nullptr };
@@ -268,6 +273,9 @@ static GameWindow *s_zhrLblDetail = nullptr;
 static GameWindow *s_zhrLblMaxFps = nullptr;
 static NameKeyType s_zhrComboMaxFpsID = NAMEKEY_INVALID;
 static GameWindow *s_zhrComboMaxFps = nullptr;
+static GameWindow *s_zhrLblUiScale = nullptr;
+static NameKeyType s_zhrComboUiScaleID = NAMEKEY_INVALID;
+static GameWindow *s_zhrComboUiScale = nullptr;
 static GameWindow *s_zhrLblBrightness = nullptr;
 static NameKeyType s_zhrBtnCustomDetailID = NAMEKEY_INVALID;
 static GameWindow *s_zhrBtnCustomDetail = nullptr;
@@ -329,6 +337,8 @@ static void clearZhrOptionsWidgets()
 	s_zhrLblDetail = nullptr;
 	s_zhrLblMaxFps = nullptr;
 	s_zhrComboMaxFps = nullptr;
+	s_zhrLblUiScale = nullptr;
+	s_zhrComboUiScale = nullptr;
 	s_zhrLblBrightness = nullptr;
 	s_zhrBtnCustomDetail = nullptr;
 
@@ -453,6 +463,26 @@ static void applyLiveMaxRenderFps(UnsignedInt maxFps)
 		TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
 		TheFramePacer->enableLogicTimeScale(maxFps > LOGICFRAMES_PER_SECOND);
 	}
+}
+
+static const Real s_zhrUiScaleChoices[] = {
+	0.0f, 0.65f, 0.75f, 0.85f, 1.00f, -1.0f
+};
+
+static Int zhrUiScaleToComboIdx(Real scale)
+{
+	if (scale < -0.5f) return 5;   // Classic (Stretched)
+	if (scale <= 0.01f) return 0;  // Auto (DPI-Aware)
+	if (scale <= 0.70f) return 1;  // 65% (Compact)
+	if (scale <= 0.80f) return 2;  // 75%
+	if (scale <= 0.92f) return 3;  // 85%
+	return 4;                      // 100% (4:3 Fit)
+}
+
+static Real zhrComboIdxToUiScale(Int idx)
+{
+	if (idx < 0 || idx >= 6) return 0.0f;
+	return s_zhrUiScaleChoices[idx];
 }
 
 static void placeComboBox(GameWindow *combo, Int x, Int y, Int w, Int h)
@@ -758,6 +788,7 @@ static void selectZhrOptionsTab(Int tabIndex)
 	if (comboBoxResolution) GadgetComboBoxHideList(comboBoxResolution);
 	if (comboBoxDetail) GadgetComboBoxHideList(comboBoxDetail);
 	if (s_zhrComboMaxFps) GadgetComboBoxHideList(s_zhrComboMaxFps);
+	if (s_zhrComboUiScale) GadgetComboBoxHideList(s_zhrComboUiScale);
 	if (s_zhrComboVisualMode) GadgetComboBoxHideList(s_zhrComboVisualMode);
 	if (comboBoxOnlineIP) GadgetComboBoxHideList(comboBoxOnlineIP);
 	if (comboBoxLANIP) GadgetComboBoxHideList(comboBoxLANIP);
@@ -794,6 +825,8 @@ static void selectZhrOptionsTab(Int tabIndex)
 	showZhrWidget(s_zhrBtnCustomDetail, isGfx);
 	showZhrWidget(s_zhrLblMaxFps, isGfx);
 	showZhrWidget(s_zhrComboMaxFps, isGfx);
+	showZhrWidget(s_zhrLblUiScale, isGfx);
+	showZhrWidget(s_zhrComboUiScale, isGfx);
 	showZhrWidget(s_zhrLblBrightness, isGfx);
 	showZhrWidget(sliderGamma, isGfx);
 
@@ -848,14 +881,29 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 	const Int screenW = static_cast<Int>(TheDisplay->getWidth());
 	const Int screenH = static_cast<Int>(TheDisplay->getHeight());
 
-	// Center a clean proportional modal card (balanced from 1280x720 up to 3840x2160)
-	Int cardW = static_cast<Int>(screenW * 0.84f);
-	const Int maxAspectW = static_cast<Int>(screenH * 1.50f);
-	if (cardW > maxAspectW) cardW = maxAspectW;
-	if (cardW < 780) cardW = (screenW > 780) ? 780 : (screenW - 24);
+	// Center a clean DPI-aware proportional modal card aligned with ZeroHourReloaded's UI scale
+	Real uiSx = 1.0f, uiSy = 1.0f, uiOx = 0.0f, uiOy = 0.0f;
+	TheDisplay->getUiTransform(
+		DEFAULT_DISPLAY_WIDTH,
+		DEFAULT_DISPLAY_HEIGHT,
+		Display::UI_ANCHOR_CENTER,
+		uiSx, uiSy, uiOx, uiOy);
+	const Int scaledBaseW = REAL_TO_INT_FLOOR(DEFAULT_DISPLAY_WIDTH * uiSx + 0.5f);
+	const Int scaledBaseH = REAL_TO_INT_FLOOR(DEFAULT_DISPLAY_HEIGHT * uiSy + 0.5f);
 
-	Int cardH = static_cast<Int>(screenH * 0.82f);
-	if (cardH < 520) cardH = (screenH > 520) ? 520 : (screenH - 24);
+	Int cardW = TheDisplay->isUiScaleClassicStretched()
+		? static_cast<Int>(screenW * 0.84f)
+		: static_cast<Int>(scaledBaseW * 1.14f);
+	const Int maxAspectW = static_cast<Int>(scaledBaseH * 1.56f);
+	if (cardW > maxAspectW) cardW = maxAspectW;
+	if (cardW > static_cast<Int>(screenW * 0.92f)) cardW = static_cast<Int>(screenW * 0.92f);
+	if (cardW < 760) cardW = (screenW > 760) ? 760 : (screenW - 24);
+
+	Int cardH = TheDisplay->isUiScaleClassicStretched()
+		? static_cast<Int>(screenH * 0.82f)
+		: static_cast<Int>(scaledBaseH * 0.90f);
+	if (cardH > static_cast<Int>(screenH * 0.90f)) cardH = static_cast<Int>(screenH * 0.90f);
+	if (cardH < 500) cardH = (screenH > 500) ? 500 : (screenH - 24);
 
 	const Int cardX = (screenW - cardW) / 2;
 	const Int cardY = (screenH - cardH) / 2;
@@ -882,6 +930,15 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 	if (s_zhrAudioGroup == s_zhrModalBox || s_zhrAudioGroup == parent) s_zhrAudioGroup = nullptr;
 	if (s_zhrControlsGroup == s_zhrModalBox || s_zhrControlsGroup == parent) s_zhrControlsGroup = nullptr;
 	if (s_zhrNetworkGroup == s_zhrModalBox || s_zhrNetworkGroup == parent) s_zhrNetworkGroup = nullptr;
+
+	// If OptionsMenuParent is nested inside a full-screen .wnd root backdrop, pin that root to (0,0,screenW,screenH)
+	// and mark it SEE_THRU so cardX/cardY are exact screen coordinates and no duplicate glass frame appears behind the modal.
+	for (GameWindow *anc = parent->winGetParent(); anc != nullptr; anc = anc->winGetParent())
+	{
+		anc->winSetPosition(0, 0);
+		anc->winSetSize(screenW, screenH);
+		anc->winSetStatus(WIN_STATUS_SEE_THRU);
+	}
 
 	// Align OptionsMenuParent (outer) and OptionsMenuParentOld (frosted modal card)
 	parent->winSetPosition(cardX, cardY);
@@ -1112,13 +1169,20 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 		s_zhrBtnCustomDetail->winEnable(FALSE);
 	cy += leftComboH + leftRowGap;
 
+	const Int halfGap = 10;
+	const Int halfW = (ctrlW - halfGap) / 2;
+	const Int rightHalfX = leftCardX + cPadX + halfW + halfGap;
+
 	s_zhrLblMaxFps = createZhrLabel(
-		gfxParent, "OptionsMenu.wnd:ZhrLblMaxFps", UnicodeString(L"Max Render FPS (30 Hz Logic)"),
-		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
+		gfxParent, "OptionsMenu.wnd:ZhrLblMaxFps", UnicodeString(L"Max Render FPS"),
+		leftCardX + cPadX, cy, halfW, lblH, bodyFont, colLabel);
+	s_zhrLblUiScale = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblUiScale", UnicodeString(L"UI Scale (DPI)"),
+		rightHalfX, cy, ctrlW - halfW - halfGap, lblH, bodyFont, colLabel);
 	cy += lblH + 2;
 	s_zhrComboMaxFps = createZhrComboBox(
 		gfxParent, "OptionsMenu.wnd:ZhrComboMaxFps",
-		leftCardX + cPadX, cy, ctrlW, leftComboH, bodyFont, s_zhrComboMaxFpsID);
+		leftCardX + cPadX, cy, halfW, leftComboH, bodyFont, s_zhrComboMaxFpsID);
 	if (s_zhrComboMaxFps)
 	{
 		const Color entryCol = GameMakeColor(236, 246, 255, 255);
@@ -1131,6 +1195,22 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"240 FPS"), entryCol);
 		GadgetComboBoxAddEntry(s_zhrComboMaxFps, UnicodeString(L"Uncapped"), entryCol);
 		GadgetComboBoxSetSelectedPos(s_zhrComboMaxFps, zhrFpsToComboIdx(s_zhrCurMaxFps));
+	}
+	s_zhrComboUiScale = createZhrComboBox(
+		gfxParent, "OptionsMenu.wnd:ZhrComboUiScale",
+		rightHalfX, cy, ctrlW - halfW - halfGap, leftComboH, bodyFont, s_zhrComboUiScaleID);
+	if (s_zhrComboUiScale)
+	{
+		const Color entryCol = GameMakeColor(236, 246, 255, 255);
+		GadgetComboBoxReset(s_zhrComboUiScale);
+		GadgetComboBoxSetMaxDisplay(s_zhrComboUiScale, 6);
+		GadgetComboBoxAddEntry(s_zhrComboUiScale, UnicodeString(L"Auto (DPI)"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboUiScale, UnicodeString(L"65% Compact"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboUiScale, UnicodeString(L"75%"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboUiScale, UnicodeString(L"85%"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboUiScale, UnicodeString(L"100% (4:3)"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboUiScale, UnicodeString(L"Classic Stretch"), entryCol);
+		GadgetComboBoxSetSelectedPos(s_zhrComboUiScale, zhrUiScaleToComboIdx(s_zhrCurUiScale));
 	}
 	cy += leftComboH + leftRowGap;
 
@@ -1458,13 +1538,16 @@ static void setDefaults()
  	GadgetSliderSetPosition(sliderGamma, ((valMax - valMin) / 2 + valMin));
 
 	//-------------------------------------------------------------------------------------------------
-	// ZeroHourReloaded Vulkan 1.3 Remaster & Frame Pacing defaults (Remastered all-ON, 144 FPS)
+	// ZeroHourReloaded Vulkan 1.3 Remaster, UI Scale & Frame Pacing defaults (Remastered all-ON, 144 FPS, Auto DPI UI)
 	s_zhrCurMaxFps = 144u;
-	if (s_zhrComboMaxFps)
+	s_zhrCurUiScale = 0.0f;
 	{
 		const Bool prevIgn = ignoreSelected;
 		ignoreSelected = TRUE;
-		GadgetComboBoxSetSelectedPos(s_zhrComboMaxFps, zhrFpsToComboIdx(s_zhrCurMaxFps));
+		if (s_zhrComboMaxFps)
+			GadgetComboBoxSetSelectedPos(s_zhrComboMaxFps, zhrFpsToComboIdx(s_zhrCurMaxFps));
+		if (s_zhrComboUiScale)
+			GadgetComboBoxSetSelectedPos(s_zhrComboUiScale, zhrUiScaleToComboIdx(s_zhrCurUiScale));
 		ignoreSelected = prevIgn;
 	}
 	applyLiveMaxRenderFps(s_zhrCurMaxFps);
@@ -2023,7 +2106,8 @@ static void saveOptions()
 	}
 
 	//-------------------------------------------------------------------------------------------------
-	// ZeroHourReloaded Max Render FPS & Vulkan 1.3 Remaster settings
+	// ZeroHourReloaded Max Render FPS, DPI-Aware UI Scale & Vulkan 1.3 Remaster settings
+	Bool zhrUiScaleChanged = FALSE;
 	{
 		if (s_zhrCurMaxFps >= RenderFpsPreset::UncappedFpsValue)
 		{
@@ -2037,6 +2121,27 @@ static void saveOptions()
 		}
 		applyLiveMaxRenderFps(s_zhrCurMaxFps);
 		s_zhrSavedMaxFps = s_zhrCurMaxFps;
+
+		if (s_zhrCurUiScale < -0.5f)
+		{
+			(*pref)["ZhrUiScale"] = "classic";
+		}
+		else if (s_zhrCurUiScale <= 0.01f)
+		{
+			(*pref)["ZhrUiScale"] = "auto";
+		}
+		else
+		{
+			AsciiString scaleStr;
+			scaleStr.format("%d", REAL_TO_INT_FLOOR(s_zhrCurUiScale * 100.0f + 0.5f));
+			(*pref)["ZhrUiScale"] = scaleStr;
+		}
+		if (TheDisplay && fabsf(s_zhrCurUiScale - s_zhrSavedUiScale) > 0.005f)
+		{
+			TheDisplay->setUiScalePreference(s_zhrCurUiScale);
+			s_zhrSavedUiScale = s_zhrCurUiScale;
+			zhrUiScaleChanged = TRUE;
+		}
 	}
 
 	if (s_zhrHasVulkan && TheDisplay)
@@ -2102,6 +2207,26 @@ static void saveOptions()
 				TheInGameUI->recreateControlBar();
 				TheInGameUI->refreshCustomUiResources();
 			}
+		}
+	}
+
+	if (!dispChanged && zhrUiScaleChanged)
+	{
+		if (TheDisplay)
+			TheDisplay->flushFontGlyphCaches();
+		if (TheHeaderTemplateManager)
+			TheHeaderTemplateManager->onResolutionChanged();
+		if (TheShell)
+			TheShell->recreateWindowLayouts();
+		if (TheInGameUI)
+		{
+			TheInGameUI->recreateControlBar();
+			TheInGameUI->refreshCustomUiResources();
+		}
+		if (TheControlBar && ThePlayerList && ThePlayerList->getLocalPlayer())
+		{
+			TheControlBar->setControlBarSchemeByPlayer(ThePlayerList->getLocalPlayer());
+			TheControlBar->markUIDirty();
 		}
 	}
 
@@ -2193,6 +2318,8 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 		s_zhrSavedMaxFps = pref->getZhrMaxRenderFps();
 	}
 	s_zhrCurMaxFps = s_zhrSavedMaxFps;
+	s_zhrSavedUiScale = TheDisplay ? TheDisplay->getUiScalePreference() : pref->getZhrUiScale();
+	s_zhrCurUiScale = s_zhrSavedUiScale;
 
 	s_zhrHasVulkan = (TheDisplay && TheDisplay->hasVulkanRemasterBackend()) ? TRUE : FALSE;
 	if (s_zhrHasVulkan)
@@ -2858,6 +2985,12 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 					GadgetComboBoxGetSelectedPos(s_zhrComboMaxFps, &index);
 					s_zhrCurMaxFps = zhrComboIdxToFps(index);
 					applyLiveMaxRenderFps(s_zhrCurMaxFps);
+				}
+				else if (controlID == s_zhrComboUiScaleID)
+				{
+					Int index = 0;
+					GadgetComboBoxGetSelectedPos(s_zhrComboUiScale, &index);
+					s_zhrCurUiScale = zhrComboIdxToUiScale(index);
 				}
 				else if (controlID == s_zhrComboVisualModeID && s_zhrHasVulkan)
 				{

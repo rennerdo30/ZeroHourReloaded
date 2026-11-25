@@ -424,6 +424,21 @@ Int parseHeadless(char *args[], int num)
 	return 1;
 }
 
+Int parseHeadlessRender(char *args[], int num)
+{
+	(void)args;
+	(void)num;
+#ifdef _WIN32
+	_putenv("ZHR_HEADLESS_RENDER=1");
+#else
+	setenv("ZHR_HEADLESS_RENDER", "1", 1);
+#endif
+	TheWritableGlobalData->m_windowed = TRUE;
+	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_playSizzle = FALSE;
+	return 1;
+}
+
 Int parseReplay(char *args[], int num)
 {
 	if (num > 1)
@@ -1177,6 +1192,10 @@ static CommandLineParam paramsForStartup[] =
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay
 	{ "-headless", parseHeadless },
+
+	// ZeroHourReloaded: Offscreen GPU headless UI & 3D render mode (zero visible OS window, silent audio,
+	// full Vulkan 1.3 PBR/water/SSAO/HDR/frosted-glass UI rendering at any resolution for screenshots & CI).
+	{ "-headlessRender", parseHeadlessRender },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.

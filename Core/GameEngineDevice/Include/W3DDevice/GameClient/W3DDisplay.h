@@ -189,6 +189,8 @@ public:
 	virtual Real getCurrentFPS() override;						///< return the current FPS.
 	virtual Int getLastFrameDrawCalls() override;				///< returns the number of draw calls issued in the previous frame
 
+	virtual void flushFontGlyphCaches() override;
+
 	virtual Bool hasVulkanRemasterBackend() const override;
 	virtual void getVulkanRemasterSettings(UnsignedInt &mode, Bool &pbrWaterSsao, Bool &hdrPostFx, Bool &remasterTextures, Bool &meshSmoothing) const override;
 	virtual void setVulkanRemasterSettings(UnsignedInt mode, Bool pbrWaterSsao, Bool hdrPostFx, Bool remasterTextures, Bool meshSmoothing) override;

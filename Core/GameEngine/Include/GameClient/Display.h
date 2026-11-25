@@ -197,7 +197,34 @@ public:
 	virtual Real getCurrentFPS() = 0;	///< returns the current FPS.
 	virtual Int getLastFrameDrawCalls() = 0;  ///< returns the number of draw calls issued in the previous frame
 
-	// ZeroHourReloaded Vulkan 1.3 Remaster settings bridge
+	// ZeroHourReloaded Vulkan 1.3 Remaster & DPI-Aware UI Scaling bridge
+	enum UiScaleAnchor
+	{
+		UI_ANCHOR_STRETCH = 0,       ///< Full-screen stretch (loading screens / Classic Stretched mode)
+		UI_ANCHOR_CENTER,            ///< Aspect-correct uniform scale, centered on screen
+		UI_ANCHOR_BOTTOM_CENTER,     ///< Aspect-correct uniform scale, anchored bottom-center (ControlBar)
+		UI_ANCHOR_RIGHT_CENTER,      ///< Aspect-correct uniform scale, anchored right-center (MainMenu / Shortcuts)
+	};
+
+	void setDpiScale(Real scale);
+	Real getDpiScale() const { return m_dpiScale; }
+	/// 0.0f = Auto (DPI-Aware), -1.0f = Classic 2003 stretched, [0.55..1.00] = explicit height fraction.
+	void setUiScalePreference(Real pref);
+	Real getUiScalePreference() const { return m_uiScalePref; }
+	Bool isUiScaleClassicStretched() const { return m_uiScalePref < -0.5f; }
+	/// Effective virtual 4:3 UI height fraction of the display (0.55..1.00).
+	Real getEffectiveUiScale() const;
+	/// Computes screen-space scale + origin offset mapping a (createW x createH) UI canvas onto the display.
+	void getUiTransform(
+		Int createW,
+		Int createH,
+		UiScaleAnchor anchor,
+		Real &outScaleX,
+		Real &outScaleY,
+		Real &outOffsetX,
+		Real &outOffsetY) const;
+	virtual void flushFontGlyphCaches() {}
+
 	virtual Bool hasVulkanRemasterBackend() const { return FALSE; }
 	virtual void getVulkanRemasterSettings(UnsignedInt &mode, Bool &pbrWaterSsao, Bool &hdrPostFx, Bool &remasterTextures, Bool &meshSmoothing) const
 	{
@@ -222,6 +249,8 @@ protected:
 	UnsignedInt m_bitDepth;							///< bit depth of the display
 	Bool m_windowed;										///< TRUE when windowed, FALSE when fullscreen
 	Bool m_isBatching;
+	Real m_dpiScale;										///< OS display DPI scale factor (1.0, 1.25, 1.5, 2.0...)
+	Real m_uiScalePref;									///< 0.0=Auto DPI-Aware, -1.0=Classic Stretched, else [0.55..1.00]
 	View *m_viewList;										///< All of the views into the world
 
 	// Cinematic text data

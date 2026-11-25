@@ -206,6 +206,23 @@ Real GlobalLanguage::getResolutionFontSizeAdjustment() const
 
 Real GlobalLanguage::getResolutionFontSizeScale(ResolutionFontSizeMethod method, Real scaler)
 {
+	// When ZeroHourReloaded's DPI-aware aspect-correct UI scaling is active, scale fonts in lockstep
+	// with the scaled virtual UI canvas so text always fits crisply inside scaled buttons/panels
+	// from 720p up to 4K high-DPI without oversizing or clipping.
+	if (TheDisplay && !TheDisplay->isUiScaleClassicStretched())
+	{
+		Real sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
+		TheDisplay->getUiTransform(
+			DEFAULT_DISPLAY_WIDTH,
+			DEFAULT_DISPLAY_HEIGHT,
+			Display::UI_ANCHOR_CENTER,
+			sx, sy, ox, oy);
+		Real adjustFactor = sx;
+		if (adjustFactor < 1.0f)
+			adjustFactor = 1.0f;
+		return adjustFactor;
+	}
+
 	Real adjustFactor;
 
 	switch (method)

@@ -1627,9 +1627,7 @@ impl VulkanRenderer {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
-        let do_capture = af.swapchain_image_index.is_some()
-            && capture_path.is_some()
-            && self.frame_number == capture_frame;
+        let do_capture = capture_path.is_some() && self.frame_number == capture_frame;
 
         let capture_staging = if do_capture {
             let byte_len = (af.extent.width as usize) * (af.extent.height as usize) * 4;
@@ -1658,6 +1656,10 @@ impl VulkanRenderer {
             let dep = vk::DependencyInfo::default().image_memory_barriers(&to_src);
             // SAFETY: Valid barrier inside active command buffer.
             unsafe { self.ctx.device.cmd_pipeline_barrier2(cmd, &dep) };
+
+            if let Some(RenderTarget::Headless(t)) = &mut self.target {
+                t.color_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+            }
 
             let copy = [vk::BufferImageCopy::default()
                 .buffer_offset(0)
@@ -1767,47 +1769,6 @@ impl VulkanRenderer {
                 }
                 Err(e) => return Err(e.into()),
             }
-
-            if let (Some(path), Some((staging, byte_len))) = (capture_path, capture_staging) {
-                // SAFETY: Wait for fence before reading back the captured staging buffer.
-                unsafe {
-                    self.ctx
-                        .device
-                        .wait_for_fences(&[slot.in_flight_fence], true, u64::MAX)?;
-                }
-                let mut pixels = staging.mapped_slice()?[..byte_len].to_vec();
-                if af.color_format == vk::Format::B8G8R8A8_UNORM
-                    || af.color_format == vk::Format::B8G8R8A8_SRGB
-                {
-                    for px in pixels.chunks_exact_mut(4) {
-                        px.swap(0, 2);
-                        px[3] = 255;
-                    }
-                }
-                let _ =
-                    write_rgba8_png(Path::new(&path), af.extent.width, af.extent.height, &pixels);
-                staging.destroy(&mut self.ctx);
-                if let Ok(stats_path) = std::env::var("ZHR_VK_STATS_LOG")
-                    && !stats_path.is_empty()
-                {
-                    let report = format!(
-                        "device={}\nresolution={}x{}\nframe={}\ndraw_calls={}\ntriangles={}\npipeline_binds={}\ntexture_binds={}\nlive_textures={}\nremastered_textures={}\nvalidation_active={}\nvalidation_errors={}\n",
-                        self.ctx.device_info.name,
-                        af.extent.width,
-                        af.extent.height,
-                        self.frame_number,
-                        self.stats.draw_calls,
-                        self.stats.triangles,
-                        self.stats.pipeline_binds,
-                        self.stats.texture_binds,
-                        self.textures.len(),
-                        self.remastered_textures.len(),
-                        self.ctx.validation_active,
-                        self.ctx.validation_error_count(),
-                    );
-                    let _ = std::fs::write(stats_path, report);
-                }
-            }
         } else {
             let submit = [vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
             // SAFETY: Headless submission synchronized by `in_flight_fence`.
@@ -1820,6 +1781,48 @@ impl VulkanRenderer {
                 self.ctx
                     .device
                     .wait_for_fences(&[slot.in_flight_fence], true, u64::MAX)?;
+            }
+        }
+
+        if let (Some(path), Some((staging, byte_len))) = (capture_path, capture_staging) {
+            if af.swapchain_image_index.is_some() {
+                // SAFETY: Wait for fence before reading back the captured staging buffer.
+                unsafe {
+                    self.ctx
+                        .device
+                        .wait_for_fences(&[slot.in_flight_fence], true, u64::MAX)?;
+                }
+            }
+            let mut pixels = staging.mapped_slice()?[..byte_len].to_vec();
+            let swap_rb = af.color_format == vk::Format::B8G8R8A8_UNORM
+                || af.color_format == vk::Format::B8G8R8A8_SRGB;
+            for px in pixels.chunks_exact_mut(4) {
+                if swap_rb {
+                    px.swap(0, 2);
+                }
+                px[3] = 255;
+            }
+            let _ = write_rgba8_png(Path::new(&path), af.extent.width, af.extent.height, &pixels);
+            staging.destroy(&mut self.ctx);
+            if let Ok(stats_path) = std::env::var("ZHR_VK_STATS_LOG")
+                && !stats_path.is_empty()
+            {
+                let report = format!(
+                    "device={}\nresolution={}x{}\nframe={}\ndraw_calls={}\ntriangles={}\npipeline_binds={}\ntexture_binds={}\nlive_textures={}\nremastered_textures={}\nvalidation_active={}\nvalidation_errors={}\n",
+                    self.ctx.device_info.name,
+                    af.extent.width,
+                    af.extent.height,
+                    self.frame_number,
+                    self.stats.draw_calls,
+                    self.stats.triangles,
+                    self.stats.pipeline_binds,
+                    self.stats.texture_binds,
+                    self.textures.len(),
+                    self.remastered_textures.len(),
+                    self.ctx.validation_active,
+                    self.ctx.validation_error_count(),
+                );
+                let _ = std::fs::write(stats_path, report);
             }
         }
 

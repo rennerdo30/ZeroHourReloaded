@@ -17,6 +17,7 @@ extern Win32Mouse* TheWin32Mouse;
 extern DWORD TheMessageTime;
 #endif
 
+#include <cstdlib>
 #include <SDL3/SDL.h>
 
 namespace
@@ -25,6 +26,24 @@ namespace
 	Bool g_sdlInitialized = FALSE;
 	Bool g_focused = TRUE;
 	Bool g_minimized = FALSE;
+
+	void sdlPointToBackbufferPixel(float x, float y, int& outX, int& outY)
+	{
+		if (g_sdlWindow)
+		{
+			int winW = 0, winH = 0, pixW = 0, pixH = 0;
+			SDL_GetWindowSize(g_sdlWindow, &winW, &winH);
+			SDL_GetWindowSizeInPixels(g_sdlWindow, &pixW, &pixH);
+			if (winW > 0 && winH > 0 && pixW > 0 && pixH > 0 && (pixW != winW || pixH != winH))
+			{
+				outX = static_cast<int>(x * (static_cast<float>(pixW) / static_cast<float>(winW)) + 0.5f);
+				outY = static_cast<int>(y * (static_cast<float>(pixH) / static_cast<float>(winH)) + 0.5f);
+				return;
+			}
+		}
+		outX = static_cast<int>(x);
+		outY = static_cast<int>(y);
+	}
 }
 
 namespace ZhrSDL3Platform
@@ -45,8 +64,15 @@ Bool createWindow(const char* title, Int width, Int height, Bool windowed, void*
 		g_sdlInitialized = TRUE;
 	}
 
-	SDL_WindowFlags flags = SDL_WINDOW_VULKAN;
-	if (!windowed)
+	const char* headlessEnv = std::getenv("ZHR_HEADLESS_RENDER");
+	const Bool headlessRender = (headlessEnv && headlessEnv[0] != '\0' && headlessEnv[0] != '0') ? TRUE : FALSE;
+
+	SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+	if (headlessRender)
+	{
+		flags |= SDL_WINDOW_HIDDEN;
+	}
+	else if (!windowed)
 	{
 		flags |= SDL_WINDOW_FULLSCREEN;
 	}
@@ -64,9 +90,12 @@ Bool createWindow(const char* title, Int width, Int height, Bool windowed, void*
 		return FALSE;
 	}
 
-	SDL_SetWindowPosition(g_sdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-	SDL_ShowWindow(g_sdlWindow);
-	SDL_RaiseWindow(g_sdlWindow);
+	if (!headlessRender)
+	{
+		SDL_SetWindowPosition(g_sdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+		SDL_ShowWindow(g_sdlWindow);
+		SDL_RaiseWindow(g_sdlWindow);
+	}
 	g_focused = TRUE;
 	g_minimized = FALSE;
 
@@ -107,6 +136,40 @@ Bool isFocused()
 Bool isMinimized()
 {
 	return g_minimized;
+}
+
+Real getDisplayDpiScale()
+{
+	if (const char* envDpi = std::getenv("ZHR_DPI_SCALE"))
+	{
+		const float parsed = static_cast<float>(std::atof(envDpi));
+		if (parsed >= 0.75f && parsed <= 4.0f)
+			return parsed;
+	}
+
+	float scale = 1.0f;
+	if (g_sdlWindow)
+	{
+		const float sdlScale = SDL_GetWindowDisplayScale(g_sdlWindow);
+		if (sdlScale >= 0.75f && sdlScale <= 4.0f)
+			scale = sdlScale;
+	}
+#ifdef _WIN32
+	if (scale <= 1.001f && g_sdlWindow)
+	{
+		SDL_PropertiesID props = SDL_GetWindowProperties(g_sdlWindow);
+		HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+		if (hwnd)
+		{
+			const UINT dpi = GetDpiForWindow(hwnd);
+			if (dpi >= 72u && dpi <= 384u)
+				scale = static_cast<float>(dpi) / 96.0f;
+		}
+	}
+#endif
+	if (scale < 1.0f) scale = 1.0f;
+	if (scale > 3.0f) scale = 3.0f;
+	return scale;
 }
 
 void pumpEvents()
@@ -174,8 +237,8 @@ void pumpEvents()
 		case SDL_EVENT_MOUSE_MOTION:
 			if (TheWin32Mouse)
 			{
-				const int mx = static_cast<int>(ev.motion.x);
-				const int my = static_cast<int>(ev.motion.y);
+				int mx = 0, my = 0;
+				sdlPointToBackbufferPixel(ev.motion.x, ev.motion.y, mx, my);
 				TheWin32Mouse->addWin32Event(WM_MOUSEMOVE, 0, MAKELPARAM(mx, my), nowMs);
 			}
 			break;
@@ -183,8 +246,8 @@ void pumpEvents()
 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
 			if (TheWin32Mouse)
 			{
-				const int mx = static_cast<int>(ev.button.x);
-				const int my = static_cast<int>(ev.button.y);
+				int mx = 0, my = 0;
+				sdlPointToBackbufferPixel(ev.button.x, ev.button.y, mx, my);
 				const LPARAM lp = MAKELPARAM(mx, my);
 				const bool dbl = (ev.button.clicks >= 2);
 				UINT msg = 0;
@@ -202,8 +265,8 @@ void pumpEvents()
 		case SDL_EVENT_MOUSE_BUTTON_UP:
 			if (TheWin32Mouse)
 			{
-				const int mx = static_cast<int>(ev.button.x);
-				const int my = static_cast<int>(ev.button.y);
+				int mx = 0, my = 0;
+				sdlPointToBackbufferPixel(ev.button.x, ev.button.y, mx, my);
 				const LPARAM lp = MAKELPARAM(mx, my);
 				UINT msg = 0;
 				if (ev.button.button == SDL_BUTTON_LEFT)
@@ -221,8 +284,8 @@ void pumpEvents()
 			if (TheWin32Mouse)
 			{
 				const short delta = static_cast<short>(ev.wheel.y * 120.0f);
-				const int mx = static_cast<int>(ev.wheel.mouse_x);
-				const int my = static_cast<int>(ev.wheel.mouse_y);
+				int mx = 0, my = 0;
+				sdlPointToBackbufferPixel(ev.wheel.mouse_x, ev.wheel.mouse_y, mx, my);
 				TheWin32Mouse->addWin32Event(WM_MOUSEWHEEL, MAKEWPARAM(0, delta), MAKELPARAM(mx, my), nowMs);
 			}
 			break;

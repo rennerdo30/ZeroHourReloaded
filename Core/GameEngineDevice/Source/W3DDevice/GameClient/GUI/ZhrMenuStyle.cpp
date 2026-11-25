@@ -20,6 +20,7 @@
 #include "GameClient/GameWindow.h"
 #include "GameClient/GameWindowGlobal.h"
 #include "GameClient/GameWindowManager.h"
+#include "GameClient/GlobalLanguage.h"
 #include "GameClient/Image.h"
 #include "GameClient/Shell.h"
 #include "WW3D2/render2d.h"
@@ -154,16 +155,23 @@ void drawStatusPill(Int screenW, Int screenH)
 	const bool postOn = (packed & 0x8u) != 0u;
 	const bool texOn = (packed & 0x10u) != 0u;
 
-	if (!s_statusBadgeText)
+	const Int targetFontPt = TheGlobalLanguageData
+		? std::max(10, TheGlobalLanguageData->adjustFontSize(9))
+		: 12;
+	static Int s_statusBadgeFontPt = -1;
+
+	if (!s_statusBadgeText || s_statusBadgeFontPt != targetFontPt)
 	{
-		s_statusBadgeText = TheDisplayStringManager->newDisplayString();
+		if (!s_statusBadgeText)
+			s_statusBadgeText = TheDisplayStringManager->newDisplayString();
 		if (!s_statusBadgeText)
 			return;
-		GameFont *font = TheFontLibrary->getFont("Generals", 12, FALSE);
+		GameFont *font = TheFontLibrary->getFont("Generals", targetFontPt, FALSE);
 		if (!font)
-			font = TheFontLibrary->getFont("Arial", 12, FALSE);
+			font = TheFontLibrary->getFont("Arial", targetFontPt, FALSE);
 		if (font)
 			s_statusBadgeText->setFont(font);
+		s_statusBadgeFontPt = targetFontPt;
 		s_cachedGfxMode = 0xFFFFFFFFu;
 	}
 
@@ -195,12 +203,16 @@ void drawStatusPill(Int screenW, Int screenH)
 	if (textW <= 0 || textH <= 0)
 		return;
 
-	const Int padX = 12;
-	const Int padY = 5;
+	const Real uiScale = (TheDisplay && !TheDisplay->isUiScaleClassicStretched())
+		? std::max(1.0f, TheDisplay->getDpiScale())
+		: 1.0f;
+	const Int padX = static_cast<Int>(12.0f * uiScale);
+	const Int padY = static_cast<Int>(5.0f * uiScale);
 	const Int pillW = textW + padX * 2;
 	const Int pillH = textH + padY * 2;
-	const Int pillX = (mode == 2u) ? (screenW / 2 + 16) : 24;
-	const Int pillY = screenH - pillH - 18;
+	const Int margin = static_cast<Int>(18.0f * uiScale);
+	const Int pillX = (mode == 2u) ? (screenW / 2 + margin) : static_cast<Int>(24.0f * uiScale);
+	const Int pillY = screenH - pillH - margin;
 
 	if (pillX + pillW > screenW - 12)
 		return;
@@ -327,6 +339,10 @@ Bool shouldStyleShellPanel(GameWindow *window, WinInstanceData *instData)
 		return FALSE;
 
 	if (isDividerLineWindow(window, instData) || isSubPanelWindow(window, instData))
+		return FALSE;
+
+	// Never paint frosted glass onto transparent click-catcher / SEE_THRU wrapper containers.
+	if (BitIsSet(window->winGetStatus(), WIN_STATUS_SEE_THRU))
 		return FALSE;
 
 	const char *name = instData->m_decoratedNameString.str();
