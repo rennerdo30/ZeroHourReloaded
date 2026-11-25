@@ -59,6 +59,33 @@ if ($inPath) {
 if ($sccachePath) {
     $env:SCCACHE_DIR = "E:/sccache"
     $env:SCCACHE_CACHE_SIZE = "50G"
+
+    # Self-heal sccache if its local Windows daemon socket closed (os error 10054).
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $sccachePath --show-stats *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Restarting unresponsive sccache daemon..." -ForegroundColor Yellow
+        & $sccachePath --stop-server *> $null
+        Get-Process sccache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        & $sccachePath --start-server *> $null
+        & $sccachePath --show-stats *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "sccache unavailable; falling back to direct cl/rustc." -ForegroundColor Yellow
+            $sccachePath = $null
+        }
+    }
+    # Probe rustc wrapping under the active vcvars64 environment (some Windows sccache builds fail with os error 10054 on rustc).
+    $rustcCmd = Get-Command rustc -ErrorAction SilentlyContinue
+    if ($sccachePath -and $rustcCmd) {
+        & $sccachePath $rustcCmd.Source -vV *> $null
+        if ($LASTEXITCODE -ne 0) {
+            $env:RUSTC_WRAPPER = ""
+        }
+    } elseif (-not $sccachePath) {
+        $env:RUSTC_WRAPPER = ""
+    }
+    $ErrorActionPreference = $prevEap
 }
 
 if ($Reconfigure -or -not (Test-Path (Join-Path $buildDir "build.ninja"))) {
