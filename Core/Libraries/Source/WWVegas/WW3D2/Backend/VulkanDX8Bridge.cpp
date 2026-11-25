@@ -2186,7 +2186,6 @@ public:
             const bool mesh_smooth_on = g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) && remaster_active;
             const bool is_stencil_only_pass =
                 (m_render_states[D3DRS_COLORWRITEENABLE] & 0x7u) == 0 ||
-                (m_render_states[D3DRS_ZWRITEENABLE] == 0) ||
                 (m_render_states[D3DRS_STENCILENABLE] != 0 &&
                  m_render_states[D3DRS_STENCILFUNC] == D3DCMP_NEVER);
 
@@ -2196,6 +2195,7 @@ public:
             if (remaster_active && cloth_hint_now != 0u &&
                 !terrain_pass_active &&
                 !is_stencil_only_pass &&
+                m_render_states[D3DRS_ZWRITEENABLE] != 0 &&
                 PrimitiveType == D3DPT_TRIANGLELIST &&
                 primCount >= 2u && primCount <= 128u)
             {
@@ -2214,18 +2214,16 @@ public:
             }
             else if (mesh_smooth_on && !terrain_pass_active &&
                      has_normal &&
-                     (m_render_states[D3DRS_LIGHTING] != 0) &&
                      !is_stencil_only_pass &&
-                     (m_render_states[D3DRS_ALPHABLENDENABLE] == 0) &&
+                     (m_render_states[D3DRS_ZENABLE] != D3DZB_FALSE) &&
                      PrimitiveType == D3DPT_TRIANGLELIST &&
                      primCount >= 5u && primCount <= 4000u)
             {
+                // Pure-geometry 3D circle/arc rounding (texture-independent so multi-pass W3D
+                // meshes like LAKEDUSK.tga reflections and night-glow overlays stay 100% coplanar
+                // and share the exact same rounded GPU VB/IB with zero Z-fighting!).
                 tess_mode = 1u;
-                ZhrVkTexture8* diffuse_tex =
-                    (m_textures[0] != nullptr && m_textures[0]->GetType() == D3DRTYPE_TEXTURE)
-                        ? static_cast<ZhrVkTexture8*>(m_textures[0])
-                        : nullptr;
-                extra_key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(diffuse_tex));
+                extra_key = 0u;
             }
 
             uint32_t mat_rgba = 0u;
@@ -3059,7 +3057,6 @@ private:
         (void)s_mesh_env_init;
         const bool is_stencil_only_pass =
             (m_render_states[D3DRS_COLORWRITEENABLE] & 0x7u) == 0 ||
-            (m_render_states[D3DRS_ZWRITEENABLE] == 0) ||
             (m_render_states[D3DRS_STENCILENABLE] != 0 &&
              m_render_states[D3DRS_STENCILFUNC] == D3DCMP_NEVER);
         const bool terrain_pass_active = g_zhr_terrain_pass_active.load(std::memory_order_relaxed);
@@ -3082,6 +3079,7 @@ private:
             !terrain_pass_active &&
             remaster_active &&
             !is_stencil_only_pass &&
+            (m_render_states[D3DRS_ZWRITEENABLE] != 0) &&
             prim_type == D3DPT_TRIANGLELIST &&
             prim_count >= 2u &&
             prim_count <= 128u &&
@@ -3103,8 +3101,9 @@ private:
             }
         }
 
-        // Only tessellate static rigid .W3D meshes (buildings, vents, vehicles, rocks, props);
-        // skip dynamic skinned buffers (D3DUSAGE_DYNAMIC) whose vertices mutate every frame.
+        // Only tessellate static rigid .W3D meshes (buildings, vents, vehicles, props) that contain
+        // genuine 3D circular loops/arcs; include multi-pass overlays (e.g. LAKEDUSK.tga reflections
+        // and night emissive windows) so Pass 0 and Pass 1 share identical rounded geometry with 0 Z-fighting.
         const bool can_smooth_mesh =
             effective_cloth_hint == 0u &&
             !terrain_pass_active &&
@@ -3113,9 +3112,8 @@ private:
             remaster_active &&
             !is_rhw &&
             has_normal &&
-            (m_render_states[D3DRS_LIGHTING] != 0) &&
             !is_stencil_only_pass &&
-            (m_render_states[D3DRS_ALPHABLENDENABLE] == 0) &&
+            (m_render_states[D3DRS_ZENABLE] != D3DZB_FALSE) &&
             prim_type == D3DPT_TRIANGLELIST &&
             prim_count >= 5u &&
             prim_count <= 4000u &&
@@ -3165,7 +3163,7 @@ private:
             else if (can_smooth_mesh)
             {
                 const auto t0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                const bool ok = ApplySmartAdaptiveTessellation(diffuse_tex);
+                const bool ok = ApplySmartAdaptiveTessellation();
                 if (m_perf_enabled)
                 {
                     m_perf_tess_ns += static_cast<uint64_t>(
@@ -3286,7 +3284,7 @@ private:
 
         if (can_smooth_mesh)
         {
-            const TessCacheKey cache_key = ComputeTessCacheKey(diffuse_tex, false);
+            const TessCacheKey cache_key = ComputeTessCacheKey(nullptr, false);
             auto cache_it = m_tess_cache.find(cache_key);
             if (cache_it != m_tess_cache.end())
             {
@@ -3300,7 +3298,7 @@ private:
             }
 
             const auto t0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const bool ok = ApplySmartAdaptiveTessellation(diffuse_tex);
+            const bool ok = ApplySmartAdaptiveTessellation();
             if (m_perf_enabled)
             {
                 m_perf_tess_ns += static_cast<uint64_t>(
@@ -3751,28 +3749,24 @@ private:
         return true;
     }
 
-    // Smart Adaptive Crack-Free Tessellation + Polygonal Cylinder Rounding + Texture Heightmap Displacement:
-    // 0. Pass 0 (Spatial Dihedral Cylinder/Vent Detection): Detects 6-sided hexagonal vents (60 deg), 8-sided
-    //            pipes/ducts (45 deg), barrel roofs, wheels, and domes across split UV/normal seams while strictly
-    //            ignoring 90-degree architectural walls/boxes (dot < 0.38). Computes welded radial curve normals
-    //            and smooths curved side-wall shading while keeping 90-degree flat caps razor-crisp.
-    // 1. Pass 1: Crease-preserving Phong + exact circularization (6->12 sides) with crack-free cap-rim lockstep.
-    // 2. Pass 2 (Adaptive Red-Green 1->2/1->3/1->4): Refines polygonal cylinders/vents/pipes a second level
-    //            (12->24+ sides) plus large curved/high-relief triangles with zero T-junctions or cap cracks.
-    // 3. Pass 3 (Crack-Free Heightmap Displacement + Smooth Displaced Normals): Samples the texture's multi-scale
-    //            heightmap (`zhr-remaster`) along welded smooth normals, fading displacement cleanly to 0 at open
-    //            mesh boundaries, hard creases, and slender antennas/struts.
-    bool ApplySmartAdaptiveTessellation(ZhrVkTexture8* diffuse_tex)
+    // Smart Adaptive Crack-Free Circular Tessellation (Universal 3D Circle & Arc Rounder):
+    // 0. Pass 0B/0C: Detects closed regular 3D circular loops (5..16 sides: wheels, tires, radar dishes,
+    //                domes, collars, spires, pillars, exhaust fans, gun barrels) AND open circular arcs
+    //                (>= 72 deg: Quonset/hangar arches, curved tank fenders, semicircular turrets) while
+    //                leaving all flat rectangular walls, roofs, and crisp tank armor 100% untouched.
+    // 1. Pass 1: Exact analytic circle/coaxial-diagonal radial projection (6->12 sides) with crack-free cap-rim lockstep.
+    // 2. Pass 2 (Adaptive Red-Green): Refines detected circular/arc rings a second level (12->24+ sides)
+    //            with zero T-junctions, zero cap cracks, zero shadow-volume self-shadowing, and bit-identical
+    //            coplanar geometry across multi-pass W3D materials (e.g. LAKEDUSK.tga reflections & night windows).
+    // (Surface relief/bump detail is rendered per-pixel in the Vulkan PBR fragment shader rather than via CPU
+    //  vertex displacement, which would break coplanarity with W3DVolumetricShadow and multi-pass overlays.)
+    bool ApplySmartAdaptiveTessellation()
     {
         const size_t tri_count = m_scratch_indices.size() / 3;
         if (tri_count == 0 || m_scratch_verts.size() + tri_count * 3 > 60000)
         {
             return false;
         }
-
-        const bool has_hm = (diffuse_tex != nullptr) &&
-                            diffuse_tex->EnsureHeightmap() &&
-                            (diffuse_tex->HeightVariance() > 0.025f);
 
         auto quant_pos_key = [](const float p[3]) -> uint64_t {
             // 0.02 world-unit spatial welding tolerance (catches UV & hard-normal seam duplicates cleanly)
@@ -4133,32 +4127,12 @@ private:
             }
         }
 
-        // Fast early-out: if a mesh has ZERO detected 3D circles/arcs and no large architectural wall/rock faces
-        // (e.g. crisp angular tank turrets, tank hulls, Humvees, crates, boxes), leave it 100% untouched & razor-sharp!
+        // Fast early-out: if a mesh has ZERO detected 3D circles or circular arcs (flat rectangular
+        // buildings, roofs, crisp angular tank hulls/turrets, Humvees, crates, boxes), leave it 100%
+        // untouched so geometry stays razor-sharp and bit-identical to W3DVolumetricShadow & Pass 1 overlays!
         if (detected_circles.empty())
         {
-            float max_edge_sq = 0.0f;
-            if (has_hm)
-            {
-                for (size_t t = 0; t < tri_count; ++t)
-                {
-                    const uint16_t i0 = m_scratch_indices[t * 3 + 0];
-                    const uint16_t i1 = m_scratch_indices[t * 3 + 1];
-                    const uint16_t i2 = m_scratch_indices[t * 3 + 2];
-                    const float* p[3] = {m_scratch_verts[i0].position, m_scratch_verts[i1].position, m_scratch_verts[i2].position};
-                    for (int e = 0; e < 3; ++e)
-                    {
-                        const float dx = p[(e + 1) % 3][0] - p[e][0];
-                        const float dy = p[(e + 1) % 3][1] - p[e][1];
-                        const float dz = p[(e + 1) % 3][2] - p[e][2];
-                        max_edge_sq = std::max(max_edge_sq, dx * dx + dy * dy + dz * dz);
-                    }
-                }
-            }
-            if (!has_hm || max_edge_sq < 64.0f)
-            {
-                return false;
-            }
+            return false;
         }
 
         // Smooth radial shading normals on vertices lying on detected 3D circles/arcs (side-wall faces only,
@@ -4750,27 +4724,6 @@ private:
                 {
                     return true;
                 }
-                // Broad organic/terrain/hull curvature & high-relief detail (> ~3.0 world units)
-                if (dist_sq < 9.0f)
-                {
-                    return false;
-                }
-                const float dot_n = va.normal[0] * vb.normal[0] + va.normal[1] * vb.normal[1] + va.normal[2] * vb.normal[2];
-                if (dot_n > 0.72f && dot_n < 0.992f)
-                {
-                    return true;
-                }
-                if (has_hm && dist_sq >= 14.0f)
-                {
-                    const float ha = diffuse_tex->SampleHeight(va.uv0[0], va.uv0[1]);
-                    const float hb = diffuse_tex->SampleHeight(vb.uv0[0], vb.uv0[1]);
-                    const float hm = diffuse_tex->SampleHeight(0.5f * (va.uv0[0] + vb.uv0[0]), 0.5f * (va.uv0[1] + vb.uv0[1]));
-                    const float contrast = std::fabs(ha - hb) + std::fabs(hm - 0.5f * (ha + hb));
-                    if (contrast > 0.22f)
-                    {
-                        return true;
-                    }
-                }
                 return false;
             };
 
@@ -4850,202 +4803,6 @@ private:
                 }
             }
             m_subdiv_indices.swap(p2_indices);
-        }
-
-        // --- Pass 3: Crack-Free Welded Texture Heightmap Displacement & Displaced Normal Re-evaluation ---
-        if (has_hm && m_subdiv_verts.size() <= 24000)
-        {
-            struct WeldNode
-            {
-                float nx{0.0f}, ny{0.0f}, nz{0.0f};
-                float h_sum{0.0f};
-                float min_edge{1e9f};
-                float max_edge{0.0f};
-                uint32_t v_count{0};
-                uint32_t e_count{0};
-                bool boundary{false};
-                bool crease{false};
-                float dnx{0.0f}, dny{0.0f}, dnz{0.0f};
-            };
-
-            std::unordered_map<uint64_t, WeldNode> weld;
-            weld.reserve(m_subdiv_verts.size());
-
-            std::vector<uint64_t> v_keys(m_subdiv_verts.size());
-            for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
-            {
-                const ZhrVertexWw3d& v = m_subdiv_verts[i];
-                const uint64_t k = quant_pos_key(v.position);
-                v_keys[i] = k;
-                WeldNode& node = weld[k];
-                node.nx += v.normal[0];
-                node.ny += v.normal[1];
-                node.nz += v.normal[2];
-                node.h_sum += diffuse_tex->SampleHeight(v.uv0[0], v.uv0[1]);
-                node.v_count += 1u;
-            }
-
-            // Normalize welded normals and detect hard creases (90-deg walls/armor corners).
-            for (auto& kv : weld)
-            {
-                WeldNode& node = kv.second;
-                const float len = std::sqrt(node.nx * node.nx + node.ny * node.ny + node.nz * node.nz);
-                if (len > 0.001f)
-                {
-                    node.nx /= len;
-                    node.ny /= len;
-                    node.nz /= len;
-                }
-                else
-                {
-                    node.crease = true;
-                }
-            }
-            for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
-            {
-                const ZhrVertexWw3d& v = m_subdiv_verts[i];
-                WeldNode& node = weld[v_keys[i]];
-                const float dot_n = v.normal[0] * node.nx + v.normal[1] * node.ny + v.normal[2] * node.nz;
-                if (dot_n < 0.78f)
-                {
-                    node.crease = true;
-                }
-            }
-
-            // Detect open mesh boundary edges in welded position space + measure local edge scale.
-            struct SpatialEdgeHash
-            {
-                size_t operator()(const std::pair<uint64_t, uint64_t>& e) const noexcept
-                {
-                    return std::hash<uint64_t>{}(e.first ^ (e.second * 0x9E3779B97F4A7C15ULL));
-                }
-            };
-            std::unordered_map<std::pair<uint64_t, uint64_t>, uint32_t, SpatialEdgeHash> edge_counts;
-            const size_t final_tris = m_subdiv_indices.size() / 3;
-            edge_counts.reserve(final_tris * 2);
-
-            auto accum_edge = [&](uint16_t ia, uint16_t ib) {
-                const uint64_t ka = v_keys[ia];
-                const uint64_t kb = v_keys[ib];
-                if (ka == kb) return;
-                const auto pair = ka < kb ? std::make_pair(ka, kb) : std::make_pair(kb, ka);
-                edge_counts[pair] += 1u;
-
-                const ZhrVertexWw3d& va = m_subdiv_verts[ia];
-                const ZhrVertexWw3d& vb = m_subdiv_verts[ib];
-                const float dx = vb.position[0] - va.position[0];
-                const float dy = vb.position[1] - va.position[1];
-                const float dz = vb.position[2] - va.position[2];
-                const float elen = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (elen > 0.001f && elen < 200.0f)
-                {
-                    WeldNode& na = weld[ka];
-                    WeldNode& nb = weld[kb];
-                    na.min_edge = std::min(na.min_edge, elen);
-                    na.max_edge = std::max(na.max_edge, elen);
-                    na.e_count += 1u;
-                    nb.min_edge = std::min(nb.min_edge, elen);
-                    nb.max_edge = std::max(nb.max_edge, elen);
-                    nb.e_count += 1u;
-                }
-            };
-
-            for (size_t t = 0; t < final_tris; ++t)
-            {
-                const uint16_t i0 = m_subdiv_indices[t * 3 + 0];
-                const uint16_t i1 = m_subdiv_indices[t * 3 + 1];
-                const uint16_t i2 = m_subdiv_indices[t * 3 + 2];
-                accum_edge(i0, i1);
-                accum_edge(i1, i2);
-                accum_edge(i2, i0);
-            }
-
-            for (const auto& kv : edge_counts)
-            {
-                if (kv.second == 1u)
-                {
-                    weld[kv.first.first].boundary = true;
-                    weld[kv.first.second].boundary = true;
-                }
-            }
-
-            // Apply seam-safe welded heightmap displacement strictly to broad, smooth interior surfaces.
-            // Using `min_edge` + aspect-ratio guard prevents thin masts, antennas, struts, and gun barrels
-            // (which have long axial edges but tiny cross-sectional edges) from ever bloating outward.
-            bool any_displaced = false;
-            for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
-            {
-                const WeldNode& node = weld[v_keys[i]];
-                if (node.boundary || node.crease || node.v_count == 0 || node.e_count == 0)
-                {
-                    continue;
-                }
-                if (node.min_edge < 4.0f || node.max_edge > node.min_edge * 4.5f)
-                {
-                    continue;
-                }
-                const float h_avg = node.h_sum / static_cast<float>(node.v_count);
-                const float disp_amp = std::min(node.min_edge * 0.065f, 0.35f);
-                const float disp = h_avg * disp_amp;
-                ZhrVertexWw3d& v = m_subdiv_verts[i];
-                v.position[0] += node.nx * disp;
-                v.position[1] += node.ny * disp;
-                v.position[2] += node.nz * disp;
-                any_displaced = true;
-            }
-
-            // Recompute area-weighted displaced normals so sunlight & GGX specular catch real 3D ridges.
-            if (any_displaced)
-            {
-                for (size_t t = 0; t < final_tris; ++t)
-                {
-                    const uint16_t i0 = m_subdiv_indices[t * 3 + 0];
-                    const uint16_t i1 = m_subdiv_indices[t * 3 + 1];
-                    const uint16_t i2 = m_subdiv_indices[t * 3 + 2];
-                    const float* p0 = m_subdiv_verts[i0].position;
-                    const float* p1 = m_subdiv_verts[i1].position;
-                    const float* p2 = m_subdiv_verts[i2].position;
-                    const float e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
-                    const float e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
-                    const float fnx = e1y * e2z - e1z * e2y;
-                    const float fny = e1z * e2x - e1x * e2z;
-                    const float fnz = e1x * e2y - e1y * e2x;
-
-                    for (uint16_t idx : {i0, i1, i2})
-                    {
-                        WeldNode& node = weld[v_keys[idx]];
-                        // Keep winding orientation consistent with original welded normal
-                        const float sign = (fnx * node.nx + fny * node.ny + fnz * node.nz) >= 0.0f ? 1.0f : -1.0f;
-                        node.dnx += fnx * sign;
-                        node.dny += fny * sign;
-                        node.dnz += fnz * sign;
-                    }
-                }
-
-                for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
-                {
-                    const WeldNode& node = weld[v_keys[i]];
-                    if (node.boundary || node.crease)
-                    {
-                        continue;
-                    }
-                    const float dlen = std::sqrt(node.dnx * node.dnx + node.dny * node.dny + node.dnz * node.dnz);
-                    if (dlen > 1e-5f)
-                    {
-                        ZhrVertexWw3d& v = m_subdiv_verts[i];
-                        const float bnx = v.normal[0] * 0.45f + (node.dnx / dlen) * 0.55f;
-                        const float bny = v.normal[1] * 0.45f + (node.dny / dlen) * 0.55f;
-                        const float bnz = v.normal[2] * 0.45f + (node.dnz / dlen) * 0.55f;
-                        const float blen = std::sqrt(bnx * bnx + bny * bny + bnz * bnz);
-                        if (blen > 1e-5f)
-                        {
-                            v.normal[0] = bnx / blen;
-                            v.normal[1] = bny / blen;
-                            v.normal[2] = bnz / blen;
-                        }
-                    }
-                }
-            }
         }
 
         return true;
