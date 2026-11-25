@@ -1272,11 +1272,14 @@ impl VulkanRenderer {
 
         let is_opaque_blend = self.shader.src_blend() == shader::SrcBlend::One
             && self.shader.dst_blend() == shader::DstBlend::Zero;
+        let is_stencil_only_pass = !self.shader.color_write()
+            || !self.shader.depth_write()
+            || (self.stencil.enabled && self.stencil.func == shader::DepthCompare::Never);
         let draw_wireframe = self.wireframe
             && self.ctx.fill_mode_non_solid
             && is_3d_pass
             && self.material_hint == 0
-            && !self.stencil.enabled
+            && !is_stencil_only_pass
             && is_opaque_blend
             && self.uniforms.ambient_and_lighting[3] > 0.5;
 

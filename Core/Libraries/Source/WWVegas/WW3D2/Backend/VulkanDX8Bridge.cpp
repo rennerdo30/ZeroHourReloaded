@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -2462,18 +2463,23 @@ private:
             return true;
         }();
         (void)s_mesh_env_init;
+        const bool is_stencil_only_pass =
+            (m_render_states[D3DRS_COLORWRITEENABLE] & 0x7u) == 0 ||
+            (m_render_states[D3DRS_ZWRITEENABLE] == 0) ||
+            (m_render_states[D3DRS_STENCILENABLE] != 0 &&
+             m_render_states[D3DRS_STENCILFUNC] == D3DCMP_NEVER);
         const bool can_smooth_mesh =
             g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) &&
             remaster_active &&
             !is_rhw &&
             has_normal &&
             (m_render_states[D3DRS_LIGHTING] != 0) &&
-            (m_render_states[D3DRS_STENCILENABLE] == 0) &&
+            !is_stencil_only_pass &&
             (m_render_states[D3DRS_ALPHABLENDENABLE] == 0) &&
             prim_type == D3DPT_TRIANGLELIST &&
-            prim_count >= 8u &&
-            prim_count <= 2000u &&
-            m_scratch_verts.size() < 12000u;
+            prim_count >= 6u &&
+            prim_count <= 4000u &&
+            m_scratch_verts.size() < 16000u;
 
         ZhrVkTexture8* diffuse_tex =
             (m_textures[0] != nullptr && m_textures[0]->GetType() == D3DRTYPE_TEXTURE)
@@ -2540,14 +2546,17 @@ private:
         return D3D_OK;
     }
 
-    // Smart Adaptive Crack-Free Tessellation + Texture-Derived Heightmap Displacement:
-    // 1. Pass 1: Crease-preserving Boubekeur-Alexa Phong subdivision (curves barrels, wheels, domes, rocks, hulls;
-    //            preserves sharp architectural & tank armor creases).
-    // 2. Pass 2 (Adaptive Red-Green 1->2/1->3/1->4): Refines large curved or high-relief triangles a second level
-    //            with zero T-junctions while leaving tiny/flat faces untouched.
+    // Smart Adaptive Crack-Free Tessellation + Polygonal Cylinder Rounding + Texture Heightmap Displacement:
+    // 0. Pass 0 (Spatial Dihedral Cylinder/Vent Detection): Detects 6-sided hexagonal vents (60 deg), 8-sided
+    //            pipes/ducts (45 deg), barrel roofs, wheels, and domes across split UV/normal seams while strictly
+    //            ignoring 90-degree architectural walls/boxes (dot < 0.38). Computes welded radial curve normals
+    //            and smooths curved side-wall shading while keeping 90-degree flat caps razor-crisp.
+    // 1. Pass 1: Crease-preserving Phong + exact circularization (6->12 sides) with crack-free cap-rim lockstep.
+    // 2. Pass 2 (Adaptive Red-Green 1->2/1->3/1->4): Refines polygonal cylinders/vents/pipes a second level
+    //            (12->24+ sides) plus large curved/high-relief triangles with zero T-junctions or cap cracks.
     // 3. Pass 3 (Crack-Free Heightmap Displacement + Smooth Displaced Normals): Samples the texture's multi-scale
-    //            heightmap (`zhr-remaster`) along welded smooth normals, averaging height across UV seams and
-    //            fading displacement cleanly to 0 at open mesh boundaries & hard creases so seams never crack.
+    //            heightmap (`zhr-remaster`) along welded smooth normals, fading displacement cleanly to 0 at open
+    //            mesh boundaries, hard creases, and slender antennas/struts.
     bool ApplySmartAdaptiveTessellation(ZhrVkTexture8* diffuse_tex)
     {
         const size_t tri_count = m_scratch_indices.size() / 3;
@@ -2561,65 +2570,339 @@ private:
                             (diffuse_tex->HeightVariance() > 0.025f);
 
         auto quant_pos_key = [](const float p[3]) -> uint64_t {
-            // 0.02 world-unit spatial welding tolerance (catches UV seam duplicates cleanly)
+            // 0.02 world-unit spatial welding tolerance (catches UV & hard-normal seam duplicates cleanly)
             const int64_t qx = static_cast<int64_t>(std::llround(p[0] * 50.0f)) & 0x1FFFFFLL;
             const int64_t qy = static_cast<int64_t>(std::llround(p[1] * 50.0f)) & 0x1FFFFFLL;
             const int64_t qz = static_cast<int64_t>(std::llround(p[2] * 50.0f)) & 0x1FFFFFLL;
             return (static_cast<uint64_t>(qx) << 42) | (static_cast<uint64_t>(qy) << 21) | static_cast<uint64_t>(qz);
         };
 
-        auto make_phong_midpoint = [](const ZhrVertexWw3d& va, const ZhrVertexWw3d& vb, float smooth_alpha) -> ZhrVertexWw3d {
+        struct SpatialEdgeHash
+        {
+            size_t operator()(const std::pair<uint64_t, uint64_t>& e) const noexcept
+            {
+                return std::hash<uint64_t>{}(e.first ^ (e.second * 0x9E3779B97F4A7C15ULL));
+            }
+        };
+        auto make_spatial_edge = [](uint64_t a, uint64_t b) -> std::pair<uint64_t, uint64_t> {
+            return a < b ? std::make_pair(a, b) : std::make_pair(b, a);
+        };
+
+        struct Vec3f
+        {
+            float x{0.0f}, y{0.0f}, z{0.0f};
+        };
+
+        // --- Pass 0: Spatial Dihedral Analysis for Polygonal Cylinders, Hexagonal Vents, Pipes & Barrel Roofs ---
+        const size_t in_vert_count = m_scratch_verts.size();
+        std::vector<uint64_t> in_v_keys(in_vert_count);
+        for (size_t i = 0; i < in_vert_count; ++i)
+        {
+            in_v_keys[i] = quant_pos_key(m_scratch_verts[i].position);
+        }
+
+        struct EdgeIncidence
+        {
+            uint32_t t0{UINT32_MAX};
+            uint32_t t1{UINT32_MAX};
+            uint8_t count{0};
+        };
+        std::vector<Vec3f> face_normals(tri_count);
+        std::vector<uint8_t> face_valid(tri_count, 0);
+        std::unordered_map<std::pair<uint64_t, uint64_t>, EdgeIncidence, SpatialEdgeHash> in_edge_map;
+        in_edge_map.reserve(tri_count * 2);
+
+        for (size_t t = 0; t < tri_count; ++t)
+        {
+            const uint16_t i0 = m_scratch_indices[t * 3 + 0];
+            const uint16_t i1 = m_scratch_indices[t * 3 + 1];
+            const uint16_t i2 = m_scratch_indices[t * 3 + 2];
+            if (i0 >= in_vert_count || i1 >= in_vert_count || i2 >= in_vert_count)
+            {
+                return false;
+            }
+            const ZhrVertexWw3d& v0 = m_scratch_verts[i0];
+            const ZhrVertexWw3d& v1 = m_scratch_verts[i1];
+            const ZhrVertexWw3d& v2 = m_scratch_verts[i2];
+
+            const float e1x = v1.position[0] - v0.position[0];
+            const float e1y = v1.position[1] - v0.position[1];
+            const float e1z = v1.position[2] - v0.position[2];
+            const float e2x = v2.position[0] - v0.position[0];
+            const float e2y = v2.position[1] - v0.position[1];
+            const float e2z = v2.position[2] - v0.position[2];
+            float fnx = e1y * e2z - e1z * e2y;
+            float fny = e1z * e2x - e1x * e2z;
+            float fnz = e1x * e2y - e1y * e2x;
+            const float flen = std::sqrt(fnx * fnx + fny * fny + fnz * fnz);
+            if (flen > 1e-6f)
+            {
+                fnx /= flen;
+                fny /= flen;
+                fnz /= flen;
+                // Align geometric face normal orientation with authored vertex normals.
+                const float vnx = v0.normal[0] + v1.normal[0] + v2.normal[0];
+                const float vny = v0.normal[1] + v1.normal[1] + v2.normal[1];
+                const float vnz = v0.normal[2] + v1.normal[2] + v2.normal[2];
+                if (fnx * vnx + fny * vny + fnz * vnz < 0.0f)
+                {
+                    fnx = -fnx;
+                    fny = -fny;
+                    fnz = -fnz;
+                }
+                face_normals[t] = {fnx, fny, fnz};
+                face_valid[t] = 1;
+
+                const uint64_t k0 = in_v_keys[i0];
+                const uint64_t k1 = in_v_keys[i1];
+                const uint64_t k2 = in_v_keys[i2];
+                auto add_in_edge = [&](uint64_t ka, uint64_t kb) {
+                    if (ka == kb) return;
+                    EdgeIncidence& inc = in_edge_map[make_spatial_edge(ka, kb)];
+                    if (inc.count == 0) inc.t0 = static_cast<uint32_t>(t);
+                    else if (inc.count == 1) inc.t1 = static_cast<uint32_t>(t);
+                    if (inc.count < 255) inc.count += 1;
+                };
+                add_in_edge(k0, k1);
+                add_in_edge(k1, k2);
+                add_in_edge(k2, k0);
+            }
+        }
+
+        // Accumulate radial curve normals strictly across 7..78 degree polygonal creases
+        // (catches 5-sided 72-deg pentagonal vents [dot=0.309], 6-sided 60-deg hexagons [0.50],
+        // 8-sided 45-deg pipes [0.71], 12-gons [0.87], barrel roofs & arches,
+        // while strictly rejecting 90-deg square walls/boxes [dot~0.0] and 4-sided pyramids [dot<0.18]).
+        std::unordered_map<uint64_t, Vec3f> curve_normal_map;
+        curve_normal_map.reserve(in_vert_count / 2 + 16);
+        std::vector<uint8_t> curved_tri(tri_count, 0);
+
+        for (const auto& kv : in_edge_map)
+        {
+            const EdgeIncidence& inc = kv.second;
+            if (inc.count != 2)
+            {
+                continue;
+            }
+            const Vec3f& n0 = face_normals[inc.t0];
+            const Vec3f& n1 = face_normals[inc.t1];
+            const float d = n0.x * n1.x + n0.y * n1.y + n0.z * n1.z;
+            if (d > 0.20f && d < 0.985f)
+            {
+                const float sx = n0.x + n1.x;
+                const float sy = n0.y + n1.y;
+                const float sz = n0.z + n1.z;
+                Vec3f& ca = curve_normal_map[kv.first.first];
+                ca.x += sx; ca.y += sy; ca.z += sz;
+                Vec3f& cb = curve_normal_map[kv.first.second];
+                cb.x += sx; cb.y += sy; cb.z += sz;
+                curved_tri[inc.t0] = 1;
+                curved_tri[inc.t1] = 1;
+            }
+        }
+
+        for (auto it = curve_normal_map.begin(); it != curve_normal_map.end(); )
+        {
+            const float len = std::sqrt(it->second.x * it->second.x + it->second.y * it->second.y + it->second.z * it->second.z);
+            if (len > 0.01f)
+            {
+                it->second.x /= len;
+                it->second.y /= len;
+                it->second.z /= len;
+                ++it;
+            }
+            else
+            {
+                it = curve_normal_map.erase(it);
+            }
+        }
+
+        // Identify true curved-surface ring edges (excludes flat wall edges touching a single 45-deg bevel
+        // and excludes interior chords of flat 90-deg cylinder caps).
+        std::unordered_set<std::pair<uint64_t, uint64_t>, SpatialEdgeHash> p0_curved_edges;
+        p0_curved_edges.reserve(tri_count);
+        std::vector<uint8_t> active_curve_tri(tri_count, 0);
+        std::vector<uint8_t> vert_in_active_curve(in_vert_count, 0);
+
+        for (size_t t = 0; t < tri_count; ++t)
+        {
+            if (!curved_tri[t])
+            {
+                continue;
+            }
+            const uint16_t idx[3] = {
+                m_scratch_indices[t * 3 + 0],
+                m_scratch_indices[t * 3 + 1],
+                m_scratch_indices[t * 3 + 2]
+            };
+            bool tri_has_curve_arc = false;
+            for (int e = 0; e < 3; ++e)
+            {
+                const uint64_t ka = in_v_keys[idx[e]];
+                const uint64_t kb = in_v_keys[idx[(e + 1) % 3]];
+                if (ka == kb) continue;
+                auto ita = curve_normal_map.find(ka);
+                auto itb = curve_normal_map.find(kb);
+                if (ita != curve_normal_map.end() && itb != curve_normal_map.end())
+                {
+                    const float dot_c = ita->second.x * itb->second.x +
+                                        ita->second.y * itb->second.y +
+                                        ita->second.z * itb->second.z;
+                    if (dot_c > 0.18f && dot_c < 0.992f)
+                    {
+                        p0_curved_edges.insert(make_spatial_edge(ka, kb));
+                        tri_has_curve_arc = true;
+                    }
+                }
+            }
+            if (tri_has_curve_arc)
+            {
+                active_curve_tri[t] = 1;
+                vert_in_active_curve[idx[0]] = 1;
+                vert_in_active_curve[idx[1]] = 1;
+                vert_in_active_curve[idx[2]] = 1;
+            }
+        }
+
+        // Carry per-vertex radial curve normals across Pass 1 -> Pass 2 so both the curved side wall
+        // AND the flat 90-degree cap rim share the exact same radial projection without softening cap shading.
+        m_subdiv_verts = m_scratch_verts;
+        std::vector<Vec3f> subdiv_curve_n(in_vert_count);
+        std::vector<uint8_t> subdiv_has_curve(in_vert_count, 0);
+        for (size_t i = 0; i < in_vert_count; ++i)
+        {
+            auto it = curve_normal_map.find(in_v_keys[i]);
+            if (it != curve_normal_map.end())
+            {
+                subdiv_curve_n[i] = it->second;
+                subdiv_has_curve[i] = 1;
+                // Smooth shading normals strictly on curved side-wall faces (eliminates flat hexagonal facet seams)
+                // while leaving flat 90-deg cap vertices (|dot| <= 0.35) completely untouched.
+                if (vert_in_active_curve[i])
+                {
+                    ZhrVertexWw3d& v = m_subdiv_verts[i];
+                    const float align = v.normal[0] * it->second.x +
+                                        v.normal[1] * it->second.y +
+                                        v.normal[2] * it->second.z;
+                    if (std::fabs(align) > 0.35f)
+                    {
+                        const float s = align >= 0.0f ? 1.0f : -1.0f;
+                        v.normal[0] = it->second.x * s;
+                        v.normal[1] = it->second.y * s;
+                        v.normal[2] = it->second.z * s;
+                    }
+                }
+            }
+        }
+
+        auto project_circular_midpoint = [](const float pa_pos[3], const float pb_pos[3],
+                                            const float an_x, const float an_y, const float an_z,
+                                            const float bn_x, const float bn_y, const float bn_z,
+                                            float dot_n, float alpha, float out_pos[3]) {
+            const float mx = 0.5f * (pa_pos[0] + pb_pos[0]);
+            const float my = 0.5f * (pa_pos[1] + pb_pos[1]);
+            const float mz = 0.5f * (pa_pos[2] + pb_pos[2]);
+
+            const float dx = pb_pos[0] - pa_pos[0];
+            const float dy = pb_pos[1] - pa_pos[1];
+            const float dz = pb_pos[2] - pa_pos[2];
+            const float dist_sq = dx * dx + dy * dy + dz * dz;
+
+            const float da = (mx - pa_pos[0]) * an_x +
+                             (my - pa_pos[1]) * an_y +
+                             (mz - pa_pos[2]) * an_z;
+            const float db = (mx - pb_pos[0]) * bn_x +
+                             (my - pb_pos[1]) * bn_y +
+                             (mz - pb_pos[2]) * bn_z;
+            const float pax = mx - da * an_x;
+            const float pay = my - da * an_y;
+            const float paz = mz - da * an_z;
+            const float pbx = mx - db * bn_x;
+            const float pby = my - db * bn_y;
+            const float pbz = mz - db * bn_z;
+
+            float ox = alpha * (0.5f * (pax + pbx) - mx);
+            float oy = alpha * (0.5f * (pay + pby) - my);
+            float oz = alpha * (0.5f * (paz + pbz) - mz);
+
+            // Safety clamp: regular pentagon exact circle sagitta is 0.163*edge_len; cap at 0.24*edge_len.
+            const float off_sq = ox * ox + oy * oy + oz * oz;
+            const float max_off = 0.24f * std::sqrt(dist_sq);
+            if (off_sq > max_off * max_off && off_sq > 1e-12f)
+            {
+                const float scale = max_off / std::sqrt(off_sq);
+                ox *= scale;
+                oy *= scale;
+                oz *= scale;
+            }
+            (void)dot_n;
+            out_pos[0] = mx + ox;
+            out_pos[1] = my + oy;
+            out_pos[2] = mz + oz;
+        };
+
+        auto make_phong_midpoint = [&](const ZhrVertexWw3d& va, const ZhrVertexWw3d& vb,
+                                       bool use_curve_ring, const Vec3f& ca, const Vec3f& cb,
+                                       float fallback_alpha, Vec3f& out_curve_n, uint8_t& out_has_curve) -> ZhrVertexWw3d {
             ZhrVertexWw3d mid{};
-            const float mx = 0.5f * (va.position[0] + vb.position[0]);
-            const float my = 0.5f * (va.position[1] + vb.position[1]);
-            const float mz = 0.5f * (va.position[2] + vb.position[2]);
+            mid.position[0] = 0.5f * (va.position[0] + vb.position[0]);
+            mid.position[1] = 0.5f * (va.position[1] + vb.position[1]);
+            mid.position[2] = 0.5f * (va.position[2] + vb.position[2]);
+            out_curve_n = {0.0f, 0.0f, 0.0f};
+            out_has_curve = 0;
 
             const float dx = vb.position[0] - va.position[0];
             const float dy = vb.position[1] - va.position[1];
             const float dz = vb.position[2] - va.position[2];
             const float dist_sq = dx * dx + dy * dy + dz * dz;
 
-            const float nax = va.normal[0], nay = va.normal[1], naz = va.normal[2];
-            const float nbx = vb.normal[0], nby = vb.normal[1], nbz = vb.normal[2];
-            const float na_len = std::sqrt(nax * nax + nay * nay + naz * naz);
-            const float nb_len = std::sqrt(nbx * nbx + nby * nby + nbz * nbz);
-
-            float px = mx, py = my, pz = mz;
-            if (na_len > 0.001f && nb_len > 0.001f && dist_sq > 1e-4f && dist_sq < 40000.0f)
+            if (use_curve_ring && dist_sq > 1e-4f && dist_sq < 40000.0f)
             {
-                const float an_x = nax / na_len, an_y = nay / na_len, an_z = naz / na_len;
-                const float bn_x = nbx / nb_len, bn_y = nby / nb_len, bn_z = nbz / nb_len;
-                const float dot_n = an_x * bn_x + an_y * bn_y + an_z * bn_z;
-
-                // Smooth curved edge (< ~44 deg) -> Phong tangent-plane projection; hard crease -> keep flat!
-                if (dot_n > 0.72f && dot_n < 0.9995f)
+                const float dot_c = ca.x * cb.x + ca.y * cb.y + ca.z * cb.z;
+                if (dot_c > 0.18f && dot_c < 0.995f)
                 {
-                    const float da = (mx - va.position[0]) * an_x +
-                                     (my - va.position[1]) * an_y +
-                                     (mz - va.position[2]) * an_z;
-                    const float db = (mx - vb.position[0]) * bn_x +
-                                     (my - vb.position[1]) * bn_y +
-                                     (mz - vb.position[2]) * bn_z;
-                    const float pax = mx - da * an_x;
-                    const float pay = my - da * an_y;
-                    const float paz = mz - da * an_z;
-                    const float pbx = mx - db * bn_x;
-                    const float pby = my - db * bn_y;
-                    const float pbz = mz - db * bn_z;
-
-                    px = mx + smooth_alpha * (0.5f * (pax + pbx) - mx);
-                    py = my + smooth_alpha * (0.5f * (pay + pby) - my);
-                    pz = mz + smooth_alpha * (0.5f * (paz + pbz) - mz);
+                    // Exact analytic circle sagitta factor: 1 / (cos(theta/2) * (1 + cos(theta/2)))
+                    // 72-deg pentagon -> 0.683 (exact 10-gon -> 20-gon), 60-deg hexagon -> 0.619 (12 -> 24), 45-deg -> 0.563.
+                    const float cos_half = std::sqrt(std::max(0.5f * (1.0f + dot_c), 0.25f));
+                    const float exact_alpha = std::clamp(1.0f / (cos_half * (1.0f + cos_half)), 0.48f, 0.72f);
+                    project_circular_midpoint(va.position, vb.position,
+                                              ca.x, ca.y, ca.z, cb.x, cb.y, cb.z,
+                                              dot_c, exact_alpha, mid.position);
+                }
+                const float cx = ca.x + cb.x;
+                const float cy = ca.y + cb.y;
+                const float cz = ca.z + cb.z;
+                const float clen = std::sqrt(cx * cx + cy * cy + cz * cz);
+                if (clen > 1e-4f)
+                {
+                    out_curve_n = {cx / clen, cy / clen, cz / clen};
+                    out_has_curve = 1;
+                }
+            }
+            else if (dist_sq > 1e-4f && dist_sq < 40000.0f)
+            {
+                const float nax = va.normal[0], nay = va.normal[1], naz = va.normal[2];
+                const float nbx = vb.normal[0], nby = vb.normal[1], nbz = vb.normal[2];
+                const float na_len = std::sqrt(nax * nax + nay * nay + naz * naz);
+                const float nb_len = std::sqrt(nbx * nbx + nby * nby + nbz * nbz);
+                if (na_len > 0.001f && nb_len > 0.001f)
+                {
+                    const float an_x = nax / na_len, an_y = nay / na_len, an_z = naz / na_len;
+                    const float bn_x = nbx / nb_len, bn_y = nby / nb_len, bn_z = nbz / nb_len;
+                    const float dot_n = an_x * bn_x + an_y * bn_y + an_z * bn_z;
+                    // Smooth curved organic edge (< ~44 deg) -> Phong tangent-plane projection; hard crease -> keep flat!
+                    if (dot_n > 0.72f && dot_n < 0.9995f)
+                    {
+                        project_circular_midpoint(va.position, vb.position,
+                                                  an_x, an_y, an_z, bn_x, bn_y, bn_z,
+                                                  dot_n, fallback_alpha, mid.position);
+                    }
                 }
             }
 
-            mid.position[0] = px;
-            mid.position[1] = py;
-            mid.position[2] = pz;
-
-            const float nx = nax + nbx;
-            const float ny = nay + nby;
-            const float nz = naz + nbz;
+            const float nx = va.normal[0] + vb.normal[0];
+            const float ny = va.normal[1] + vb.normal[1];
+            const float nz = va.normal[2] + vb.normal[2];
             const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
             if (nlen > 0.0001f)
             {
@@ -2642,13 +2925,20 @@ private:
             return mid;
         };
 
-        // --- Pass 1: Uniform 1->4 Crease-Preserving Phong Subdivision ---
-        m_subdiv_verts = m_scratch_verts;
+        // --- Pass 1: Uniform 1->4 Crease-Preserving Phong + Exact Cylinder/Vent Circularization ---
         m_subdiv_indices.clear();
         m_subdiv_indices.reserve(tri_count * 12);
 
         m_edge_midpoints.clear();
         m_edge_midpoints.reserve(tri_count * 2);
+
+        std::vector<uint64_t> subdiv_keys = in_v_keys;
+        subdiv_keys.reserve(in_vert_count + tri_count * 3);
+        subdiv_curve_n.reserve(in_vert_count + tri_count * 3);
+        subdiv_has_curve.reserve(in_vert_count + tri_count * 3);
+
+        std::unordered_set<std::pair<uint64_t, uint64_t>, SpatialEdgeHash> p1_curved_edges;
+        p1_curved_edges.reserve(p0_curved_edges.size() * 4 + 32);
 
         auto get_midpoint_p1 = [&](uint16_t ia, uint16_t ib) -> uint16_t {
             const uint32_t lo = ia < ib ? ia : ib;
@@ -2659,11 +2949,73 @@ private:
             {
                 return it->second;
             }
-            ZhrVertexWw3d mid = make_phong_midpoint(m_scratch_verts[ia], m_scratch_verts[ib], 0.44f);
+            const uint64_t ka = subdiv_keys[ia];
+            const uint64_t kb = subdiv_keys[ib];
+            const bool is_ring_edge = (ka != kb) &&
+                                      subdiv_has_curve[ia] && subdiv_has_curve[ib] &&
+                                      (p0_curved_edges.find(make_spatial_edge(ka, kb)) != p0_curved_edges.end());
+
+            Vec3f mid_cn{};
+            uint8_t mid_hc = 0;
+            ZhrVertexWw3d mid = make_phong_midpoint(
+                m_subdiv_verts[ia], m_subdiv_verts[ib],
+                is_ring_edge, subdiv_curve_n[ia], subdiv_curve_n[ib],
+                0.44f, mid_cn, mid_hc);
+
+            // Preserve radial curve normal along straight axial cylinder edges so mid-height rings also refine in Pass 2.
+            if (!mid_hc && subdiv_has_curve[ia] && subdiv_has_curve[ib])
+            {
+                const float dot_c = subdiv_curve_n[ia].x * subdiv_curve_n[ib].x +
+                                    subdiv_curve_n[ia].y * subdiv_curve_n[ib].y +
+                                    subdiv_curve_n[ia].z * subdiv_curve_n[ib].z;
+                if (dot_c >= 0.985f)
+                {
+                    const float cx = subdiv_curve_n[ia].x + subdiv_curve_n[ib].x;
+                    const float cy = subdiv_curve_n[ia].y + subdiv_curve_n[ib].y;
+                    const float cz = subdiv_curve_n[ia].z + subdiv_curve_n[ib].z;
+                    const float clen = std::sqrt(cx * cx + cy * cy + cz * cz);
+                    if (clen > 1e-4f)
+                    {
+                        mid_cn = {cx / clen, cy / clen, cz / clen};
+                        mid_hc = 1;
+                    }
+                }
+            }
+
             const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
             m_subdiv_verts.push_back(mid);
+            const uint64_t km = quant_pos_key(mid.position);
+            subdiv_keys.push_back(km);
+            subdiv_curve_n.push_back(mid_cn);
+            subdiv_has_curve.push_back(mid_hc);
             m_edge_midpoints.emplace(key, new_idx);
+
+            if (is_ring_edge)
+            {
+                if (ka != km) p1_curved_edges.insert(make_spatial_edge(ka, km));
+                if (km != kb) p1_curved_edges.insert(make_spatial_edge(km, kb));
+            }
             return new_idx;
+        };
+
+        auto register_p1_tri_curved_edges = [&](uint16_t a, uint16_t b, uint16_t c) {
+            const uint16_t idx[3] = {a, b, c};
+            for (int e = 0; e < 3; ++e)
+            {
+                const uint16_t u = idx[e];
+                const uint16_t v = idx[(e + 1) % 3];
+                if (!subdiv_has_curve[u] || !subdiv_has_curve[v]) continue;
+                const uint64_t ku = subdiv_keys[u];
+                const uint64_t kv = subdiv_keys[v];
+                if (ku == kv) continue;
+                const float dot_c = subdiv_curve_n[u].x * subdiv_curve_n[v].x +
+                                    subdiv_curve_n[u].y * subdiv_curve_n[v].y +
+                                    subdiv_curve_n[u].z * subdiv_curve_n[v].z;
+                if (dot_c > 0.18f && dot_c < 0.992f)
+                {
+                    p1_curved_edges.insert(make_spatial_edge(ku, kv));
+                }
+            }
         };
 
         for (size_t t = 0; t < tri_count; ++t)
@@ -2671,10 +3023,6 @@ private:
             const uint16_t i0 = m_scratch_indices[t * 3 + 0];
             const uint16_t i1 = m_scratch_indices[t * 3 + 1];
             const uint16_t i2 = m_scratch_indices[t * 3 + 2];
-            if (i0 >= m_scratch_verts.size() || i1 >= m_scratch_verts.size() || i2 >= m_scratch_verts.size())
-            {
-                return false;
-            }
             const uint16_t m01 = get_midpoint_p1(i0, i1);
             const uint16_t m12 = get_midpoint_p1(i1, i2);
             const uint16_t m20 = get_midpoint_p1(i2, i0);
@@ -2683,15 +3031,30 @@ private:
             m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(i1);  m_subdiv_indices.push_back(m12);
             m_subdiv_indices.push_back(m20); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(i2);
             m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(m20);
+
+            if (active_curve_tri[t])
+            {
+                register_p1_tri_curved_edges(i0, m01, m20);
+                register_p1_tri_curved_edges(m01, i1, m12);
+                register_p1_tri_curved_edges(m20, m12, i2);
+                register_p1_tri_curved_edges(m01, m12, m20);
+            }
         }
 
-        // --- Pass 2: Smart Adaptive Red-Green Refinement (Level 2 on large curved / high-relief edges, 0 T-junctions) ---
+        // --- Pass 2: Smart Adaptive Red-Green Refinement (Level 2 on polygonal vents/pipes & large curved/relief edges) ---
         const size_t p1_tris = m_subdiv_indices.size() / 3;
-        if (p1_tris <= 1600 && m_subdiv_verts.size() + p1_tris * 3 < 52000)
+        if (p1_tris <= 12000 && m_subdiv_verts.size() < 56000)
         {
             std::vector<uint16_t> p2_indices;
             p2_indices.reserve(m_subdiv_indices.size() * 2);
             m_edge_midpoints.clear();
+
+            auto is_p1_curved_ring = [&](uint16_t ia, uint16_t ib) -> bool {
+                if (!subdiv_has_curve[ia] || !subdiv_has_curve[ib]) return false;
+                const uint64_t ka = subdiv_keys[ia];
+                const uint64_t kb = subdiv_keys[ib];
+                return (ka != kb) && (p1_curved_edges.find(make_spatial_edge(ka, kb)) != p1_curved_edges.end());
+            };
 
             auto should_split_edge = [&](uint16_t ia, uint16_t ib) -> bool {
                 const ZhrVertexWw3d& va = m_subdiv_verts[ia];
@@ -2700,8 +3063,17 @@ private:
                 const float dy = vb.position[1] - va.position[1];
                 const float dz = vb.position[2] - va.position[2];
                 const float dist_sq = dx * dx + dy * dy + dz * dz;
-                // Only adaptively refine physically large edges (> ~3.0 world units: islands, rocks, turrets, roofs)
-                if (dist_sq < 9.0f || dist_sq > 40000.0f)
+                if (dist_sq > 40000.0f)
+                {
+                    return false;
+                }
+                // Compact polygonal cylinders/vents/pipes/wheels (edge >= 0.5 world units -> 12->24+ sides!)
+                if (dist_sq >= 0.25f && is_p1_curved_ring(ia, ib))
+                {
+                    return true;
+                }
+                // Broad organic/terrain/hull curvature & high-relief detail (> ~3.0 world units)
+                if (dist_sq < 9.0f)
                 {
                     return false;
                 }
@@ -2733,7 +3105,13 @@ private:
                 {
                     return it->second;
                 }
-                ZhrVertexWw3d mid = make_phong_midpoint(m_subdiv_verts[ia], m_subdiv_verts[ib], 0.34f);
+                const bool ring = is_p1_curved_ring(ia, ib);
+                Vec3f mid_cn{};
+                uint8_t mid_hc = 0;
+                ZhrVertexWw3d mid = make_phong_midpoint(
+                    m_subdiv_verts[ia], m_subdiv_verts[ib],
+                    ring, subdiv_curve_n[ia], subdiv_curve_n[ib],
+                    0.34f, mid_cn, mid_hc);
                 const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
                 m_subdiv_verts.push_back(mid);
                 m_edge_midpoints.emplace(key, new_idx);

@@ -38,6 +38,7 @@
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Team.h"
+#include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
@@ -82,6 +83,8 @@
 #include "GameLogic/ObjectCreationList.h"
 #include "GameLogic/Weapon.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/Object.h"
+#include "Common/ThingTemplate.h"
 #include "GameLogic/Locomotor.h"
 #include "GameLogic/RankInfo.h"
 #include "GameLogic/ScriptEngine.h"
@@ -109,6 +112,8 @@
 
 #include "Common/version.h"
 #include "GameClient/Display.h"
+#include "GameClient/View.h"
+#include "GameNetwork/GameInfo.h"
 #include <cstdlib>
 #include <string>
 
@@ -895,6 +900,79 @@ DECLARE_PERF_TIMER(GameEngine_update)
  */
 void GameEngine::update()
 {
+	// Optional headless automated skirmish launcher (only active when `ZHR_HEADLESS_SKIRMISH_MAP` is set).
+	// Fires on the first update tick after init() & resetSubsystems(), identical to clicking Start in Skirmish.
+	{
+		static const char* skMapEnv = std::getenv("ZHR_HEADLESS_SKIRMISH_MAP");
+		static bool skLaunched = false;
+		if (!skLaunched && skMapEnv != nullptr && skMapEnv[0] != '\0' &&
+		    TheMapCache != nullptr && TheGameLogic != nullptr && !TheGameLogic->isInGame())
+		{
+			skLaunched = true;
+			AsciiString needle(skMapEnv);
+			needle.toLower();
+			AsciiString matchedMap;
+			const MapMetaData* matchedMeta = nullptr;
+			for (MapCache::const_iterator it = TheMapCache->begin(); it != TheMapCache->end(); ++it)
+			{
+				if (strstr(it->first.str(), needle.str()) != nullptr && it->second.m_isMultiplayer)
+				{
+					matchedMap = it->first;
+					matchedMeta = &it->second;
+					break;
+				}
+			}
+			if (!matchedMap.isEmpty() && matchedMeta != nullptr)
+			{
+				if (!TheSkirmishGameInfo)
+				{
+					TheSkirmishGameInfo = NEW SkirmishGameInfo;
+				}
+				TheSkirmishGameInfo->init();
+				TheSkirmishGameInfo->clearSlotList();
+				TheSkirmishGameInfo->reset();
+				TheSkirmishGameInfo->enterGame();
+				TheSkirmishGameInfo->setMap(matchedMap);
+				TheSkirmishGameInfo->setMapCRC(matchedMeta->m_CRC);
+				TheSkirmishGameInfo->setMapSize(matchedMeta->m_filesize);
+
+				Int usaTemplate = ThePlayerTemplateStore ? ThePlayerTemplateStore->getTemplateNumByName("FactionAmerica") : 0;
+				if (usaTemplate < 0) usaTemplate = 0;
+
+				GameSlot* s0 = TheSkirmishGameInfo->getSlot(0);
+				if (s0)
+				{
+					s0->setState(SLOT_PLAYER, UnicodeString(L"Player"));
+					s0->setIP(1);
+					s0->setPlayerTemplate(usaTemplate);
+					s0->setColor(0);
+					s0->setStartPos(0);
+					s0->setTeamNumber(0);
+				}
+				TheSkirmishGameInfo->setLocalIP(1);
+				GameSlot* s1 = TheSkirmishGameInfo->getSlot(1);
+				if (s1)
+				{
+					s1->setState(SLOT_EASY_AI);
+					s1->setPlayerTemplate(usaTemplate);
+					s1->setColor(1);
+					s1->setStartPos(1);
+					s1->setTeamNumber(1);
+				}
+
+				TheWritableGlobalData->m_mapName = matchedMap;
+				TheSkirmishGameInfo->startGame(0);
+				InitRandom(TheSkirmishGameInfo->getSeed());
+
+				GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_NEW_GAME);
+				msg->appendIntegerArgument(GAME_SKIRMISH);
+				msg->appendIntegerArgument(DIFFICULTY_NORMAL);
+				msg->appendIntegerArgument(0);
+				msg->appendIntegerArgument(120);
+			}
+		}
+	}
+
 	// Deterministic Frozen-Simulation Multi-Shot A/B Capture:
 	// Set `ZHR_AB_CAPTURE_DIR=<folder>` (and optional `ZHR_AB_CAPTURE_LOGIC_FRAME=<n>`, default 160).
 	// Steps logic deterministically to `targetFrame`, then FREEZES simulation, client animations, and
@@ -916,10 +994,41 @@ void GameEngine::update()
 				return 160u;
 			}();
 
+			// If ZHR_AB_CAPTURE_ZOOM is set, apply camera focus + zoom early (frame >= 5)
+			// so W3DView's smooth height interpolation settles cleanly before targetLogicFrame.
+			static bool abZoomApplied = false;
+			const char* zoomEnv = std::getenv("ZHR_AB_CAPTURE_ZOOM");
+			if (!abZoomApplied && zoomEnv != nullptr && zoomEnv[0] != '\0' &&
+			    TheTacticalView != nullptr && TheGameLogic->getFrame() >= 5u)
+			{
+				abZoomApplied = true;
+				for (Object* obj = TheGameLogic->getFirstObject(); obj != nullptr; obj = obj->getNextObject())
+				{
+					const ThingTemplate* tt = obj->getTemplate();
+					if (obj->isLocallyControlled() && tt && strstr(tt->getName().str(), "CommandCenter") != nullptr)
+					{
+						if (const Coord3D* pos = obj->getPosition())
+						{
+							TheTacticalView->lookAt(pos);
+						}
+						break;
+					}
+				}
+				const float h = static_cast<float>(std::strtod(zoomEnv, nullptr));
+				if (h > 20.0f && h <= 1200.0f)
+				{
+					TheTacticalView->setHeightAboveGround(h);
+				}
+				else if (h > 0.05f && h <= 3.0f)
+				{
+					TheTacticalView->setZoom(h);
+				}
+			}
+
 			if (TheGameLogic->getFrame() >= targetLogicFrame)
 			{
 				abDone = true;
-				// Freeze shader clock (waves/caustics) and capture all 4 modes directly inside this
+				// Freeze shader clock (waves/caustics) and capture all 6 modes directly inside this
 				// single paused GameEngine::update() turn WITHOUT calling TheFramePacer->setTimeFrozen(TRUE)
 				// (which would trigger W3DDisplay::draw()'s scripted cutscene camera-pan do/while loop).
 				TheDisplay->setVulkanFreezeTime(TRUE);
