@@ -191,6 +191,7 @@ enum KeyDefType CPP_11(: UnsignedByte)
 	KEY_CAPS 								= DIK_CAPSLOCK,
 	KEY_NUM 								= DIK_NUMLOCK,
 	KEY_SCROLL 							= DIK_SCROLL,
+	KEY_PAUSE 							= DIK_PAUSE,
 	KEY_LCTRL 							= DIK_LCONTROL,
 	KEY_LALT 								= DIK_LALT,
 	KEY_LSHIFT 							= DIK_LSHIFT,

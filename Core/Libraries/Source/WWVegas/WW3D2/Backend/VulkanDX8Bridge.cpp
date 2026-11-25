@@ -32,6 +32,7 @@ namespace {
 
 std::atomic<bool> g_zhr_mesh_smoothing_enabled{true};
 std::atomic<bool> g_zhr_title_banner_dirty{true};
+std::atomic<bool> g_zhr_sim_paused{false};
 std::atomic<bool> g_zhr_terrain_pass_active{false};
 std::atomic<uint32_t> g_zhr_cloth_hint{0u};
 std::atomic<uint64_t> g_zhr_next_buf_id{1};
@@ -4990,11 +4991,13 @@ private:
             (mode == 2u) ? "Split-Screen A/B (Classic | Remastered)" :
                            "Remastered";
         char title[384]{};
+        const bool sim_paused = g_zhr_sim_paused.load(std::memory_order_relaxed);
         std::snprintf(
             title,
             sizeof(title),
-            "%s  [Vulkan 1.3 | %s | Mesh:%s | 2xTex:%s | PBR:%s | PostFX:%s | F7-F11]",
+            "%s  [%sVulkan 1.3 | %s | Mesh:%s | 2xTex:%s | PBR:%s | PostFX:%s | F7-F11 | Pause/Shift+P]",
             m_base_window_title,
+            sim_paused ? "PAUSED | " : "",
             mode_label,
             (g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) && mode != 0u) ? "ON" : "OFF",
             (remaster_tex && mode != 0u) ? "ON" : "OFF",
@@ -5661,6 +5664,16 @@ extern "C" bool zhr_vk_get_mesh_smoothing(void)
 extern "C" void zhr_vk_mark_title_banner_dirty(void)
 {
     g_zhr_title_banner_dirty.store(true, std::memory_order_relaxed);
+}
+
+extern "C" void zhr_vk_set_sim_paused(bool paused)
+{
+    const bool prev = g_zhr_sim_paused.exchange(paused, std::memory_order_relaxed);
+    zhr_vk_set_freeze_time(paused);
+    if (prev != paused)
+    {
+        g_zhr_title_banner_dirty.store(true, std::memory_order_relaxed);
+    }
 }
 
 extern "C" void zhr_vk_set_terrain_heightmap(

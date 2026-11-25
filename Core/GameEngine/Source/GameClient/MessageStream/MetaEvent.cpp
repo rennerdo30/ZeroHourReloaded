@@ -600,6 +600,21 @@ void MetaEventTranslator::onKeyModStateRemoved(GameMessageDisposition &disp, Map
 //-------------------------------------------------------------------------------------------------
 void MetaEventTranslator::onKeyPressed(GameMessageDisposition &disp, Int systemKeyState, MappableKeyType keyType, MappableKeyModState keyModState)
 {
+	// Dedicated Pause/Break key toggles simulation pause in single-player/skirmish/replay
+	// (complements Shift+P on compact keyboards without a Pause key, and Shift+O single-frame step).
+	if (keyType == MK_PAUSE && keyModState == NONE && (systemKeyState & KEY_STATE_DOWN) != 0)
+	{
+		if (isMessageUsable(COMMANDUSABLE_GAME) || isMessageUsable(COMMANDUSABLE_OBSERVER))
+		{
+			if ((systemKeyState & KEY_STATE_AUTOREPEAT) == 0)
+			{
+				TheMessageStream->appendMessage(GameMessage::MSG_META_TOGGLE_PAUSE_ALT);
+			}
+			disp = DESTROY_MESSAGE;
+			return;
+		}
+	}
+
 	// TheSuperHackers @info The regular key handler only triggers events when the mapped key is pressed,
 	// not when the modifier (CTRL, ALT, SHIFT) is pressed, unless the key is MK_NONE.
 

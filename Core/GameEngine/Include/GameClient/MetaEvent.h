@@ -160,6 +160,7 @@ enum MappableKeyType CPP_11(: Int)
 	MK_PGDN					= KEY_PGDN,
 	MK_INS					= KEY_INS,
 	MK_DEL					= KEY_DEL,
+	MK_PAUSE				= KEY_PAUSE,
 	MK_NONE					= KEY_NONE
 
 };
@@ -258,6 +259,7 @@ static const LookupListRec KeyNames[] =
 	{ "KEY_PGDN", MK_PGDN },
 	{ "KEY_INS", MK_INS },
 	{ "KEY_DEL", MK_DEL },
+	{ "KEY_PAUSE", MK_PAUSE },
 	{ "KEY_NONE", MK_NONE },
 	{ nullptr, 0	}
 };

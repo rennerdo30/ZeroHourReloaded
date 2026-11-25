@@ -3563,6 +3563,10 @@ GameMessageDisposition CommandTranslator::translateGameMessage(const GameMessage
 				if (TheGameLogic->isGamePaused())
 				{
 					TheGameLogic->setGamePaused(FALSE);
+					if (TheInGameUI)
+					{
+						TheInGameUI->messageNoFormat(L"Simulation Resumed");
+					}
 				}
 				else
 				{
@@ -3570,6 +3574,10 @@ GameMessageDisposition CommandTranslator::translateGameMessage(const GameMessage
 					Bool pauseMusic = FALSE;
 					Bool pauseInput = FALSE;
 					TheGameLogic->setGamePaused(pause, pauseMusic, pauseInput);
+					if (TheInGameUI)
+					{
+						TheInGameUI->messageNoFormat(L"Simulation Paused  (Pause / Shift+P: Resume  |  Shift+O: Step Frame)");
+					}
 				}
 				disp = DESTROY_MESSAGE;
 			}

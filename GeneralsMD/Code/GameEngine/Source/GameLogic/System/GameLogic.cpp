@@ -98,6 +98,9 @@
 #include "GameLogic/ScriptActions.h"
 #include "GameLogic/ScriptConditions.h"
 #include "GameLogic/ScriptEngine.h"
+#ifdef ZHR_USE_VULKAN
+extern "C" void zhr_vk_set_sim_paused(bool paused);
+#endif
 #include "GameLogic/SidesList.h"
 #include "GameLogic/VictoryConditions.h"
 #include "GameLogic/Weapon.h"
@@ -4462,6 +4465,9 @@ void GameLogic::setGamePaused( Bool paused, Bool pauseMusic, Bool pauseInput )
 void GameLogic::pauseGameLogic(Bool paused)
 {
 	m_gamePaused = paused;
+#ifdef ZHR_USE_VULKAN
+	zhr_vk_set_sim_paused(paused != FALSE);
+#endif
 
 	if (!paused && m_logicTimeScaleEnabledMemory)
 	{

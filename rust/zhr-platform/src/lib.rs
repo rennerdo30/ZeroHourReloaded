@@ -85,6 +85,7 @@ pub const fn sdl_scancode_to_zh_key(scancode: u32) -> u8 {
         // Navigation & system keys
         70 => 0xB7, // PRINTSCREEN -> DIK_SYSRQ
         71 => 0x46, // SCROLLLOCK -> DIK_SCROLL
+        72 => 0xC5, // PAUSE -> DIK_PAUSE
         73 => 0xD2, // INSERT -> DIK_INSERT
         74 => 0xC7, // HOME -> DIK_HOME
         75 => 0xC9, // PAGEUP -> DIK_PGUP
@@ -143,6 +144,7 @@ mod tests {
         assert_eq!(sdl_scancode_to_zh_key(66), 0x43); // F9
         assert_eq!(sdl_scancode_to_zh_key(68), 0x57); // F11
         assert_eq!(sdl_scancode_to_zh_key(69), 0x58); // F12
+        assert_eq!(sdl_scancode_to_zh_key(72), 0xC5); // PAUSE
         assert_eq!(sdl_scancode_to_zh_key(82), 0xC8); // UP
         assert_eq!(sdl_scancode_to_zh_key(224), 0x1D); // LCTRL
         assert_eq!(sdl_scancode_to_zh_key(225), 0x2A); // LSHIFT

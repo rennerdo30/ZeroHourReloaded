@@ -125,6 +125,8 @@ pub struct VulkanRenderer {
     frame_number: u64,
     start_time: Instant,
     frozen_time_sec: Option<f32>,
+    paused_at: Option<Instant>,
+    paused_accum_sec: f32,
     wireframe: bool,
     pending_capture: Option<(String, Option<String>)>,
     active_frame: Option<ActiveFrame>,
@@ -376,6 +378,8 @@ impl VulkanRenderer {
             frame_number: 0,
             start_time: Instant::now(),
             frozen_time_sec: None,
+            paused_at: None,
+            paused_accum_sec: 0.0,
             wireframe: false,
             pending_capture: None,
             active_frame: None,
@@ -1572,7 +1576,7 @@ impl VulkanRenderer {
         };
         let time_sec = self
             .frozen_time_sec
-            .unwrap_or_else(|| self.start_time.elapsed().as_secs_f32());
+            .unwrap_or_else(|| (self.start_time.elapsed().as_secs_f32() - self.paused_accum_sec).max(0.0));
         draw_uniforms.water_params = [time_sec, glass_hint, screen_inv_w, screen_inv_h];
         if let Some((pos, str0, t0)) = self.wind_blast {
             let dt = if self.frozen_time_sec.is_some() {
@@ -2056,14 +2060,26 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    /// Freezes or unfreezes the shader animation clock (water waves, caustics) so A/B captures
-    /// compare the exact same frozen world state pixel-for-pixel.
+    /// Freezes or unfreezes the shader animation clock (cloth waves, water ripples, caustics,
+    /// volumetric fire/smoke drift) cleanly without time-jumping on resume.
     pub fn set_freeze_time(&mut self, frozen: bool) {
         if frozen {
             if self.frozen_time_sec.is_none() {
-                self.frozen_time_sec = Some(self.start_time.elapsed().as_secs_f32());
+                let now = Instant::now();
+                let sim_t = (now.saturating_duration_since(self.start_time).as_secs_f32()
+                    - self.paused_accum_sec)
+                    .max(0.0);
+                self.frozen_time_sec = Some(sim_t);
+                self.paused_at = Some(now);
             }
-        } else {
+        } else if self.frozen_time_sec.is_some() {
+            if let Some(p_at) = self.paused_at.take() {
+                let pause_dur = Instant::now().saturating_duration_since(p_at);
+                self.paused_accum_sec += pause_dur.as_secs_f32();
+                if let Some((pos, str0, t0)) = self.wind_blast {
+                    self.wind_blast = Some((pos, str0, t0 + pause_dur));
+                }
+            }
             self.frozen_time_sec = None;
         }
     }
