@@ -433,6 +433,7 @@ pub struct PostProcessPipeline {
     ssao_blur_pipeline: vk::Pipeline,
     ssao_apply_pipeline: vk::Pipeline,
     output_format: vk::Format,
+    water_depth_format: vk::Format,
 }
 
 impl PostProcessPipeline {
@@ -451,11 +452,31 @@ impl PostProcessPipeline {
         let sw = (w / 2).max(1);
         let sh = (h / 2).max(1);
 
+        // Prefer full 32-bit float RGBA for `water_depth` so linearized seabed view-Z (~500..2000)
+        // never quantizes into f16 (~0.5-unit) horizontal beach stair-steps.
+        let water_depth_format = {
+            let candidate = vk::Format::R32G32B32A32_SFLOAT;
+            // SAFETY: Valid physical device handle on `ctx.instance`.
+            let props = unsafe {
+                ctx.instance
+                    .get_physical_device_format_properties(ctx.physical_device, candidate)
+            };
+            let needed = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+            if props.optimal_tiling_features.contains(needed) {
+                candidate
+            } else {
+                HDR_FORMAT
+            }
+        };
+
         let hdr_scene = ImageTarget::new(ctx, "zhr_hdr_scene", w, h)?;
         let bloom_a = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let bloom_b = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
         let ui_backdrop = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
-        let water_depth = ImageTarget::new(ctx, "zhr_water_snapshot", w, h)?;
+        let water_depth =
+            ImageTarget::new_with_format(ctx, "zhr_water_snapshot", w, h, water_depth_format)?;
         let ssao_a = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let ssao_b = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
 
@@ -618,7 +639,7 @@ impl PostProcessPipeline {
             vs_module,
             fs_water_depth_module,
             c"fs_water_depth_copy",
-            HDR_FORMAT,
+            water_depth_format,
             false,
         )?;
         let backdrop_copy_pipeline = create_fullscreen_pipeline(
@@ -728,6 +749,7 @@ impl PostProcessPipeline {
             ssao_blur_pipeline,
             ssao_apply_pipeline,
             output_format,
+            water_depth_format,
         };
         me.update_descriptors(&ctx.device);
         Ok(me)
@@ -772,7 +794,8 @@ impl PostProcessPipeline {
         let new_ba = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let new_bb = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
         let new_ui = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
-        let new_wd = ImageTarget::new(ctx, "zhr_water_snapshot", w, h)?;
+        let new_wd =
+            ImageTarget::new_with_format(ctx, "zhr_water_snapshot", w, h, self.water_depth_format)?;
         let new_sa = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let new_sb = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
         transition_images_to_shader_read(
@@ -1525,7 +1548,7 @@ impl PostProcessPipeline {
 
         let p_extract = PostParams {
             params0: [1.0, split_x_uv, inv_w, inv_h],
-            params1: [0.0, 0.0, 1.02, 0.0],
+            params1: [0.0, 0.0, 1.14, 0.0],
             params2: [0.0; 4],
         };
         let p_blur_h = PostParams {
@@ -1545,7 +1568,7 @@ impl PostProcessPipeline {
                 inv_w,
                 inv_h,
             ],
-            params1: [0.0, 0.0, 1.02, 0.34],
+            params1: [0.0, 0.0, 1.14, 0.24],
             params2: [0.0; 4],
         };
 

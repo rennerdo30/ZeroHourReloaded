@@ -436,6 +436,169 @@ pub fn remaster_rgba8_2x(
     Some((out_w as u32, out_h as u32, albedo, normal_rough))
 }
 
+/// Synthesizes a compact, seam-safe, multi-scale 8-bit displacement heightmap (`out_dim * out_dim`,
+/// centered at `128` = neutral) directly from an original Zero Hour texture buffer.
+///
+/// Format codes match `zhr_vk_create_texture_2d`:
+/// `0 = RGBA8`, `1 = BGRA8`, `2 = BC1 (DXT1)`, `3 = BC2 (DXT3)`, `4 = BC3 (DXT5)`.
+///
+/// Design details:
+/// - Masks transparent alpha-cutout pixels (`alpha < 128`) to neutral so foliage/decals never spike.
+/// - Attenuates highly saturated team/house-color stripes so faction paint never falsely protrudes.
+/// - Combines multi-scale band-pass relief (`blur_small - blur_large`) with gentle macro luminance
+///   so real rock crags, stone facets, masonry, and armor seams pop cleanly without shadow artifacts.
+pub fn synthesize_heightmap_r8(
+    format_code: u32,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    out_dim: u32,
+) -> Option<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    let dim = out_dim.clamp(16, 128) as usize;
+    if w < 16 || h < 16 || data.is_empty() {
+        return None;
+    }
+
+    let rgba_owned: Vec<u8>;
+    let rgba: &[u8] = match format_code {
+        0 => {
+            if data.len() < w * h * 4 {
+                return None;
+            }
+            data
+        }
+        1 => {
+            if data.len() < w * h * 4 {
+                return None;
+            }
+            rgba_owned = bgra8_to_rgba8(&data[..w * h * 4]);
+            &rgba_owned
+        }
+        2..=4 => {
+            rgba_owned = decode_bc_to_rgba8(format_code, width, height, data)?;
+            &rgba_owned
+        }
+        _ => return None,
+    };
+
+    // Step 1: Resample source into `dim x dim` alpha-safe & saturation-attenuated luminance + mask.
+    let mut base = vec![0.5f32; dim * dim];
+    let mut mask = vec![1.0f32; dim * dim];
+    let mut opaque_count = 0usize;
+    let mut mean_luma = 0.0f32;
+
+    for oy in 0..dim {
+        let sy = ((oy as f32 + 0.5) * (h as f32) / (dim as f32))
+            .floor()
+            .clamp(0.0, (h - 1) as f32) as usize;
+        for ox in 0..dim {
+            let sx = ((ox as f32 + 0.5) * (w as f32) / (dim as f32))
+                .floor()
+                .clamp(0.0, (w - 1) as f32) as usize;
+            let idx = (sy * w + sx) * 4;
+            let r = rgba[idx] as f32 / 255.0;
+            let g = rgba[idx + 1] as f32 / 255.0;
+            let b = rgba[idx + 2] as f32 / 255.0;
+            let a = rgba[idx + 3] as f32 / 255.0;
+
+            let o = oy * dim + ox;
+            if a < 0.5 {
+                mask[o] = 0.0;
+                base[o] = 0.5;
+                continue;
+            }
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            let max_c = r.max(g).max(b);
+            let min_c = r.min(g).min(b);
+            let sat = if max_c > 0.001 {
+                (max_c - min_c) / max_c
+            } else {
+                0.0
+            };
+            // Attenuate bright saturated faction/house-color stripes (e.g. royal blue / red paint).
+            let paint_atten = (1.0 - ((sat - 0.55).max(0.0) * 1.65)).clamp(0.20, 1.0);
+            base[o] = luma;
+            mask[o] = paint_atten * a;
+            mean_luma += luma;
+            opaque_count += 1;
+        }
+    }
+
+    // Mostly transparent decal/sprite sheet -> flat neutral heightmap.
+    if opaque_count * 4 < dim * dim {
+        return Some(vec![128u8; dim * dim]);
+    }
+    mean_luma /= opaque_count as f32;
+    for i in 0..(dim * dim) {
+        if mask[i] <= 0.01 {
+            base[i] = mean_luma;
+        }
+    }
+
+    // Separable wrapping box blur helper for multi-scale relief extraction.
+    let box_blur = |src: &[f32], radius: isize| -> Vec<f32> {
+        let mut tmp = vec![0.0f32; dim * dim];
+        let mut dst = vec![0.0f32; dim * dim];
+        let inv = 1.0 / (2 * radius + 1) as f32;
+        for y in 0..dim {
+            for x in 0..dim {
+                let mut acc = 0.0f32;
+                for d in -radius..=radius {
+                    let sx = (x as isize + d).rem_euclid(dim as isize) as usize;
+                    acc += src[y * dim + sx];
+                }
+                tmp[y * dim + x] = acc * inv;
+            }
+        }
+        for y in 0..dim {
+            for x in 0..dim {
+                let mut acc = 0.0f32;
+                for d in -radius..=radius {
+                    let sy = (y as isize + d).rem_euclid(dim as isize) as usize;
+                    acc += tmp[sy * dim + x];
+                }
+                dst[y * dim + x] = acc * inv;
+            }
+        }
+        dst
+    };
+
+    // Multi-scale structural relief: medium features (r=1) minus broad lighting (r=5) + gentle macro slope.
+    let smooth_s = box_blur(&base, 1);
+    let smooth_l = box_blur(&base, 5);
+    let mut raw = vec![0.0f32; dim * dim];
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    for i in 0..(dim * dim) {
+        let band = smooth_s[i] - smooth_l[i];
+        let macro_h = (smooth_s[i] - mean_luma) * 0.42;
+        let h_val = (band * 1.45 + macro_h) * mask[i];
+        raw[i] = h_val;
+        sum += h_val;
+        sum_sq += h_val * h_val;
+    }
+
+    let n = (dim * dim) as f32;
+    let mean = sum / n;
+    let std_dev = ((sum_sq / n) - mean * mean).max(0.0).sqrt();
+
+    // Normalize contrast smoothly while keeping nearly-flat textures gently attenuated.
+    let gain = if std_dev > 0.015 {
+        (0.24 / std_dev).clamp(0.65, 2.4)
+    } else {
+        1.0
+    };
+
+    let mut out = vec![128u8; dim * dim];
+    for i in 0..(dim * dim) {
+        let v = (0.5 + (raw[i] - mean) * gain).clamp(0.0, 1.0);
+        out[i] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    Some(out)
+}
+
 fn cache_file_path(cache_dir: &Path, hash: &str) -> PathBuf {
     cache_dir.join(format!("zhr_tex_{hash}.zhrt"))
 }
@@ -679,6 +842,32 @@ mod tests {
             (normal[edge_idx] as i32 - 128).abs() > 15,
             "expected Sobel edge gradient in normal X, got {}",
             normal[edge_idx]
+        );
+    }
+
+    #[test]
+    fn synthesizes_heightmap_with_alpha_and_relief_safety() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let ridge = ((x as i32 - 16).abs() < 6) && ((y as i32 - 16).abs() < 6);
+                let v = if ridge { 220u8 } else { 70u8 };
+                src[i] = v;
+                src[i + 1] = v;
+                src[i + 2] = v;
+                src[i + 3] = 255;
+            }
+        }
+        let hm = synthesize_heightmap_r8(0, w, h, &src, 32).expect("heightmap ok");
+        assert_eq!(hm.len(), 32 * 32);
+        let center = hm[16 * 32 + 16];
+        let corner = hm[2 * 32 + 2];
+        assert!(
+            center > corner + 20,
+            "expected raised ridge ({center}) above background ({corner})"
         );
     }
 

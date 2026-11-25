@@ -238,6 +238,12 @@ public:
 	{
 		(void)mode; (void)pbrWaterSsao; (void)hdrPostFx; (void)remasterTextures; (void)meshSmoothing;
 	}
+	virtual void setVulkanFreezeTime(Bool frozen) { (void)frozen; }
+	virtual void setVulkanWireframe(Bool enabled) { (void)enabled; }
+	virtual void requestVulkanCapture(const char* pngPath, const char* statsPath)
+	{
+		(void)pngPath; (void)statsPath;
+	}
 
 protected:
 	virtual void onBeginBatch() { }

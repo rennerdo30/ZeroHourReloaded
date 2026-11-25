@@ -123,6 +123,9 @@ pub struct VulkanRenderer {
     frame_cursor: usize,
     frame_number: u64,
     start_time: Instant,
+    frozen_time_sec: Option<f32>,
+    wireframe: bool,
+    pending_capture: Option<(String, Option<String>)>,
     active_frame: Option<ActiveFrame>,
 
     // GPU resource registries
@@ -368,6 +371,9 @@ impl VulkanRenderer {
             frame_cursor: 0,
             frame_number: 0,
             start_time: Instant::now(),
+            frozen_time_sec: None,
+            wireframe: false,
+            pending_capture: None,
             active_frame: None,
             next_buffer_id: 1,
             buffers: HashMap::new(),
@@ -1264,12 +1270,23 @@ impl VulkanRenderer {
         }
         let slot_index = af.slot_index;
 
+        let is_opaque_blend = self.shader.src_blend() == shader::SrcBlend::One
+            && self.shader.dst_blend() == shader::DstBlend::Zero;
+        let draw_wireframe = self.wireframe
+            && self.ctx.fill_mode_non_solid
+            && is_3d_pass
+            && self.material_hint == 0
+            && !self.stencil.enabled
+            && is_opaque_blend
+            && self.uniforms.ambient_and_lighting[3] > 0.5;
+
         let pso = self.pipelines.get_or_create(
             &self.ctx.device,
             self.shader,
             self.stencil.pipeline_key(),
             HDR_FORMAT,
             af.depth_format,
+            draw_wireframe,
         )?;
         let cmd = self.frames[slot_index].cmd;
 
@@ -1374,12 +1391,10 @@ impl VulkanRenderer {
         } else {
             0.0
         };
-        draw_uniforms.water_params = [
-            self.start_time.elapsed().as_secs_f32(),
-            glass_hint,
-            screen_inv_w,
-            screen_inv_h,
-        ];
+        let time_sec = self
+            .frozen_time_sec
+            .unwrap_or_else(|| self.start_time.elapsed().as_secs_f32());
+        draw_uniforms.water_params = [time_sec, glass_hint, screen_inv_w, screen_inv_h];
 
         let alignment = self.ctx.min_uniform_offset_alignment as usize;
         let dyn_offset = self.frames[slot_index]
@@ -1620,14 +1635,26 @@ impl VulkanRenderer {
         }
 
         self.frame_number += 1;
-        let capture_path = std::env::var("ZHR_VK_CAPTURE_PNG")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let capture_frame: u64 = std::env::var("ZHR_VK_CAPTURE_FRAME")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
-        let do_capture = capture_path.is_some() && self.frame_number == capture_frame;
+        let (capture_path, capture_stats_path) = if let Some((png, stats)) = self.pending_capture.take() {
+            (Some(png), stats)
+        } else {
+            let env_png = std::env::var("ZHR_VK_CAPTURE_PNG")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let capture_frame: u64 = std::env::var("ZHR_VK_CAPTURE_FRAME")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            if env_png.is_some() && self.frame_number == capture_frame {
+                let env_stats = std::env::var("ZHR_VK_STATS_LOG")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                (env_png, env_stats)
+            } else {
+                (None, None)
+            }
+        };
+        let do_capture = capture_path.is_some();
 
         let capture_staging = if do_capture {
             let byte_len = (af.extent.width as usize) * (af.extent.height as usize) * 4;
@@ -1804,7 +1831,7 @@ impl VulkanRenderer {
             }
             let _ = write_rgba8_png(Path::new(&path), af.extent.width, af.extent.height, &pixels);
             staging.destroy(&mut self.ctx);
-            if let Ok(stats_path) = std::env::var("ZHR_VK_STATS_LOG")
+            if let Some(stats_path) = capture_stats_path
                 && !stats_path.is_empty()
             {
                 let report = format!(
@@ -1827,6 +1854,29 @@ impl VulkanRenderer {
         }
 
         Ok(())
+    }
+
+    /// Freezes or unfreezes the shader animation clock (water waves, caustics) so A/B captures
+    /// compare the exact same frozen world state pixel-for-pixel.
+    pub fn set_freeze_time(&mut self, frozen: bool) {
+        if frozen {
+            if self.frozen_time_sec.is_none() {
+                self.frozen_time_sec = Some(self.start_time.elapsed().as_secs_f32());
+            }
+        } else {
+            self.frozen_time_sec = None;
+        }
+    }
+
+    /// Toggles Vulkan `VK_POLYGON_MODE_LINE` wireframe rendering on opaque 3D lit meshes
+    /// (for inspecting Smart Adaptive Tessellation triangle density side-by-side).
+    pub fn set_wireframe(&mut self, enabled: bool) {
+        self.wireframe = enabled;
+    }
+
+    /// Schedules a one-shot PNG (+ optional stats file) capture on the very next `end_frame()`.
+    pub fn request_capture(&mut self, png_path: String, stats_path: Option<String>) {
+        self.pending_capture = Some((png_path, stats_path));
     }
 
     /// Reads back the last rendered headless frame as tightly-packed RGBA8 bytes (`width * height * 4`).

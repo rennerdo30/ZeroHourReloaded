@@ -41,16 +41,22 @@ Replaces flat dark scrolling water planes and hard dry polygon rock intersection
 
 ---
 
-### 3. Crease-Preserving `.W3D` Mesh Smoothing (`F7`), Volumetric Shadows, Bilateral SSAO & 2× Texture Remastering (`F8`)
-- **Rig-Safe Phong Mesh Subdivision (`F7`):** Smooths curved silhouettes (turrets, radar domes, hulls, barrels, wheels) while preserving sharp armor creases and 100% of `.W3D` bone hierarchies and animations.
+### 3. Smart Adaptive `.W3D` Tessellation, Texture-Derived Heightmap Displacement & Steep POM (`F7`), Volumetric Shadows, Bilateral SSAO & 2× Texture Remastering (`F8`)
+- **Smart Adaptive Crack-Free `.W3D` Tessellation & Heightmap Displacement (`F7`):** Without shipping any modified `.W3D` assets, `rust/zhr-remaster` synthesizes seam-safe, alpha-safe, house-color-attenuated multi-scale heightmaps on the fly from original Zero Hour diffuse textures (`RGBA8`, `BGRA8`, `BC1`–`BC3`), driving a **3-pass adaptive tessellator** in `VulkanDX8Bridge.cpp` (Pass 1: crease-preserving Boubekeur-Alexa Phong `1→4`; Pass 2: T-junction-free Red-Green adaptive Level-2 `1→2/1→3/1→4` on curved/high-relief faces; Pass 3: spatially welded heightmap displacement with `min_edge` / aspect-ratio thin-geometry guards so antennas, masts, and gun barrels stay razor-sharp, backed by a 128-bit content-hashed static mesh cache for zero per-frame CPU overhead).
+- **Per-Pixel 4-Step Steep Parallax Occlusion Mapping (POM) & Matte Stone Roughness:** Adds cotangent-frame Steep POM, 4-tap finite-difference micro-relief normals, micro-cavity self-shadowing, and micro-roughness stone/metal separation in `WW3D2_UBER_WGSL` so granite rocks stay natural matte stone while painted steel hulls & turrets retain crisp GGX specular.
 - **Hardware Stencil Volumetric Shadows & Occluded Silhouettes:** Full `VkStencilOpState` shadow volume extrusion and occluded unit highlighting.
 - **Pre-UI Bilateral Depth SSAO (`F10`):** Half-resolution edge-preserving ambient occlusion grounding units, deck structures, and terrain crevices without bleeding onto the 2D HUD.
 - **Zero-Stall Async 2× Texture Remastering (`F8`):** `rust/zhr-remaster` upscales diffuse textures asynchronously on background workers with alpha/house-color isolation and persistent BLAKE3 disk caching (`%LOCALAPPDATA%/ZeroHourReloaded/cache/`), hot-swapping Vulkan descriptors with zero frame hitches.
 
-| Classic Hull, Turrets & Lighting | Remastered Mesh, PBR/SSAO, Shadows & 2× Textures |
+| Classic Hull, Turrets & Lighting | Remastered Mesh, PBR/POM/SSAO, Shadows & 2× Textures |
 | :---: | :---: |
 | ![Classic Battleship Detail](docs/screenshots/a_ship_detail_classic.png) | ![Remastered Battleship Detail](docs/screenshots/b_ship_detail_remastered.png) |
 | *Faceted 2003 geometry, muddy DXT1 textures, flat lighting with no crevice occlusion* | *Smoothed curved geometry, metallic GGX + Sky IBL specular, crisp volumetric shadows, bilateral SSAO, and 2× remastered textures* |
+
+| Frozen-Frame Wireframe A/B — Battleship, Chinook & Hovercraft (`F7` OFF vs ON) | Frozen-Frame Wireframe A/B — Coastal Boulders (`F7` OFF vs ON) |
+| :---: | :---: |
+| ![Smart Adaptive Tessellation Wireframe A/B — Ship](docs/screenshots/ab_tessellation_wireframe.png) | ![Smart Adaptive Tessellation Wireframe A/B — Boulders](docs/screenshots/ab_rocks_wireframe.png) |
+| *Exact frozen frame (`171,592` → `196,067` tris, `0` validation errors): 4×–16× adaptive subdivision on curved hulls, barrels, and fuselage while keeping thin antennas razor-sharp* | *Exact frozen frame: jagged 2003 rock pyramids adaptively subdivided & heightmap-displaced into smooth sculpted boulders with zero cracks* |
 
 ---
 
@@ -124,7 +130,7 @@ Toggle every visual remaster subsystem live during the shell map or skirmish wit
 | **`F9`** | **Master Graphics Mode** | Cycles **Remastered** → **50/50 Split-Screen A/B** → **Classic 2003** |
 | **`F10`** | **PBR, Water & SSAO** | Toggles GGX/IBL lighting, animated water & reflections, terrain PBR relief, and bilateral SSAO |
 | **`F11`** | **HDR Post-Processing** | Toggles HDR Bloom, ACES Filmic Tonemapping, and AMD CAS sharpening |
-| **`F7`** | **Mesh Smoothing** | Toggles crease-preserving Phong `.W3D` geometry subdivision |
+| **`F7`** | **Smart Tessellation & Relief** | Toggles crack-free adaptive `.W3D` tessellation, texture-derived heightmap displacement, and Steep POM |
 | **`F8`** | **2× Remastered Textures** | Toggles zero-stall async 2× upscaled textures (with persistent BLAKE3 disk cache) |
 
 ---

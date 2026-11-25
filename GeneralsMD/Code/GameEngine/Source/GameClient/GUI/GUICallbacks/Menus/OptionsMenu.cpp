@@ -1267,7 +1267,7 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 
 	s_zhrCheckMeshSmooth = createZhrCheckBox(
 		gfxParent, "OptionsMenu.wnd:ZhrCheckMeshSmoothing",
-		UnicodeString(L"Phong .W3D Mesh Smoothing  [F7]"),
+		UnicodeString(L"Smart Tessellation & Relief  [F7]"),
 		rightCardX + cPadX, cy, ctrlW, checkH, bodyFont, s_zhrCheckMeshSmoothID);
 
 	const Int hintH = static_cast<Int>(bodyH * 0.065f);

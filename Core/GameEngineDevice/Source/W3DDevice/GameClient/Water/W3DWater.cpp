@@ -1561,11 +1561,14 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 		return;
 	}
 
+	{
 #if defined(ZHR_USE_VULKAN)
-	struct ZhrVulkanWaterGuard {
-		ZhrVulkanWaterGuard() { zhr_vk_set_material_hint(1u); }
-		~ZhrVulkanWaterGuard() { zhr_vk_set_material_hint(0u); }
-	} zhrWaterGuard;
+		// Scope the Vulkan water material hint strictly to the water surface passes so
+		// the skybox and m_waterTrackSystem (breaking beach surf ribbons) keep their own shading.
+		struct ZhrVulkanWaterGuard {
+			ZhrVulkanWaterGuard() { zhr_vk_set_material_hint(1u); }
+			~ZhrVulkanWaterGuard() { zhr_vk_set_material_hint(0u); }
+		} zhrWaterGuard;
 #endif
 
 	switch(m_waterType)
@@ -1717,6 +1720,7 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 		default:
 			break;
 	}
+	} // end ZhrVulkanWaterGuard (skybox & breaking beach surf tracks render with normal shaders)
 
 	if (TheGlobalData && TheGlobalData->m_drawSkyBox)
 	{

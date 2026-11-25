@@ -3518,3 +3518,30 @@ void W3DDisplay::setVulkanRemasterSettings(UnsignedInt mode, Bool pbrWaterSsao, 
 	(void)mode; (void)pbrWaterSsao; (void)hdrPostFx; (void)remasterTextures; (void)meshSmoothing;
 #endif
 }
+
+void W3DDisplay::setVulkanFreezeTime(Bool frozen)
+{
+#ifdef ZHR_VULKAN_BACKEND
+	zhr_vk_set_freeze_time(frozen != FALSE);
+#else
+	(void)frozen;
+#endif
+}
+
+void W3DDisplay::setVulkanWireframe(Bool enabled)
+{
+#ifdef ZHR_VULKAN_BACKEND
+	zhr_vk_set_wireframe(enabled != FALSE);
+#else
+	(void)enabled;
+#endif
+}
+
+void W3DDisplay::requestVulkanCapture(const char* pngPath, const char* statsPath)
+{
+#ifdef ZHR_VULKAN_BACKEND
+	zhr_vk_request_capture(pngPath, statsPath);
+#else
+	(void)pngPath; (void)statsPath;
+#endif
+}

@@ -108,6 +108,9 @@
 #include "GameNetwork/GameSpy/GameResultsThread.h"
 
 #include "Common/version.h"
+#include "GameClient/Display.h"
+#include <cstdlib>
+#include <string>
 
 
 //-------------------------------------------------------------------------------------------------
@@ -892,6 +895,70 @@ DECLARE_PERF_TIMER(GameEngine_update)
  */
 void GameEngine::update()
 {
+	// Deterministic Frozen-Simulation Multi-Shot A/B Capture:
+	// Set `ZHR_AB_CAPTURE_DIR=<folder>` (and optional `ZHR_AB_CAPTURE_LOGIC_FRAME=<n>`, default 160).
+	// Steps logic deterministically to `targetFrame`, then FREEZES simulation, client animations, and
+	// shader clocks completely so Classic / Tess-OFF / Tess-ON / Split-AB capture the EXACT same frame.
+	{
+		static const char* abDir = std::getenv("ZHR_AB_CAPTURE_DIR");
+		static bool abDone = false;
+		if (!abDone && abDir != nullptr && abDir[0] != '\0' &&
+		    TheGameLogic != nullptr && TheGameLogic->isInGame() &&
+		    TheDisplay != nullptr && TheDisplay->hasVulkanRemasterBackend())
+		{
+			static const UnsignedInt targetLogicFrame = []() -> UnsignedInt {
+				const char* e = std::getenv("ZHR_AB_CAPTURE_LOGIC_FRAME");
+				if (e != nullptr && e[0] != '\0')
+				{
+					long v = std::strtol(e, nullptr, 10);
+					if (v > 0) return static_cast<UnsignedInt>(v);
+				}
+				return 160u;
+			}();
+
+			if (TheGameLogic->getFrame() >= targetLogicFrame)
+			{
+				abDone = true;
+				// Freeze shader clock (waves/caustics) and capture all 4 modes directly inside this
+				// single paused GameEngine::update() turn WITHOUT calling TheFramePacer->setTimeFrozen(TRUE)
+				// (which would trigger W3DDisplay::draw()'s scripted cutscene camera-pan do/while loop).
+				TheDisplay->setVulkanFreezeTime(TRUE);
+
+				struct AbShot {
+					const char* name;
+					UnsignedInt mode;
+					Bool pbr;
+					Bool postFx;
+					Bool remasterTex;
+					Bool meshSmooth;
+					Bool wireframe;
+				};
+				const AbShot shots[] = {
+					{ "c_tess_on",       1u, TRUE,  TRUE,  TRUE,  TRUE,  FALSE },
+					{ "b_tess_off",      1u, TRUE,  TRUE,  TRUE,  FALSE, FALSE },
+					{ "a_classic",       0u, FALSE, FALSE, FALSE, FALSE, FALSE },
+					{ "d_split_ab",      2u, TRUE,  TRUE,  TRUE,  TRUE,  FALSE },
+					{ "e_wire_tess_off", 1u, TRUE,  TRUE,  TRUE,  FALSE, TRUE  },
+					{ "f_wire_tess_on",  1u, TRUE,  TRUE,  TRUE,  TRUE,  TRUE  },
+				};
+
+				const std::string baseDir(abDir);
+				for (const AbShot& s : shots)
+				{
+					TheDisplay->setVulkanRemasterSettings(s.mode, s.pbr, s.postFx, s.remasterTex, s.meshSmooth);
+					TheDisplay->setVulkanWireframe(s.wireframe);
+					const std::string pngPath = baseDir + "/" + s.name + ".png";
+					const std::string statsPath = baseDir + "/" + s.name + ".stats.txt";
+					TheDisplay->requestVulkanCapture(pngPath.c_str(), statsPath.c_str());
+					TheDisplay->draw();
+				}
+				TheDisplay->setVulkanWireframe(FALSE);
+
+				std::_Exit(0);
+			}
+		}
+	}
+
 	USE_PERF_TIMER(GameEngine_update)
 	{
 		{

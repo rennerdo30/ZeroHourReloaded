@@ -144,6 +144,18 @@ void zhr_vk_set_graphics_mode(uint32_t mode, bool pbr_lighting, bool post_fx);
 void zhr_vk_set_remaster_textures(bool enabled);
 void zhr_vk_set_material_hint(uint32_t hint);
 uint32_t zhr_vk_get_graphics_mode(void);
+void zhr_vk_set_freeze_time(bool frozen);
+void zhr_vk_set_wireframe(bool enabled);
+void zhr_vk_request_capture(const char* png_path, const char* stats_path);
+/// Synthesizes an `out_dim * out_dim` 8-bit displacement heightmap (centered at 128) from raw or BC1-BC3 texture data.
+int32_t zhr_remaster_build_heightmap(
+    uint32_t width,
+    uint32_t height,
+    uint32_t format_code,
+    const uint8_t* data,
+    size_t byte_len,
+    uint32_t out_dim,
+    uint8_t* out_height_r8);
 uint32_t zhr_vk_create_texture_rgba8(
     uint32_t width,
     uint32_t height,

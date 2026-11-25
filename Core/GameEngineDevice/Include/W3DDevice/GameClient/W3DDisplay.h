@@ -194,6 +194,9 @@ public:
 	virtual Bool hasVulkanRemasterBackend() const override;
 	virtual void getVulkanRemasterSettings(UnsignedInt &mode, Bool &pbrWaterSsao, Bool &hdrPostFx, Bool &remasterTextures, Bool &meshSmoothing) const override;
 	virtual void setVulkanRemasterSettings(UnsignedInt mode, Bool pbrWaterSsao, Bool hdrPostFx, Bool remasterTextures, Bool meshSmoothing) override;
+	virtual void setVulkanFreezeTime(Bool frozen) override;
+	virtual void setVulkanWireframe(Bool enabled) override;
+	virtual void requestVulkanCapture(const char* pngPath, const char* statsPath) override;
 
 protected:
 

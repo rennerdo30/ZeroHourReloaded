@@ -683,6 +683,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Compute screen-space derivatives in uniform control flow before any branches.
     let dpos_dx = dpdx(in.world_pos);
     let dpos_dy = dpdy(in.world_pos);
+    let duv_dx = dpdx(in.uv0);
+    let duv_dy = dpdy(in.uv0);
     let tex_luma = dot(tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
     let dl_dx = dpdx(tex_luma);
     let dl_dy = dpdy(tex_luma);
@@ -816,67 +818,146 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let foam_tex = foam_noise * 0.65 + foam_detail * 0.35;
 
         // Soft, broken organic contact foam collar hugging rocks, hulls, and beaches.
-        let contact_band = smoothstep(2.4, 0.08, raw_water_depth);
-        let contact_foam = smoothstep(0.38, 0.74, contact_band * 1.08 + (foam_tex - 0.5) * 0.92) * contact_band;
+        let contact_band = smoothstep(2.1, 0.08, raw_water_depth);
+        let contact_foam = smoothstep(0.42, 0.78, contact_band * 1.02 + (foam_tex - 0.5) * 0.88) * contact_band;
 
-        // Gently rolling surf ripples lapping inward around coastlines and shallow rocks.
-        let surf_zone = smoothstep(6.8, 0.6, raw_water_depth) * smoothstep(0.18, 1.0, raw_water_depth);
-        let surf_wave = sin(raw_water_depth * 1.85 - t * 2.0 + foam_noise * 3.6);
-        let surf_rings = smoothstep(0.52, 0.94, surf_wave) * smoothstep(0.36, 0.72, foam_tex) * surf_zone * 0.66;
+        // Subtle organic surf ripples in coastal shallows (Zero Hour's WaterTrackSystem draws main beach breakers).
+        let surf_zone = smoothstep(5.5, 0.8, raw_water_depth) * smoothstep(0.35, 1.4, raw_water_depth);
+        let surf_wave = sin(raw_water_depth * 1.15 - t * 1.7 + foam_noise * 4.2);
+        let surf_rings = smoothstep(0.62, 0.96, surf_wave) * smoothstep(0.40, 0.76, foam_tex) * surf_zone * 0.28;
 
         // Subtle wind-swept whitecaps on the tallest deep-water swell peaks.
-        let whitecap = smoothstep(0.84, 1.16, h_c + foam_tex * 0.34) * smoothstep(4.5, 14.0, raw_water_depth) * 0.18;
+        let whitecap = smoothstep(0.84, 1.16, h_c + foam_tex * 0.34) * smoothstep(4.5, 14.0, raw_water_depth) * 0.16;
 
-        let total_foam = clamp(contact_foam * 0.88 + surf_rings + whitecap, 0.0, 1.0);
-        let foam_col = mix(vec3<f32>(0.82, 0.92, 0.96), vec3<f32>(0.98, 0.99, 1.0), 0.72) * (0.76 + 0.32 * ndotl);
+        let total_foam = clamp(contact_foam * 0.64 + surf_rings + whitecap, 0.0, 0.92);
+        let foam_col = mix(vec3<f32>(0.80, 0.90, 0.95), vec3<f32>(0.94, 0.97, 0.99), 0.65) * (0.76 + 0.24 * ndotl);
 
         let water_body = underwater + sss_col;
-        let reflected_water = mix(water_body, sky_refl, clamp(fresnel * 0.72, 0.10, 0.80)) + water_spec;
+        let reflected_water = mix(water_body, sky_refl, clamp(fresnel * 0.68, 0.10, 0.76)) + water_spec;
         let surfaced_water = mix(reflected_water, foam_col, total_foam);
 
         // Soft wet shoreline edge feathering eliminates hard polygon cuts around every rock & island.
-        let shore_feather = select(1.0, smoothstep(0.0, 0.75, raw_water_depth), has_snap);
-        let wet_shore = backdrop_sample.rgb * 0.82;
+        let shore_feather = select(1.0, smoothstep(0.0, 0.95, raw_water_depth), has_snap);
+        let wet_shore = backdrop_sample.rgb * 0.86;
         let final_water = select(surfaced_water, mix(wet_shore, surfaced_water, shore_feather), has_snap);
         let final_alpha = select(
-            clamp(col.a + fresnel * 0.25 + total_foam * 0.5, 0.55, 0.98),
-            clamp(max(shore_feather, total_foam * 0.82), 0.0, 1.0),
+            clamp(col.a + fresnel * 0.25 + total_foam * 0.45, 0.55, 0.98),
+            clamp(max(shore_feather, total_foam * 0.68), 0.0, 1.0),
             has_snap
         );
         col = vec4<f32>(final_water, final_alpha);
     } else if (pbr_active && u.render_flags.x > 0.5) {
-        // 3D lit geometry: per-pixel micro-normal + Cook-Torrance GGX specular + hemisphere sky/ground IBL.
-        let albedo = eval_combiner(in.raw_color, tex0, tex1);
+        // 3D lit geometry: per-pixel Parallax Occlusion Mapping (POM) + multi-tap micro-relief normal
+        // + micro-cavity self-shadowing + Cook-Torrance GGX specular + hemisphere sky/ground IBL.
         let n_geom = normalize(in.world_normal);
+        let to_cam = u.camera_pos_and_pbr.xyz - in.world_pos;
+        let cam_dist = length(to_cam);
+        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, cam_dist > 0.0001));
 
-        // Derivative-based procedural micro-normal relief (Mikkelsen unparametrized bump mapping).
-        let r1 = cross(dpos_dy, n_geom);
-        let r2 = cross(n_geom, dpos_dx);
-        let det = dot(dpos_dx, r1);
-        var n_bump = n_geom;
-        if (abs(det) > 0.00001) {
-            let surf_grad = sign(det) * (dl_dx * r1 + dl_dy * r2);
-            let grad_len = length(surf_grad);
-            let clamped_grad = surf_grad / max(1.0, grad_len * 0.45);
-            n_bump = normalize(abs(det) * n_geom - 0.34 * clamped_grad);
+        // Construct cotangent frame from screen-space derivatives for zero-attribute POM.
+        var pom_uv = in.uv0;
+        var pom_tex0 = tex0;
+        var pom_cavity = 1.0;
+        var pom_normal = n_geom;
+        var pom_grad_mag = 0.0;
+        var used_pom_normal = false;
+
+        let uv_det = duv_dx.x * duv_dy.y - duv_dx.y * duv_dy.x;
+        let pom_fade = smoothstep(420.0, 110.0, cam_dist);
+        if (u.fog_and_shader_params.w > 0.5 && alpha_ref <= 0.0 && pom_fade > 0.02 && abs(uv_det) > 0.0000001) {
+            let inv_uv_det = 1.0 / uv_det;
+            let t_raw = (dpos_dx * duv_dy.y - dpos_dy * duv_dx.y) * inv_uv_det;
+            let b_raw = (dpos_dy * duv_dx.x - dpos_dx * duv_dy.x) * inv_uv_det;
+            // Gram-Schmidt orthogonalize T and B against n_geom.
+            let t_ortho = t_raw - n_geom * dot(t_raw, n_geom);
+            let b_ortho = b_raw - n_geom * dot(b_raw, n_geom);
+            let t_len = length(t_ortho);
+            let b_len = length(b_ortho);
+            if (t_len > 0.0001 && b_len > 0.0001) {
+                let t_vec = t_ortho / t_len;
+                let b_vec = b_ortho / b_len;
+                let vz = max(dot(v_dir, n_geom), 0.28);
+                let v_tan = vec2<f32>(dot(v_dir, t_vec), dot(v_dir, b_vec)) / vz;
+                // Keep parallax shift physically bounded in UV space (zero swimming on atlases).
+                let parallax_amp = 0.0075 * pom_fade * smoothstep(0.18, 0.55, vz);
+                let max_uv_shift = clamp(v_tan * parallax_amp, vec2<f32>(-0.011), vec2<f32>(0.011));
+
+                // 4-step Steep Parallax Occlusion march + linear intersection refinement.
+                let step_uv = max_uv_shift * 0.25;
+                var cur_uv = in.uv0;
+                var prev_uv = in.uv0;
+                var cur_layer = 0.0;
+                var prev_diff = 0.0;
+                var cur_h = dot(tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                for (var s: u32 = 0u; s < 4u; s = s + 1u) {
+                    if (cur_layer >= (1.0 - cur_h)) {
+                        break;
+                    }
+                    prev_uv = cur_uv;
+                    prev_diff = (1.0 - cur_h) - cur_layer;
+                    cur_uv = cur_uv - step_uv;
+                    cur_layer = cur_layer + 0.25;
+                    let s_rgb = textureSampleGrad(t_diffuse, s_diffuse, cur_uv, duv_dx, duv_dy).rgb;
+                    cur_h = dot(s_rgb, vec3<f32>(0.299, 0.587, 0.114));
+                }
+                let after_diff = cur_layer - (1.0 - cur_h);
+                let denom_p = max(after_diff + prev_diff, 0.0001);
+                let weight = clamp(after_diff / denom_p, 0.0, 1.0);
+                pom_uv = mix(cur_uv, prev_uv, weight);
+                pom_tex0 = textureSampleGrad(t_diffuse, s_diffuse, pom_uv, duv_dx, duv_dy);
+
+                // 4-tap finite-difference relief normal + gentle micro-cavity self-shadowing (bloom-safe).
+                let texel_step = clamp(max(length(duv_dx), length(duv_dy)) * 1.15, 0.0012, 0.010);
+                let h_r = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_l = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(texel_step, 0.0), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_u = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv + vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_d = dot(textureSampleGrad(t_diffuse, s_diffuse, pom_uv - vec2<f32>(0.0, texel_step), duv_dx, duv_dy).rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let h_c = dot(pom_tex0.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let relief_str = 0.92 * pom_fade;
+                let gx = clamp((h_r - h_l) * relief_str, -0.52, 0.52);
+                let gy = clamp((h_u - h_d) * relief_str, -0.52, 0.52);
+                pom_grad_mag = length(vec2<f32>(h_r - h_l, h_u - h_d));
+                pom_normal = normalize(n_geom - t_vec * gx - b_vec * gy);
+                used_pom_normal = true;
+                let local_avg = 0.25 * (h_r + h_l + h_u + h_d);
+                pom_cavity = clamp(1.0 + (h_c - local_avg) * 0.45 * pom_fade, 0.88, 1.015);
+            }
         }
 
-        let to_cam = u.camera_pos_and_pbr.xyz - in.world_pos;
-        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, length(to_cam) > 0.0001));
+        let albedo = eval_combiner(in.raw_color, pom_tex0, tex1);
+
+        // Fallback to Mikkelsen screen-space derivative bump normal at far distances or untextured draws.
+        var n_bump = pom_normal;
+        if (!used_pom_normal) {
+            let r1 = cross(dpos_dy, n_geom);
+            let r2 = cross(n_geom, dpos_dx);
+            let det = dot(dpos_dx, r1);
+            if (abs(det) > 0.00001) {
+                let surf_grad = sign(det) * (dl_dx * r1 + dl_dy * r2);
+                let grad_len = length(surf_grad);
+                let clamped_grad = surf_grad / max(1.0, grad_len * 0.45);
+                n_bump = normalize(abs(det) * n_geom - 0.26 * clamped_grad);
+            }
+        }
+
         let ndotv = max(dot(n_bump, v_dir), 0.001);
 
-        // Estimate military material roughness/F0 from albedo (painted steel/armor vs matte sand/cloth).
+        // Estimate military material roughness/F0 from albedo + micro-roughness:
+        // High-frequency textured stone/granite/masonry stays matte dielectric (zero glowing rock highlights),
+        // while smooth painted steel armor/turrets/barrels retain crisp metallic GGX specular.
         let max_c = max(albedo.r, max(albedo.g, albedo.b));
         let min_c = min(albedo.r, min(albedo.g, albedo.b));
         let sat = (max_c - min_c) / max(max_c, 0.001);
-        let metallic_hint = clamp((1.0 - sat * 1.4) * smoothstep(0.18, 0.72, max_c), 0.0, 0.55);
-        let roughness = clamp(0.68 - metallic_hint * 0.36, 0.28, 0.80);
-        let f0 = mix(vec3<f32>(0.045), albedo.rgb * 0.35 + vec3<f32>(0.06), metallic_hint);
+        let stone_roughness_mask = smoothstep(0.06, 0.26, pom_grad_mag);
+        let metallic_hint = clamp((1.0 - sat * 1.4) * smoothstep(0.22, 0.75, max_c), 0.0, 0.45)
+            * (1.0 - stone_roughness_mask * 0.92);
+        let roughness = clamp(0.70 - metallic_hint * 0.34 + stone_roughness_mask * 0.20, 0.34, 0.92);
+        let f0 = mix(vec3<f32>(0.032), albedo.rgb * 0.28 + vec3<f32>(0.05), metallic_hint);
 
         // Hemisphere sky/ground IBL (Zero Hour uses +Z up).
         let up_factor = clamp(n_bump.z * 0.5 + 0.5, 0.0, 1.0);
-        let sky_amb = u.ambient_and_lighting.rgb * vec3<f32>(0.90, 1.02, 1.18);
-        let ground_amb = u.ambient_and_lighting.rgb * vec3<f32>(1.04, 0.90, 0.78);
+        let sky_amb = u.ambient_and_lighting.rgb * vec3<f32>(0.90, 1.01, 1.14);
+        let ground_amb = u.ambient_and_lighting.rgb * vec3<f32>(1.02, 0.91, 0.80);
         var diff_accum = mix(ground_amb, sky_amb, up_factor);
         var spec_accum = vec3<f32>(0.0);
 
@@ -887,10 +968,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let l_dir = normalize(-light.pos_or_dir_and_kind.xyz);
                 let ndotl = max(dot(n_bump, l_dir), 0.0);
                 let wrapped = clamp((dot(n_bump, l_dir) + 0.10) / 1.10, 0.0, 1.0);
-                diff_accum = diff_accum + light.diffuse_and_range.rgb * mix(ndotl, wrapped, 0.25);
+                diff_accum = diff_accum + light.diffuse_and_range.rgb * mix(ndotl, wrapped, 0.22);
                 if (ndotl > 0.0) {
                     let spec = ggx_specular(n_bump, v_dir, l_dir, roughness, f0);
-                    spec_accum = spec_accum + light.diffuse_and_range.rgb * spec * ndotl * 1.15;
+                    spec_accum = spec_accum + light.diffuse_and_range.rgb * spec * ndotl * 0.62;
                 }
             } else if (kind >= 1.5) {
                 let to_light = light.pos_or_dir_and_kind.xyz - in.world_pos;
@@ -904,20 +985,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     diff_accum = diff_accum + light.diffuse_and_range.rgb * (ndotl * atten);
                     if (ndotl > 0.0) {
                         let spec = ggx_specular(n_bump, v_dir, l_dir, roughness, f0);
-                        spec_accum = spec_accum + light.diffuse_and_range.rgb * spec * (ndotl * atten_smooth * 1.4);
+                        spec_accum = spec_accum + light.diffuse_and_range.rgb * spec * (ndotl * atten_smooth * 0.85);
                     }
                 }
             }
         }
 
-        // Crisp grazing sky rim for strong unit/building silhouette separation.
-        let fresnel_rim = pow(1.0 - ndotv, 4.0) * (0.12 + 0.14 * metallic_hint) * (0.4 + 0.6 * up_factor);
-        let pbr_rgb = albedo.rgb * clamp(diff_accum, vec3<f32>(0.0), vec3<f32>(2.1))
-            + spec_accum
+        // Subtle grazing sky rim (stronger on smooth metallic units, minimal on rough matte stone).
+        let fresnel_rim = pow(1.0 - ndotv, 4.2) * (0.025 + 0.095 * metallic_hint) * (0.4 + 0.6 * up_factor);
+        let pbr_rgb = albedo.rgb * pom_cavity * clamp(diff_accum, vec3<f32>(0.0), vec3<f32>(1.45))
+            + min(spec_accum * pom_cavity, vec3<f32>(0.55))
             + sky_amb * fresnel_rim;
         col = vec4<f32>(pbr_rgb, col.a);
     } else if (pbr_active && u.render_flags.w > 0.5) {
-        // 3D unlit opaque terrain/ground: subtle micro-relief lighting + grazing sheen.
+        // 3D unlit opaque terrain/ground: natural micro-relief lighting without blooming sunlit stone.
         let n_geom = normalize(in.world_normal);
         let r1 = cross(dpos_dy, n_geom);
         let r2 = cross(n_geom, dpos_dx);
@@ -926,14 +1007,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if (abs(det) > 0.00001) {
             let surf_grad = sign(det) * (dl_dx * r1 + dl_dy * r2);
             let grad_len = length(surf_grad);
-            let n_bump = normalize(abs(det) * n_geom - 0.24 * (surf_grad / max(1.0, grad_len * 0.5)));
+            let n_bump = normalize(abs(det) * n_geom - 0.18 * (surf_grad / max(1.0, grad_len * 0.5)));
             var sun_dir = normalize(vec3<f32>(0.42, 0.28, 0.86));
             if (u.lights[0].pos_or_dir_and_kind.w > 0.5 && u.lights[0].pos_or_dir_and_kind.w < 1.5) {
                 sun_dir = normalize(-u.lights[0].pos_or_dir_and_kind.xyz);
             }
-            relief = clamp(dot(n_bump, sun_dir) - dot(n_geom, sun_dir), -0.25, 0.25);
+            relief = clamp(dot(n_bump, sun_dir) - dot(n_geom, sun_dir), -0.18, 0.10);
         }
-        col = vec4<f32>(col.rgb * (1.0 + relief * 0.65), col.a);
+        col = vec4<f32>(col.rgb * (1.0 + relief * 0.38), col.a);
     } else if (pbr_active && u.render_flags.y > 0.5) {
         // 3D additive VFX (explosions, fireballs, lasers, muzzle flashes): push bright core into HDR for soft bloom.
         let luma = max(col.r, max(col.g, col.b));
@@ -946,6 +1027,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let fog_end = max(u.fog_and_shader_params.y, fog_start + 0.001);
         let fog_factor = clamp((in.view_dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
         col = vec4<f32>(mix(col.rgb, u.fog_color_and_enable.rgb, fog_factor), col.a);
+    }
+
+    // Clamp Classic-side pixels to [0..1] just like D3D8 UNORM render targets so
+    // Split-Screen HDR (`R16G16B16A16_SFLOAT`) never overflows negative/signed combiner values.
+    if (!pbr_active) {
+        col = vec4<f32>(clamp(col.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(col.a, 0.0, 1.0));
     }
 
     return col;

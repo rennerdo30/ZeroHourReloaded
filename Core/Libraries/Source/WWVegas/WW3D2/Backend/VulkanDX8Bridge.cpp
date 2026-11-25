@@ -510,7 +510,104 @@ public:
         m_surfaces.clear();
     }
 
-    void MarkDirty() { m_dirty = true; }
+    void MarkDirty()
+    {
+        m_dirty = true;
+        m_heightmap_built = false;
+        m_heightmap.clear();
+        m_height_variance = 0.0f;
+    }
+
+    bool EnsureHeightmap()
+    {
+        if (m_heightmap_built)
+        {
+            return !m_heightmap.empty();
+        }
+        m_heightmap_built = true;
+        if (m_surfaces.empty() || m_width < 32 || m_height < 32)
+        {
+            return false;
+        }
+        ZhrVkSurface8* base = m_surfaces[0];
+        if (!base || !base->WasWritten() || base->DataSize() == 0)
+        {
+            return false;
+        }
+
+        constexpr uint32_t kDim = 64u;
+        std::vector<uint8_t> hm(kDim * kDim, 128u);
+        int32_t ok = 0;
+
+        if (m_format == D3DFMT_DXT1)
+        {
+            ok = zhr_remaster_build_heightmap(m_width, m_height, 2u, base->Data(), base->DataSize(), kDim, hm.data());
+        }
+        else if (m_format == D3DFMT_DXT2 || m_format == D3DFMT_DXT3)
+        {
+            ok = zhr_remaster_build_heightmap(m_width, m_height, 3u, base->Data(), base->DataSize(), kDim, hm.data());
+        }
+        else if (m_format == D3DFMT_DXT4 || m_format == D3DFMT_DXT5)
+        {
+            ok = zhr_remaster_build_heightmap(m_width, m_height, 4u, base->Data(), base->DataSize(), kDim, hm.data());
+        }
+        else if (m_format == D3DFMT_A8R8G8B8 && base->Pitch() == m_width * 4)
+        {
+            ok = zhr_remaster_build_heightmap(m_width, m_height, 1u, base->Data(), base->DataSize(), kDim, hm.data());
+        }
+        else
+        {
+            std::vector<uint8_t> rgba;
+            ConvertToRgba8(m_format, m_width, m_height, base->Data(), base->Pitch(), rgba);
+            ok = zhr_remaster_build_heightmap(m_width, m_height, 0u, rgba.data(), rgba.size(), kDim, hm.data());
+        }
+
+        if (ok == 0)
+        {
+            return false;
+        }
+
+        float sum_abs = 0.0f;
+        for (uint8_t v : hm)
+        {
+            sum_abs += std::fabs((static_cast<float>(v) * (1.0f / 255.0f)) - 0.5f);
+        }
+        m_height_variance = sum_abs / static_cast<float>(hm.size());
+        m_heightmap_dim = kDim;
+        m_heightmap = std::move(hm);
+        return true;
+    }
+
+    float HeightVariance() const { return m_height_variance; }
+
+    // Fast inline bilinear height lookup centered at 0.0 in [-1.0, +1.0].
+    float SampleHeight(float u, float v) const
+    {
+        if (m_heightmap.empty() || m_heightmap_dim == 0)
+        {
+            return 0.0f;
+        }
+        const float fu = u - std::floor(u);
+        const float fv = v - std::floor(v);
+        const uint32_t dim = m_heightmap_dim;
+        const float fx = fu * static_cast<float>(dim);
+        const float fy = fv * static_cast<float>(dim);
+        const uint32_t x0 = static_cast<uint32_t>(fx) % dim;
+        const uint32_t y0 = static_cast<uint32_t>(fy) % dim;
+        const uint32_t x1 = (x0 + 1u) % dim;
+        const uint32_t y1 = (y0 + 1u) % dim;
+        const float tx = fx - std::floor(fx);
+        const float ty = fy - std::floor(fy);
+
+        const float h00 = static_cast<float>(m_heightmap[y0 * dim + x0]);
+        const float h10 = static_cast<float>(m_heightmap[y0 * dim + x1]);
+        const float h01 = static_cast<float>(m_heightmap[y1 * dim + x0]);
+        const float h11 = static_cast<float>(m_heightmap[y1 * dim + x1]);
+        const float top = h00 + (h10 - h00) * tx;
+        const float bot = h01 + (h11 - h01) * tx;
+        const float h = (top + (bot - top) * ty) * (1.0f / 255.0f);
+        return (h - 0.5f) * 2.0f;
+    }
 
     uint32_t EnsureUploaded(bool linear_filter, bool clamp_edge)
     {
@@ -677,6 +774,10 @@ private:
     bool m_dirty{true};
     bool m_uploaded_linear{true};
     bool m_uploaded_clamp{false};
+    bool m_heightmap_built{false};
+    uint32_t m_heightmap_dim{0};
+    float m_height_variance{0.0f};
+    std::vector<uint8_t> m_heightmap;
 };
 
 ZhrVkSurface8::ZhrVkSurface8(
@@ -938,9 +1039,13 @@ public:
     STDMETHOD_(DWORD, GetPriority)() override { return m_priority; }
     STDMETHOD_(void, PreLoad)() override {}
     STDMETHOD_(D3DRESOURCETYPE, GetType)() override { return D3DRTYPE_VERTEXBUFFER; }
-    STDMETHOD(Lock)(UINT OffsetToLock, UINT /*SizeToLock*/, BYTE** ppbData, DWORD /*Flags*/) override
+    STDMETHOD(Lock)(UINT OffsetToLock, UINT /*SizeToLock*/, BYTE** ppbData, DWORD Flags) override
     {
         if (!ppbData || OffsetToLock > m_data.size()) return D3DERR_INVALIDCALL;
+        if ((Flags & D3DLOCK_READONLY) == 0)
+        {
+            ++m_generation;
+        }
         *ppbData = m_data.data() + OffsetToLock;
         return D3D_OK;
     }
@@ -961,6 +1066,8 @@ public:
     const uint8_t* Data() const { return m_data.data(); }
     size_t Size() const { return m_data.size(); }
     DWORD FVF() const { return m_fvf; }
+    DWORD Usage() const { return m_usage; }
+    uint64_t Generation() const { return m_generation; }
 
 private:
     std::atomic<ULONG> m_ref_count{1};
@@ -969,6 +1076,7 @@ private:
     DWORD m_fvf;
     D3DPOOL m_pool;
     DWORD m_priority{0};
+    uint64_t m_generation{1};
     std::vector<uint8_t> m_data;
 };
 
@@ -994,9 +1102,13 @@ public:
     STDMETHOD_(DWORD, GetPriority)() override { return m_priority; }
     STDMETHOD_(void, PreLoad)() override {}
     STDMETHOD_(D3DRESOURCETYPE, GetType)() override { return D3DRTYPE_INDEXBUFFER; }
-    STDMETHOD(Lock)(UINT OffsetToLock, UINT /*SizeToLock*/, BYTE** ppbData, DWORD /*Flags*/) override
+    STDMETHOD(Lock)(UINT OffsetToLock, UINT /*SizeToLock*/, BYTE** ppbData, DWORD Flags) override
     {
         if (!ppbData || OffsetToLock > m_data.size()) return D3DERR_INVALIDCALL;
+        if ((Flags & D3DLOCK_READONLY) == 0)
+        {
+            ++m_generation;
+        }
         *ppbData = m_data.data() + OffsetToLock;
         return D3D_OK;
     }
@@ -1015,6 +1127,8 @@ public:
 
     const uint16_t* Data16() const { return reinterpret_cast<const uint16_t*>(m_data.data()); }
     size_t Count16() const { return m_data.size() / sizeof(uint16_t); }
+    DWORD Usage() const { return m_usage; }
+    uint64_t Generation() const { return m_generation; }
 
 private:
     std::atomic<ULONG> m_ref_count{1};
@@ -1023,6 +1137,7 @@ private:
     D3DFORMAT m_format;
     D3DPOOL m_pool;
     DWORD m_priority{0};
+    uint64_t m_generation{1};
     std::vector<uint8_t> m_data;
 };
 
@@ -2337,6 +2452,16 @@ private:
 
         const uint32_t gfx_packed = zhr_vk_get_graphics_mode();
         const bool remaster_active = (gfx_packed & 0x3u) != 0u;
+        // Optional startup override via ZHR_MESH_SMOOTHING=0|1 (still allows runtime F7 / A/B toggles).
+        static const bool s_mesh_env_init = []() -> bool {
+            const char* e = std::getenv("ZHR_MESH_SMOOTHING");
+            if (e != nullptr && e[0] != '\0')
+            {
+                g_zhr_mesh_smoothing_enabled.store(e[0] != '0', std::memory_order_relaxed);
+            }
+            return true;
+        }();
+        (void)s_mesh_env_init;
         const bool can_smooth_mesh =
             g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) &&
             remaster_active &&
@@ -2350,15 +2475,44 @@ private:
             prim_count <= 2000u &&
             m_scratch_verts.size() < 12000u;
 
-        if (can_smooth_mesh && ApplyCreasePreservingPhongSubdiv())
+        ZhrVkTexture8* diffuse_tex =
+            (m_textures[0] != nullptr && m_textures[0]->GetType() == D3DRTYPE_TEXTURE)
+                ? static_cast<ZhrVkTexture8*>(m_textures[0])
+                : nullptr;
+
+        if (can_smooth_mesh)
         {
-            zhr_vk_draw_dynamic(
-                m_subdiv_verts.data(),
-                m_subdiv_verts.size(),
-                m_subdiv_indices.data(),
-                m_subdiv_indices.size());
+            const TessCacheKey cache_key = ComputeTessCacheKey(diffuse_tex);
+            auto cache_it = m_tess_cache.find(cache_key);
+            if (cache_it != m_tess_cache.end())
+            {
+                zhr_vk_draw_dynamic(
+                    cache_it->second.verts.data(),
+                    cache_it->second.verts.size(),
+                    cache_it->second.indices.data(),
+                    cache_it->second.indices.size());
+                return D3D_OK;
+            }
+
+            if (ApplySmartAdaptiveTessellation(diffuse_tex))
+            {
+                if (m_tess_cache.size() >= 512u)
+                {
+                    m_tess_cache.clear();
+                }
+                CachedTessMesh entry;
+                entry.verts = m_subdiv_verts;
+                entry.indices = m_subdiv_indices;
+                auto inserted = m_tess_cache.emplace(cache_key, std::move(entry));
+                zhr_vk_draw_dynamic(
+                    inserted.first->second.verts.data(),
+                    inserted.first->second.verts.size(),
+                    inserted.first->second.indices.data(),
+                    inserted.first->second.indices.size());
+                return D3D_OK;
+            }
         }
-        else
+
         {
             if (is_rhw)
             {
@@ -2386,38 +2540,36 @@ private:
         return D3D_OK;
     }
 
-    // Deterministic, rig-safe 1-level crease-preserving Phong triangle subdivision (Boubekeur & Alexa 2008).
-    // Preserves sharp armor/building creases (angle > ~38 deg) while curving barrels, wheels, radar dishes,
-    // domes, aircraft fuselages, and ship hulls cleanly with zero bone/UV breakage.
-    bool ApplyCreasePreservingPhongSubdiv()
+    // Smart Adaptive Crack-Free Tessellation + Texture-Derived Heightmap Displacement:
+    // 1. Pass 1: Crease-preserving Boubekeur-Alexa Phong subdivision (curves barrels, wheels, domes, rocks, hulls;
+    //            preserves sharp architectural & tank armor creases).
+    // 2. Pass 2 (Adaptive Red-Green 1->2/1->3/1->4): Refines large curved or high-relief triangles a second level
+    //            with zero T-junctions while leaving tiny/flat faces untouched.
+    // 3. Pass 3 (Crack-Free Heightmap Displacement + Smooth Displaced Normals): Samples the texture's multi-scale
+    //            heightmap (`zhr-remaster`) along welded smooth normals, averaging height across UV seams and
+    //            fading displacement cleanly to 0 at open mesh boundaries & hard creases so seams never crack.
+    bool ApplySmartAdaptiveTessellation(ZhrVkTexture8* diffuse_tex)
     {
         const size_t tri_count = m_scratch_indices.size() / 3;
-        if (tri_count == 0 || m_scratch_verts.size() + tri_count * 3 > 65000)
+        if (tri_count == 0 || m_scratch_verts.size() + tri_count * 3 > 60000)
         {
             return false;
         }
 
-        m_subdiv_verts = m_scratch_verts;
-        m_subdiv_indices.clear();
-        m_subdiv_indices.reserve(tri_count * 12);
+        const bool has_hm = (diffuse_tex != nullptr) &&
+                            diffuse_tex->EnsureHeightmap() &&
+                            (diffuse_tex->HeightVariance() > 0.025f);
 
-        m_edge_midpoints.clear();
-        m_edge_midpoints.reserve(tri_count * 2);
+        auto quant_pos_key = [](const float p[3]) -> uint64_t {
+            // 0.02 world-unit spatial welding tolerance (catches UV seam duplicates cleanly)
+            const int64_t qx = static_cast<int64_t>(std::llround(p[0] * 50.0f)) & 0x1FFFFFLL;
+            const int64_t qy = static_cast<int64_t>(std::llround(p[1] * 50.0f)) & 0x1FFFFFLL;
+            const int64_t qz = static_cast<int64_t>(std::llround(p[2] * 50.0f)) & 0x1FFFFFLL;
+            return (static_cast<uint64_t>(qx) << 42) | (static_cast<uint64_t>(qy) << 21) | static_cast<uint64_t>(qz);
+        };
 
-        auto get_midpoint = [&](uint16_t ia, uint16_t ib) -> uint16_t {
-            const uint32_t lo = ia < ib ? ia : ib;
-            const uint32_t hi = ia < ib ? ib : ia;
-            const uint32_t key = (lo << 16) | hi;
-            auto it = m_edge_midpoints.find(key);
-            if (it != m_edge_midpoints.end())
-            {
-                return it->second;
-            }
-
-            const ZhrVertexWw3d& va = m_scratch_verts[ia];
-            const ZhrVertexWw3d& vb = m_scratch_verts[ib];
+        auto make_phong_midpoint = [](const ZhrVertexWw3d& va, const ZhrVertexWw3d& vb, float smooth_alpha) -> ZhrVertexWw3d {
             ZhrVertexWw3d mid{};
-
             const float mx = 0.5f * (va.position[0] + vb.position[0]);
             const float my = 0.5f * (va.position[1] + vb.position[1]);
             const float mz = 0.5f * (va.position[2] + vb.position[2]);
@@ -2439,8 +2591,8 @@ private:
                 const float bn_x = nbx / nb_len, bn_y = nby / nb_len, bn_z = nbz / nb_len;
                 const float dot_n = an_x * bn_x + an_y * bn_y + an_z * bn_z;
 
-                // Smooth curved edge (< ~38 deg) -> Phong tangent-plane projection; hard crease -> keep flat!
-                if (dot_n > 0.78f && dot_n < 0.9995f)
+                // Smooth curved edge (< ~44 deg) -> Phong tangent-plane projection; hard crease -> keep flat!
+                if (dot_n > 0.72f && dot_n < 0.9995f)
                 {
                     const float da = (mx - va.position[0]) * an_x +
                                      (my - va.position[1]) * an_y +
@@ -2455,10 +2607,9 @@ private:
                     const float pby = my - db * bn_y;
                     const float pbz = mz - db * bn_z;
 
-                    constexpr float kSmoothAlpha = 0.38f;
-                    px = mx + kSmoothAlpha * (0.5f * (pax + pbx) - mx);
-                    py = my + kSmoothAlpha * (0.5f * (pay + pby) - my);
-                    pz = mz + kSmoothAlpha * (0.5f * (paz + pbz) - mz);
+                    px = mx + smooth_alpha * (0.5f * (pax + pbx) - mx);
+                    py = my + smooth_alpha * (0.5f * (pay + pby) - my);
+                    pz = mz + smooth_alpha * (0.5f * (paz + pbz) - mz);
                 }
             }
 
@@ -2466,9 +2617,9 @@ private:
             mid.position[1] = py;
             mid.position[2] = pz;
 
-            float nx = nax + nbx;
-            float ny = nay + nby;
-            float nz = naz + nbz;
+            const float nx = nax + nbx;
+            const float ny = nay + nby;
+            const float nz = naz + nbz;
             const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
             if (nlen > 0.0001f)
             {
@@ -2488,7 +2639,27 @@ private:
             mid.uv0[1] = 0.5f * (va.uv0[1] + vb.uv0[1]);
             mid.uv1[0] = 0.5f * (va.uv1[0] + vb.uv1[0]);
             mid.uv1[1] = 0.5f * (va.uv1[1] + vb.uv1[1]);
+            return mid;
+        };
 
+        // --- Pass 1: Uniform 1->4 Crease-Preserving Phong Subdivision ---
+        m_subdiv_verts = m_scratch_verts;
+        m_subdiv_indices.clear();
+        m_subdiv_indices.reserve(tri_count * 12);
+
+        m_edge_midpoints.clear();
+        m_edge_midpoints.reserve(tri_count * 2);
+
+        auto get_midpoint_p1 = [&](uint16_t ia, uint16_t ib) -> uint16_t {
+            const uint32_t lo = ia < ib ? ia : ib;
+            const uint32_t hi = ia < ib ? ib : ia;
+            const uint32_t key = (lo << 16) | hi;
+            auto it = m_edge_midpoints.find(key);
+            if (it != m_edge_midpoints.end())
+            {
+                return it->second;
+            }
+            ZhrVertexWw3d mid = make_phong_midpoint(m_scratch_verts[ia], m_scratch_verts[ib], 0.44f);
             const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
             m_subdiv_verts.push_back(mid);
             m_edge_midpoints.emplace(key, new_idx);
@@ -2504,15 +2675,318 @@ private:
             {
                 return false;
             }
-            const uint16_t m01 = get_midpoint(i0, i1);
-            const uint16_t m12 = get_midpoint(i1, i2);
-            const uint16_t m20 = get_midpoint(i2, i0);
+            const uint16_t m01 = get_midpoint_p1(i0, i1);
+            const uint16_t m12 = get_midpoint_p1(i1, i2);
+            const uint16_t m20 = get_midpoint_p1(i2, i0);
 
             m_subdiv_indices.push_back(i0);  m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(m20);
             m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(i1);  m_subdiv_indices.push_back(m12);
             m_subdiv_indices.push_back(m20); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(i2);
             m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(m20);
         }
+
+        // --- Pass 2: Smart Adaptive Red-Green Refinement (Level 2 on large curved / high-relief edges, 0 T-junctions) ---
+        const size_t p1_tris = m_subdiv_indices.size() / 3;
+        if (p1_tris <= 1600 && m_subdiv_verts.size() + p1_tris * 3 < 52000)
+        {
+            std::vector<uint16_t> p2_indices;
+            p2_indices.reserve(m_subdiv_indices.size() * 2);
+            m_edge_midpoints.clear();
+
+            auto should_split_edge = [&](uint16_t ia, uint16_t ib) -> bool {
+                const ZhrVertexWw3d& va = m_subdiv_verts[ia];
+                const ZhrVertexWw3d& vb = m_subdiv_verts[ib];
+                const float dx = vb.position[0] - va.position[0];
+                const float dy = vb.position[1] - va.position[1];
+                const float dz = vb.position[2] - va.position[2];
+                const float dist_sq = dx * dx + dy * dy + dz * dz;
+                // Only adaptively refine physically large edges (> ~3.0 world units: islands, rocks, turrets, roofs)
+                if (dist_sq < 9.0f || dist_sq > 40000.0f)
+                {
+                    return false;
+                }
+                const float dot_n = va.normal[0] * vb.normal[0] + va.normal[1] * vb.normal[1] + va.normal[2] * vb.normal[2];
+                if (dot_n > 0.72f && dot_n < 0.992f)
+                {
+                    return true;
+                }
+                if (has_hm && dist_sq >= 14.0f)
+                {
+                    const float ha = diffuse_tex->SampleHeight(va.uv0[0], va.uv0[1]);
+                    const float hb = diffuse_tex->SampleHeight(vb.uv0[0], vb.uv0[1]);
+                    const float hm = diffuse_tex->SampleHeight(0.5f * (va.uv0[0] + vb.uv0[0]), 0.5f * (va.uv0[1] + vb.uv0[1]));
+                    const float contrast = std::fabs(ha - hb) + std::fabs(hm - 0.5f * (ha + hb));
+                    if (contrast > 0.22f)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            auto get_midpoint_p2 = [&](uint16_t ia, uint16_t ib) -> uint16_t {
+                const uint32_t lo = ia < ib ? ia : ib;
+                const uint32_t hi = ia < ib ? ib : ia;
+                const uint32_t key = (lo << 16) | hi;
+                auto it = m_edge_midpoints.find(key);
+                if (it != m_edge_midpoints.end())
+                {
+                    return it->second;
+                }
+                ZhrVertexWw3d mid = make_phong_midpoint(m_subdiv_verts[ia], m_subdiv_verts[ib], 0.34f);
+                const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
+                m_subdiv_verts.push_back(mid);
+                m_edge_midpoints.emplace(key, new_idx);
+                return new_idx;
+            };
+
+            for (size_t t = 0; t < p1_tris; ++t)
+            {
+                const uint16_t i0 = m_subdiv_indices[t * 3 + 0];
+                const uint16_t i1 = m_subdiv_indices[t * 3 + 1];
+                const uint16_t i2 = m_subdiv_indices[t * 3 + 2];
+                const bool s01 = should_split_edge(i0, i1);
+                const bool s12 = should_split_edge(i1, i2);
+                const bool s20 = should_split_edge(i2, i0);
+                const int mask = (s01 ? 1 : 0) | (s12 ? 2 : 0) | (s20 ? 4 : 0);
+
+                if (mask == 0 || m_subdiv_verts.size() + 3 >= 60000)
+                {
+                    p2_indices.push_back(i0); p2_indices.push_back(i1); p2_indices.push_back(i2);
+                }
+                else if (mask == 7)
+                {
+                    const uint16_t m01 = get_midpoint_p2(i0, i1);
+                    const uint16_t m12 = get_midpoint_p2(i1, i2);
+                    const uint16_t m20 = get_midpoint_p2(i2, i0);
+                    p2_indices.push_back(i0);  p2_indices.push_back(m01); p2_indices.push_back(m20);
+                    p2_indices.push_back(m01); p2_indices.push_back(i1);  p2_indices.push_back(m12);
+                    p2_indices.push_back(m20); p2_indices.push_back(m12); p2_indices.push_back(i2);
+                    p2_indices.push_back(m01); p2_indices.push_back(m12); p2_indices.push_back(m20);
+                }
+                else if (mask == 1 || mask == 2 || mask == 4)
+                {
+                    // Rotate so split edge is (a, b)
+                    uint16_t a = i0, b = i1, c = i2;
+                    if (mask == 2) { a = i1; b = i2; c = i0; }
+                    else if (mask == 4) { a = i2; b = i0; c = i1; }
+                    const uint16_t mab = get_midpoint_p2(a, b);
+                    p2_indices.push_back(a);   p2_indices.push_back(mab); p2_indices.push_back(c);
+                    p2_indices.push_back(mab); p2_indices.push_back(b);   p2_indices.push_back(c);
+                }
+                else
+                {
+                    // 2 edges split: rotate so unsplit edge is (b, c)
+                    uint16_t a = i0, b = i1, c = i2;
+                    if (mask == 3) { a = i1; b = i2; c = i0; }       // s01 & s12 -> unsplit (i2, i0)
+                    else if (mask == 6) { a = i2; b = i0; c = i1; }  // s12 & s20 -> unsplit (i0, i1)
+                    // mask == 5: s01 & s20 -> unsplit (i1, i2)
+                    const uint16_t mab = get_midpoint_p2(a, b);
+                    const uint16_t mca = get_midpoint_p2(c, a);
+                    p2_indices.push_back(a);   p2_indices.push_back(mab); p2_indices.push_back(mca);
+                    p2_indices.push_back(mab); p2_indices.push_back(b);   p2_indices.push_back(c);
+                    p2_indices.push_back(mab); p2_indices.push_back(c);   p2_indices.push_back(mca);
+                }
+            }
+            m_subdiv_indices.swap(p2_indices);
+        }
+
+        // --- Pass 3: Crack-Free Welded Texture Heightmap Displacement & Displaced Normal Re-evaluation ---
+        if (has_hm && m_subdiv_verts.size() <= 24000)
+        {
+            struct WeldNode
+            {
+                float nx{0.0f}, ny{0.0f}, nz{0.0f};
+                float h_sum{0.0f};
+                float min_edge{1e9f};
+                float max_edge{0.0f};
+                uint32_t v_count{0};
+                uint32_t e_count{0};
+                bool boundary{false};
+                bool crease{false};
+                float dnx{0.0f}, dny{0.0f}, dnz{0.0f};
+            };
+
+            std::unordered_map<uint64_t, WeldNode> weld;
+            weld.reserve(m_subdiv_verts.size());
+
+            std::vector<uint64_t> v_keys(m_subdiv_verts.size());
+            for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
+            {
+                const ZhrVertexWw3d& v = m_subdiv_verts[i];
+                const uint64_t k = quant_pos_key(v.position);
+                v_keys[i] = k;
+                WeldNode& node = weld[k];
+                node.nx += v.normal[0];
+                node.ny += v.normal[1];
+                node.nz += v.normal[2];
+                node.h_sum += diffuse_tex->SampleHeight(v.uv0[0], v.uv0[1]);
+                node.v_count += 1u;
+            }
+
+            // Normalize welded normals and detect hard creases (90-deg walls/armor corners).
+            for (auto& kv : weld)
+            {
+                WeldNode& node = kv.second;
+                const float len = std::sqrt(node.nx * node.nx + node.ny * node.ny + node.nz * node.nz);
+                if (len > 0.001f)
+                {
+                    node.nx /= len;
+                    node.ny /= len;
+                    node.nz /= len;
+                }
+                else
+                {
+                    node.crease = true;
+                }
+            }
+            for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
+            {
+                const ZhrVertexWw3d& v = m_subdiv_verts[i];
+                WeldNode& node = weld[v_keys[i]];
+                const float dot_n = v.normal[0] * node.nx + v.normal[1] * node.ny + v.normal[2] * node.nz;
+                if (dot_n < 0.78f)
+                {
+                    node.crease = true;
+                }
+            }
+
+            // Detect open mesh boundary edges in welded position space + measure local edge scale.
+            struct SpatialEdgeHash
+            {
+                size_t operator()(const std::pair<uint64_t, uint64_t>& e) const noexcept
+                {
+                    return std::hash<uint64_t>{}(e.first ^ (e.second * 0x9E3779B97F4A7C15ULL));
+                }
+            };
+            std::unordered_map<std::pair<uint64_t, uint64_t>, uint32_t, SpatialEdgeHash> edge_counts;
+            const size_t final_tris = m_subdiv_indices.size() / 3;
+            edge_counts.reserve(final_tris * 2);
+
+            auto accum_edge = [&](uint16_t ia, uint16_t ib) {
+                const uint64_t ka = v_keys[ia];
+                const uint64_t kb = v_keys[ib];
+                if (ka == kb) return;
+                const auto pair = ka < kb ? std::make_pair(ka, kb) : std::make_pair(kb, ka);
+                edge_counts[pair] += 1u;
+
+                const ZhrVertexWw3d& va = m_subdiv_verts[ia];
+                const ZhrVertexWw3d& vb = m_subdiv_verts[ib];
+                const float dx = vb.position[0] - va.position[0];
+                const float dy = vb.position[1] - va.position[1];
+                const float dz = vb.position[2] - va.position[2];
+                const float elen = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (elen > 0.001f && elen < 200.0f)
+                {
+                    WeldNode& na = weld[ka];
+                    WeldNode& nb = weld[kb];
+                    na.min_edge = std::min(na.min_edge, elen);
+                    na.max_edge = std::max(na.max_edge, elen);
+                    na.e_count += 1u;
+                    nb.min_edge = std::min(nb.min_edge, elen);
+                    nb.max_edge = std::max(nb.max_edge, elen);
+                    nb.e_count += 1u;
+                }
+            };
+
+            for (size_t t = 0; t < final_tris; ++t)
+            {
+                const uint16_t i0 = m_subdiv_indices[t * 3 + 0];
+                const uint16_t i1 = m_subdiv_indices[t * 3 + 1];
+                const uint16_t i2 = m_subdiv_indices[t * 3 + 2];
+                accum_edge(i0, i1);
+                accum_edge(i1, i2);
+                accum_edge(i2, i0);
+            }
+
+            for (const auto& kv : edge_counts)
+            {
+                if (kv.second == 1u)
+                {
+                    weld[kv.first.first].boundary = true;
+                    weld[kv.first.second].boundary = true;
+                }
+            }
+
+            // Apply seam-safe welded heightmap displacement strictly to broad, smooth interior surfaces.
+            // Using `min_edge` + aspect-ratio guard prevents thin masts, antennas, struts, and gun barrels
+            // (which have long axial edges but tiny cross-sectional edges) from ever bloating outward.
+            bool any_displaced = false;
+            for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
+            {
+                const WeldNode& node = weld[v_keys[i]];
+                if (node.boundary || node.crease || node.v_count == 0 || node.e_count == 0)
+                {
+                    continue;
+                }
+                if (node.min_edge < 1.1f || node.max_edge > node.min_edge * 4.5f)
+                {
+                    continue;
+                }
+                const float h_avg = node.h_sum / static_cast<float>(node.v_count);
+                const float disp_amp = std::min(node.min_edge * 0.16f, 0.85f);
+                const float disp = h_avg * disp_amp;
+                ZhrVertexWw3d& v = m_subdiv_verts[i];
+                v.position[0] += node.nx * disp;
+                v.position[1] += node.ny * disp;
+                v.position[2] += node.nz * disp;
+                any_displaced = true;
+            }
+
+            // Recompute area-weighted displaced normals so sunlight & GGX specular catch real 3D ridges.
+            if (any_displaced)
+            {
+                for (size_t t = 0; t < final_tris; ++t)
+                {
+                    const uint16_t i0 = m_subdiv_indices[t * 3 + 0];
+                    const uint16_t i1 = m_subdiv_indices[t * 3 + 1];
+                    const uint16_t i2 = m_subdiv_indices[t * 3 + 2];
+                    const float* p0 = m_subdiv_verts[i0].position;
+                    const float* p1 = m_subdiv_verts[i1].position;
+                    const float* p2 = m_subdiv_verts[i2].position;
+                    const float e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+                    const float e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
+                    const float fnx = e1y * e2z - e1z * e2y;
+                    const float fny = e1z * e2x - e1x * e2z;
+                    const float fnz = e1x * e2y - e1y * e2x;
+
+                    for (uint16_t idx : {i0, i1, i2})
+                    {
+                        WeldNode& node = weld[v_keys[idx]];
+                        // Keep winding orientation consistent with original welded normal
+                        const float sign = (fnx * node.nx + fny * node.ny + fnz * node.nz) >= 0.0f ? 1.0f : -1.0f;
+                        node.dnx += fnx * sign;
+                        node.dny += fny * sign;
+                        node.dnz += fnz * sign;
+                    }
+                }
+
+                for (size_t i = 0; i < m_subdiv_verts.size(); ++i)
+                {
+                    const WeldNode& node = weld[v_keys[i]];
+                    if (node.boundary || node.crease)
+                    {
+                        continue;
+                    }
+                    const float dlen = std::sqrt(node.dnx * node.dnx + node.dny * node.dny + node.dnz * node.dnz);
+                    if (dlen > 1e-5f)
+                    {
+                        ZhrVertexWw3d& v = m_subdiv_verts[i];
+                        const float bnx = v.normal[0] * 0.45f + (node.dnx / dlen) * 0.55f;
+                        const float bny = v.normal[1] * 0.45f + (node.dny / dlen) * 0.55f;
+                        const float bnz = v.normal[2] * 0.45f + (node.dnz / dlen) * 0.55f;
+                        const float blen = std::sqrt(bnx * bnx + bny * bny + bnz * bnz);
+                        if (blen > 1e-5f)
+                        {
+                            v.normal[0] = bnx / blen;
+                            v.normal[1] = bny / blen;
+                            v.normal[2] = bnz / blen;
+                        }
+                    }
+                }
+            }
+        }
+
         return true;
     }
 
@@ -2674,11 +3148,81 @@ private:
     IDirect3DSurface8* m_current_rt{nullptr};
     IDirect3DSurface8* m_current_depth{nullptr};
 
+    struct TessCacheKey
+    {
+        uint64_t hash_a{0};
+        uint64_t hash_b{0};
+        uint32_t v_count{0};
+        uint32_t i_count{0};
+        uintptr_t tex_ptr{0};
+
+        bool operator==(const TessCacheKey& o) const noexcept
+        {
+            return hash_a == o.hash_a && hash_b == o.hash_b &&
+                   v_count == o.v_count && i_count == o.i_count &&
+                   tex_ptr == o.tex_ptr;
+        }
+    };
+
+    struct TessCacheKeyHash
+    {
+        size_t operator()(const TessCacheKey& k) const noexcept
+        {
+            return static_cast<size_t>(k.hash_a ^ (k.hash_b * 0x9E3779B97F4A7C15ULL) ^ k.tex_ptr);
+        }
+    };
+
+    struct CachedTessMesh
+    {
+        std::vector<ZhrVertexWw3d> verts;
+        std::vector<uint16_t> indices;
+    };
+
+    // Fast 128-bit content hash over object-space vertices & indices (~1.5us per draw) so static
+    // .W3D meshes & terrain props are tessellated + heightmap-displaced ONCE and replayed at 0ms/frame.
+    TessCacheKey ComputeTessCacheKey(ZhrVkTexture8* diffuse_tex) const
+    {
+        TessCacheKey k{};
+        k.v_count = static_cast<uint32_t>(m_scratch_verts.size());
+        k.i_count = static_cast<uint32_t>(m_scratch_indices.size());
+        k.tex_ptr = reinterpret_cast<uintptr_t>(diffuse_tex);
+
+        uint64_t ha = 14695981039346656037ULL ^ (static_cast<uint64_t>(k.v_count) << 32) ^ k.i_count;
+        uint64_t hb = 0x517CC1B727220A95ULL ^ static_cast<uint64_t>(k.tex_ptr);
+
+        const uint64_t* vwords = reinterpret_cast<const uint64_t*>(m_scratch_verts.data());
+        const size_t vw_count = (m_scratch_verts.size() * sizeof(ZhrVertexWw3d)) / sizeof(uint64_t);
+        for (size_t i = 0; i < vw_count; ++i)
+        {
+            const uint64_t w = vwords[i];
+            ha = (ha ^ w) * 1099511628211ULL;
+            hb = ((hb << 7) | (hb >> 57)) ^ (w + 0x9E3779B97F4A7C15ULL);
+        }
+
+        const uint64_t* iwords = reinterpret_cast<const uint64_t*>(m_scratch_indices.data());
+        const size_t iw_count = (m_scratch_indices.size() * sizeof(uint16_t)) / sizeof(uint64_t);
+        for (size_t i = 0; i < iw_count; ++i)
+        {
+            const uint64_t w = iwords[i];
+            ha = (ha ^ w) * 1099511628211ULL;
+            hb = ((hb << 11) | (hb >> 53)) ^ w;
+        }
+        for (size_t i = iw_count * 4; i < m_scratch_indices.size(); ++i)
+        {
+            ha = (ha ^ m_scratch_indices[i]) * 1099511628211ULL;
+        }
+
+        k.hash_a = ha;
+        k.hash_b = hb;
+        return k;
+    }
+
     std::vector<ZhrVertexWw3d> m_scratch_verts;
     std::vector<uint16_t> m_scratch_indices;
     std::vector<ZhrVertexWw3d> m_subdiv_verts;
     std::vector<uint16_t> m_subdiv_indices;
     std::unordered_map<uint32_t, uint16_t> m_edge_midpoints;
+    std::unordered_map<TessCacheKey, CachedTessMesh, TessCacheKeyHash> m_tess_cache;
 };
 
 HRESULT STDMETHODCALLTYPE ZhrVkSurface8::GetDevice(IDirect3DDevice8** ppDevice)

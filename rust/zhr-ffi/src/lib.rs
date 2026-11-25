@@ -1306,6 +1306,93 @@ pub extern "C" fn zhr_platform_sdl_scancode_to_zh_key(sdl_scancode: u32) -> u8 {
     zhr_platform::sdl_scancode_to_zh_key(sdl_scancode)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_freeze_time(frozen: bool) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_freeze_time(frozen);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_set_wireframe(enabled: bool) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.set_wireframe(enabled);
+    }
+}
+
+/// Schedules a one-shot PNG (+ optional stats log) capture on the very next `end_frame`.
+///
+/// # Safety
+/// `png_path` must be a valid NUL-terminated C string; `stats_path` may be null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_vk_request_capture(
+    png_path: *const std::ffi::c_char,
+    stats_path: *const std::ffi::c_char,
+) {
+    if png_path.is_null() {
+        return;
+    }
+    let Ok(png) = unsafe { std::ffi::CStr::from_ptr(png_path) }.to_str() else {
+        return;
+    };
+    if png.is_empty() {
+        return;
+    }
+    let stats = if stats_path.is_null() {
+        None
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(stats_path) }
+            .to_str()
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.request_capture(png.to_owned(), stats);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real-Time Texture Heightmap Synthesis for Smart Tessellation (zhr-remaster)
+// ---------------------------------------------------------------------------
+
+/// Synthesizes a seam-safe, alpha-safe `out_dim * out_dim` 8-bit displacement heightmap
+/// directly from an original Zero Hour texture buffer (`format_code`: 0=RGBA8, 1=BGRA8,
+/// 2=BC1, 3=BC2, 4=BC3).
+///
+/// # Safety
+/// - `data` must point to at least `byte_len` readable bytes.
+/// - `out_height_r8` must point to at least `(out_dim.clamp(16, 128)^2)` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_remaster_build_heightmap(
+    width: u32,
+    height: u32,
+    format_code: u32,
+    data: *const u8,
+    byte_len: usize,
+    out_dim: u32,
+    out_height_r8: *mut u8,
+) -> i32 {
+    if data.is_null() || out_height_r8.is_null() || byte_len == 0 {
+        return 0;
+    }
+    let dim = out_dim.clamp(16, 128) as usize;
+    let src = unsafe { std::slice::from_raw_parts(data, byte_len) };
+    let Some(hm) = zhr_remaster::synthesize_heightmap_r8(format_code, width, height, src, out_dim)
+    else {
+        return 0;
+    };
+    if hm.len() != dim * dim {
+        return 0;
+    }
+    let dst = unsafe { std::slice::from_raw_parts_mut(out_height_r8, dim * dim) };
+    dst.copy_from_slice(&hm);
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

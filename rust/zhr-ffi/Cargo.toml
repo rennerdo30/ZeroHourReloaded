@@ -18,6 +18,7 @@ raw-window-handle.workspace = true
 zhr-audio.workspace = true
 zhr-core.workspace = true
 zhr-platform.workspace = true
+zhr-remaster.workspace = true
 zhr-vulkan.workspace = true
 
 [lints]

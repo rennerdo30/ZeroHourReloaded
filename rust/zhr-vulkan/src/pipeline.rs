@@ -15,6 +15,7 @@ struct PipelineLookupKey {
     stencil: StencilPipelineKey,
     color_format: vk::Format,
     depth_format: vk::Format,
+    wireframe: bool,
 }
 
 /// Caches Vulkan 1.3 dynamic-rendering graphics pipelines keyed by `WW3D2::ShaderKey`.
@@ -86,12 +87,14 @@ impl PipelineCache {
         stencil: StencilPipelineKey,
         color_format: vk::Format,
         depth_format: vk::Format,
+        wireframe: bool,
     ) -> Result<vk::Pipeline> {
         let key = PipelineLookupKey {
             shader: shader.pipeline_state_key(),
             stencil,
             color_format,
             depth_format,
+            wireframe,
         };
         if let Some(&pso) = self.pipelines.get(&key) {
             return Ok(pso);
@@ -153,7 +156,11 @@ impl PipelineCache {
             .scissor_count(1);
 
         let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
+            .polygon_mode(if key.wireframe {
+                vk::PolygonMode::LINE
+            } else {
+                vk::PolygonMode::FILL
+            })
             .cull_mode(if key.shader.cull_enabled() {
                 vk::CullModeFlags::BACK
             } else {
