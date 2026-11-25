@@ -1,110 +1,156 @@
-[![GitHub Release](https://img.shields.io/github/v/release/TheSuperHackers/GeneralsGameCode?include_prereleases&sort=date&display_name=tag&style=flat&label=Release)](https://github.com/TheSuperHackers/GeneralsGameCode/releases)
-![GitHub milestone details](https://img.shields.io/github/milestones/progress-percent/TheSuperHackers/GeneralsGameCode/3)
-![GitHub milestone details](https://img.shields.io/github/milestones/progress-percent/TheSuperHackers/GeneralsGameCode/1)
-![GitHub milestone details](https://img.shields.io/github/milestones/progress-percent/TheSuperHackers/GeneralsGameCode/4)
-![GitHub milestone details](https://img.shields.io/github/milestones/progress-percent/TheSuperHackers/GeneralsGameCode/5)
-![GitHub milestone details](https://img.shields.io/github/milestones/progress-percent/TheSuperHackers/GeneralsGameCode/6)
+# ZeroHourReloaded
 
-[![GitHub issues by-label](https://img.shields.io/github/issues/TheSuperHackers/GeneralsGameCode/bug?style=flat&label=Bug%20Issues&labelColor=%23c4c4c4&color=%23424242)](https://github.com/TheSuperHackers/GeneralsGameCode/issues?q=label%3ABug)
-[![GitHub issues by-label](https://img.shields.io/github/issues/TheSuperHackers/GeneralsGameCode/enhancement?style=flat&label=Enhancement%20Issues&labelColor=%23c4c4c4&color=%23424242)](https://github.com/TheSuperHackers/GeneralsGameCode/issues?q=label%3AEnhancement)
-[![GitHub issues by-label](https://img.shields.io/github/issues/TheSuperHackers/GeneralsGameCode/major?style=flat&label=Major%20Issues&labelColor=%23c4c4c4&color=%23424242)](https://github.com/TheSuperHackers/GeneralsGameCode/issues?q=label%3AMajor)
-[![GitHub issues by-label](https://img.shields.io/github/issues/TheSuperHackers/GeneralsGameCode/critical?style=flat&label=Critical%20Issues&labelColor=%23c4c4c4&color=%23424242)](https://github.com/TheSuperHackers/GeneralsGameCode/issues?q=label%3ACritical)
-[![GitHub issues by-label](https://img.shields.io/github/issues/TheSuperHackers/GeneralsGameCode/blocker?style=flat&label=Blocker%20Issues&labelColor=%23c4c4c4&color=%23424242)](https://github.com/TheSuperHackers/GeneralsGameCode/issues?q=label%3ABlocker)
+**ZeroHourReloaded** is a modernized, native **64-bit (`x64`)**, **Vulkan 1.3**, **SDL3**, **FFmpeg 8.1**, **Rust-augmented** engine for *Generals: Zero Hour*, forked from [`TheSuperHackers/GeneralsGameCode`](https://github.com/TheSuperHackers/GeneralsGameCode).
 
-# Welcome to the Generals Game Code Project
+It retains the battle-tested C++20 simulation, INI/BIG/W3D/map loaders, AI, scripts, and replay compatibility while replacing every legacy 32-bit Windows-only engine dependency (`d3d8.dll`, `mss32.dll`, `binkw32.dll`, `dinput8.dll`, and Win32 windowing) with modern open-source 64-bit subsystems and a live-toggleable Vulkan 1.3 visual remaster.
 
-GeneralsGameCode is a community-driven project aimed at fixing and improving the classic RTS game, *Command &
-Conquer: Generals* and its expansion *Zero Hour*. This repository contains the source code for both games, with a
-primary focus on *Zero Hour*.
+> **Legal Notice:** Zero copyrighted game files, `.big` archives, or third-party AI weights are stored in this repository. You must own a legal copy of *Command & Conquer: Generals – Zero Hour* (e.g., via *The Ultimate Collection* on [Steam](https://store.steampowered.com/bundle/39394)). ZeroHourReloaded automatically locates your local installation on launch.
 
-Additionally, there is a complementary project repository for fixing and improving game data and assets such as
-INI scripts, GUI, AI, maps, models, textures, audio, localization. You can find it
-[here](https://github.com/TheSuperHackers/GeneralsGamePatch/) and contribute to it as well.
+---
 
-## Project Overview
+## Live 50/50 Split-Screen Overview (`F9`)
 
-The game was originally developed using Visual Studio 6 and C++98. We've updated the code to be compatible with Visual
-Studio 2022 and C++20.
+Classic 2003 DirectX 8 look on the **left** vs. ZeroHourReloaded's native 64-bit Vulkan 1.3 remaster on the **right** — toggled instantaneously in-game with **`F9`** (captured live at `1280×720` on AMD Radeon RX 9070 XT with Khronos Vulkan validation enabled and `0` validation errors):
 
-The initial goal of this project is to fix critical bugs and implement improvements while maintaining compatibility with
-the original *Generals* version 1.08 and *Zero Hour* version 1.04. Once we can break retail compatibility, more fixes
-and features will be possible to implement.
+![ZeroHourReloaded 50/50 Live Split-Screen Comparison — Classic 2003 (Left) vs. Vulkan 1.3 Remastered (Right)](docs/screenshots/ab_overview_split.png)
 
-## Current Focus and Future Plans
+---
 
-Here's an overview of our current focus and future plans
+## Feature-by-Feature A/B Showcase
 
-- **Modernizing the Codebase**: Transitioning to modern C++ standards and refactoring old code.
-- **Critical Bug Fixes**: Fixing game-breaking issues (e.g., fullscreen crash).
-- **Minor Bug Fixes**: Addressing minor bugs (e.g., UI issues, graphical glitches).
-- **Cross-Platform Support**: Adding support for more platforms (e.g., Linux, macOS).
-- **Engine Improvements**: Enhancing the game engine to improve performance and stability.
-- **Client-Side Features**: Enhancing the game's client with features such as an improved replay viewer and UI updates.
-- **Multiplayer Improvements**: Implementing a new game server and an upgraded matchmaking lobby.
-- **Tooling Improvements**: Developing new or improving existing tools for modding and game development.
-- **Community-Driven Improvements**: Once the community grows, we plan to incorporate more features, updates, and
-  changes based on player feedback.
+### 1. Full-Frame Vulkan 1.3 Remaster (`F9`)
+Replaces legacy 32-bit DirectX 8 (`d3d8.dll`) with a native 64-bit Vulkan 1.3 dynamic-rendering pipeline (`rust/zhr-vulkan`: `ash` + `gpu-allocator` + `naga` WGSL→SPIR-V) featuring 16× anisotropic filtering, full mipmaps, HDR bloom, ACES filmic tonemapping, and AMD FidelityFX CAS sharpening.
 
-## Running the Game
+| Classic (2003 Baseline) | ZeroHourReloaded (Vulkan 1.3 Remastered) |
+| :---: | :---: |
+| ![Classic 2003 Full Frame](docs/screenshots/a_classic_2003.png) | ![ZeroHourReloaded Remastered Full Frame](docs/screenshots/b_remastered_full.png) |
+| *Flat 2003 Gouraud shading, low-res textures, static water, unsmoothed silhouettes (`171,573` tris, `0` remastered textures)* | *PBR GGX + Sky IBL, animated water, volumetric shadows, bilateral SSAO, HDR bloom/ACES/CAS, smoothed `.W3D` meshes & 2× textures (`182,868` tris, `30` remastered textures)* |
 
-To run *Generals* or *Zero Hour* using this project, you need to have the original *Command & Conquer: Generals and Zero Hour* game
-installed. The easiest way to get it is through *Command & Conquer The Ultimate Collection*
-on [Steam](https://store.steampowered.com/bundle/39394). Once the game is ready, download the latest version of the
-project from [GitHub Releases](https://github.com/TheSuperHackers/GeneralsGameCode/releases), extract the necessary 
-files, and follow the instructions in the [Wiki](https://github.com/TheSuperHackers/GeneralsGameCode/wiki).
+---
 
+### 2. Domain-Warped Animated Water, Fresnel Reflections & PBR Terrain Relief (`F10`)
+Replaces flat scrolling water planes and matte terrain with 5-octave domain-warped procedural waves, viewing-angle Fresnel sky reflections, GGX sun glints, animated shoreline ripples, and derivative micro-normal PBR relief on rocky coastlines and terrain.
 
-## Joining the Community
+| Classic Water & Coastline | Remastered Animated Water & PBR Rocks |
+| :---: | :---: |
+| ![Classic Water and Rocks](docs/screenshots/a_water_rocks_classic.png) | ![Remastered Water and Rocks](docs/screenshots/b_water_rocks_remastered.png) |
+| *Static low-contrast water texture with flat Gouraud-shaded shoreline rocks* | *Animated multi-octave waves, crisp specular water highlights, Fresnel sky reflection, and PBR micro-normal stone relief* |
 
-You can chat and discuss the development of the project on our [Discord channel](https://www.community-outpost.com/discord) to get the latest updates,
-report bugs, and contribute to the project!
+---
 
-## Building the Game Yourself
+### 3. Crease-Preserving `.W3D` Mesh Smoothing (`F7`), Volumetric Shadows, Bilateral SSAO & 2× Texture Remastering (`F8`)
+- **Rig-Safe Phong Mesh Subdivision (`F7`):** Smooths curved silhouettes (turrets, radar domes, hulls, barrels, wheels) while preserving sharp armor creases and 100% of `.W3D` bone hierarchies and animations.
+- **Hardware Stencil Volumetric Shadows & Occluded Silhouettes:** Full `VkStencilOpState` shadow volume extrusion and occluded unit highlighting.
+- **Pre-UI Bilateral Depth SSAO (`F10`):** Half-resolution edge-preserving ambient occlusion grounding units, deck structures, and terrain crevices without bleeding onto the 2D HUD.
+- **Zero-Stall Async 2× Texture Remastering (`F8`):** `rust/zhr-remaster` upscales diffuse textures asynchronously on background workers with alpha/house-color isolation and persistent BLAKE3 disk caching (`%LOCALAPPDATA%/ZeroHourReloaded/cache/`), hot-swapping Vulkan descriptors with zero frame hitches.
 
-We provide support for building the project on Windows and Linux. For detailed build instructions, check the
-[Wiki](https://github.com/TheSuperHackers/GeneralsGameCode/wiki/build_guides), which includes guides for VS6, VS2022,
-Docker, CLion, and links to forks supporting additional versions.
+| Classic Hull, Turrets & Lighting | Remastered Mesh, PBR/SSAO, Shadows & 2× Textures |
+| :---: | :---: |
+| ![Classic Battleship Detail](docs/screenshots/a_ship_detail_classic.png) | ![Remastered Battleship Detail](docs/screenshots/b_ship_detail_remastered.png) |
+| *Faceted 2003 geometry, muddy DXT1 textures, flat lighting with no crevice occlusion* | *Smoothed curved geometry, metallic GGX + Sky IBL specular, crisp volumetric shadows, bilateral SSAO, and 2× remastered textures* |
 
-### Quick Start
+---
 
-**Windows (Visual Studio 2022)**
-```bash
-cmake --preset win32
-cmake --build build/win32 --config Release
+### 4. Native 64-bit FFmpeg 8.1 Cutscene Video & Synced Rust Audio (`zhr-audio`)
+Legacy 32-bit `binkw32.dll` and `mss32.dll` cannot load in a 64-bit process. ZeroHourReloaded replaces both:
+- **Video (`FFmpegVideoPlayer` + `FFmpegFile`):** Automatically fetches and links official LGPL **FFmpeg 8.1** (`avcodec-62`, `avformat-62`, `avutil-60`, `swscale-9`, `swresample-6`) to decode `.bik` intro movies, shell backgrounds, and campaign cutscenes directly from `.big` archives via custom seekable AVIO callbacks.
+- **Audio (`rust/zhr-audio`):** Native 64-bit audio engine (`cpal` + `symphonia` replacing `mss32.dll`) handling music, speech, 2D UI SFX, 3D positional battlefield audio, and a lock-free `VideoAudioQueue` PCM ring buffer that mixes synchronized FFmpeg cutscene audio cleanly in real time.
+
+| Legacy 64-bit Baseline (No `binkw32.dll`) | ZeroHourReloaded (FFmpeg 8.1 LGPL + `zhr-audio`) |
+| :---: | :---: |
+| *Intro & campaign `.bik` movies skipped/black on 64-bit because 32-bit `binkw32.dll` cannot be loaded.* | ![FFmpeg 8.1 Native 64-bit Bink Video Playback](docs/screenshots/ffmpeg_bik_video.png) |
+| | *Full-resolution `1280×720` `.bik` playback on SDL3 + Vulkan 1.3 with synchronized `zhr-audio` PCM mixing and `0` validation errors* |
+
+---
+
+### 5. Native Cross-Platform SDL3 Window & Input (`rust/zhr-platform`)
+Replaces legacy Win32 `CreateWindow`/`WndProc` boilerplate and `DirectInput8` (`dinput8.dll`) with **SDL3 3.4.20** (`Core/GameEngineDevice/Source/SDLDevice/`) backed by a Rust USB HID `SDL_Scancode` → Zero Hour `KeyDefType` mapping crate (`rust/zhr-platform`):
+- Resizable Vulkan-ready SDL3 window with automatic swapchain sizing (`-xres`/`-yres` respected immediately).
+- Full RTS keyboard & hotkey support (control groups, camera controls, modifiers, `F7`–`F11` remaster toggles) with zero `DirectInput8` dependency.
+- Preserves custom W3D faction cursors and mouse behavior across menus and skirmish gameplay.
+- Cross-platform Vulkan surface FFI hooks (`zhr_vk_init_win32`, `zhr_vk_init_xlib`, `zhr_vk_init_wayland`, `zhr_vk_init_macos`) prepared for Linux and macOS targets.
+
+---
+
+## Architecture Status
+
+| Legacy 32-bit Blocker | ZeroHourReloaded 64-bit Replacement | Status |
+|---|---|---|
+| DirectX 8 (`d3d8.dll`) | `rust/zhr-vulkan` (`ash` Vulkan 1.3 + `gpu-allocator` + `naga` WGSL) + `VulkanDX8Bridge.cpp` | **Working** |
+| Miles Sound System (`mss32.dll`) | `rust/zhr-audio` (`cpal` + `symphonia` 2D/3D mixer + video PCM stream) via `MilesLoader.cpp` | **Working** |
+| Bink Video (`binkw32.dll`) | `FFmpegVideoPlayer` + `FFmpegFile` (FFmpeg 8.1 LGPL) + `zhr-audio` `VideoAudioQueue` | **Working** |
+| Win32 Window + `DirectInput8` | SDL3 3.4.20 (`SDL3Platform` + `SDL3Keyboard`) + `rust/zhr-platform` | **Working** |
+| 2003 Low-Res Visuals | PBR/GGX/IBL, Animated Water, Volumetric Stencil Shadows, Bilateral SSAO, HDR Bloom/ACES/CAS, Phong `.W3D` Smoothing (`F7`), Async 2× `zhr-remaster` (`F8`) | **Working** |
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for deeper technical details on the hybrid C++20/Rust FFI architecture and local asset remastering pipeline.
+
+---
+
+## Live In-Game Hotkeys
+
+Toggle every visual remaster subsystem live during the shell map or skirmish without restarting:
+
+| Hotkey | Feature | Modes / Behavior |
+| :---: | :--- | :--- |
+| **`F9`** | **Master Graphics Mode** | Cycles **Remastered** → **50/50 Split-Screen A/B** → **Classic 2003** |
+| **`F10`** | **PBR, Water & SSAO** | Toggles GGX/IBL lighting, animated water & reflections, terrain PBR relief, and bilateral SSAO |
+| **`F11`** | **HDR Post-Processing** | Toggles HDR Bloom, ACES Filmic Tonemapping, and AMD CAS sharpening |
+| **`F7`** | **Mesh Smoothing** | Toggles crease-preserving Phong `.W3D` geometry subdivision |
+| **`F8`** | **2× Remastered Textures** | Toggles zero-stall async 2× upscaled textures (with persistent BLAKE3 disk cache) |
+
+---
+
+## Quick Start (Windows 64-bit)
+
+### Prerequisites
+- **Visual Studio 2022** (C++20 desktop workload) + **CMake** + **Ninja**
+- **Rust toolchain** (`rustup`, stable MSVC `x86_64-pc-windows-msvc`)
+- **Vulkan SDK** (or up-to-date GPU driver with Vulkan 1.3 support)
+- A legal local installation of *Command & Conquer: Generals – Zero Hour* (`INIZH.big`)
+
+*(SDL3 3.4.20 and LGPL FFmpeg 8.1 SDKs are downloaded and staged automatically by CMake on first configure.)*
+
+### 1. One-Time Fast Build Setup (Optional `sccache` + `rust-lld`)
+```powershell
+pwsh -File scripts/setup-rust.ps1
 ```
 
-**Linux (via Docker)**
-```bash
-./scripts/docker-build.sh              # Build using Docker
-./scripts/docker-install.sh --detect # Install to your game
+### 2. Build & Launch in One Step
+```powershell
+# Double-click play.bat in the repo root, OR run:
+cargo run
+
+# Or invoke the PowerShell launcher directly:
+pwsh -File scripts/run-win64-vulkan.ps1
+pwsh -File scripts/run-win64-vulkan.ps1 -NoShellMap -Validation
+pwsh -File scripts/run-win64-vulkan.ps1 -AssetsDir "C:\Path\To\Zero Hour"
 ```
 
-### Dependency management
+The launcher incrementally compiles Rust + C++20, stages `generalszh-vulkan64.exe` alongside `SDL3.dll` and the FFmpeg LGPL DLLs in your Zero Hour directory (leaving any original 32-bit `generalszh.exe` untouched), and launches straight into native 64-bit Vulkan 1.3.
 
-The repository uses a vcpkg manifest (`vcpkg.json`). Dependency versions come from the `builtin-baseline` commit
-recorded there, with per-port `overrides` when a specific version is required. Update the baseline to pick up new
-versions. GitHub Actions consumes these ports through a vcpkg binary cache backed by a NuGet feed on GitHub
-Packages, keyed by vcpkg's own ABI hashes, so the first CI build warms the feed and subsequent builds pull prebuilt
-binaries instead of re-compiling everything. Pull requests from forks restore from the feed but cannot write to it.
+### 3. Build Only / Run Tests
+```powershell
+# Full 64-bit Vulkan + SDL3 + FFmpeg build
+pwsh -File scripts/build-win64-vulkan.ps1 -Config RelWithDebInfo -Target z_generals
 
-### Profiling
+# Rust workspace tests & lints
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-Tracy profiling is supported in the CMake preset `win32-profile`.
-Use `tracy-profiler.exe` from [Tracy v0.13.1](https://github.com/wolfpld/tracy/releases/tag/v0.13.1).
-If you get an error when using Tracy, try removing `dbghelp.dll` from the game binary directory.
+### Useful Environment Variables
+| Variable | Values / Example | Purpose |
+|---|---|---|
+| `ZHR_ASSETS_DIR` | `C:\Games\Zero Hour` | Override auto-discovered Zero Hour asset folder |
+| `ZHR_GRAPHICS_MODE` | `remastered` \| `split` \| `classic` | Starting visual mode (can still cycle live with `F9`) |
+| `ZHR_VK_VALIDATION` | `1` \| `0` | Enable Khronos Vulkan validation layers |
+| `ZHR_REMASTER_OFF` | `1` | Disable background 2× texture remastering at startup |
 
-## Contributing
+---
 
-We welcome contributions to the project! If you’re interested in contributing, you need to have knowledge of C++. Join
-the developer chat on Discord for more information on how to get started. Please make sure to read our
-[Contributing Guidelines](CONTRIBUTING.md) before submitting a pull request. You can also check out 
-the [Wiki](https://github.com/TheSuperHackers/GeneralsGameCode/wiki) for more detailed documentation.
+## Licensing & Attribution
 
-
-## License & Legal Disclaimer
-
-EA has not endorsed and does not support this product. All trademarks are the property of their respective owners.
-
-This project is licensed under the [GPL-3.0 License](https://www.gnu.org/licenses/gpl-3.0.html), which allows you to
-freely modify and distribute the source code under the terms of this license. Please see [LICENSE.md](LICENSE.md) 
-for details.
+- **License:** [GPL-3.0-or-later](https://www.gnu.org/licenses/gpl-3.0.html) with EA GPL Section 7 Additional Terms — see [LICENSE.md](LICENSE.md).
+- **Upstream:** Built on [`TheSuperHackers/GeneralsGameCode`](https://github.com/TheSuperHackers/GeneralsGameCode).
+- **Third-Party Libraries:** SDL3 (zlib license), FFmpeg 8.1 (LGPL-2.1-or-later shared build), `ash`, `gpu-allocator`, `naga`, `cpal`, `symphonia`, `blake3`.
+- **Disclaimer:** EA has not endorsed and does not support this project. All trademarks are the property of their respective owners.
