@@ -4,6 +4,7 @@ members = [
     "rust/zhr-core",
     "rust/zhr-vulkan",
     "rust/zhr-audio",
+    "rust/zhr-platform",
     "rust/zhr-remaster",
     "rust/zhr-ffi",
     "rust/zhr-play",
@@ -20,6 +21,7 @@ repository = "https://github.com/rennerdo30/ZeroHourReloaded"
 zhr-core = { path = "rust/zhr-core" }
 zhr-vulkan = { path = "rust/zhr-vulkan" }
 zhr-audio = { path = "rust/zhr-audio" }
+zhr-platform = { path = "rust/zhr-platform" }
 zhr-remaster = { path = "rust/zhr-remaster" }
 zhr-ffi = { path = "rust/zhr-ffi" }
 

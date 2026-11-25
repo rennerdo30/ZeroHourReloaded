@@ -78,12 +78,14 @@ Bool FFmpegFile::open(File *file)
 		return false;
 	}
 
-	m_avioCtx = avio_alloc_context(buffer, avio_ctx_buffer_size, 0, file, &readPacket, nullptr, nullptr);
+	m_avioCtx = avio_alloc_context(buffer, avio_ctx_buffer_size, 0, file, &readPacket, nullptr, &seekPacket);
 	if (m_avioCtx == nullptr) {
 		DEBUG_LOG(("Failed to alloc AVIOContext"));
 		close();
 		return false;
 	}
+
+	m_decodedVideoFrames = 0;
 
 	m_fmtCtx->pb = m_avioCtx;
 	m_fmtCtx->flags |= AVFMT_FLAG_CUSTOM_IO;
@@ -169,6 +171,27 @@ int FFmpegFile::readPacket(void *opaque, uint8_t *buf, int buf_size)
 	return read;
 }
 
+Int64 FFmpegFile::seekPacket(void *opaque, Int64 offset, Int whence)
+{
+	File *file = static_cast<File *>(opaque);
+	if (file == nullptr)
+		return -1;
+
+	if ((whence & AVSEEK_SIZE) != 0)
+		return static_cast<Int64>(file->size());
+
+	File::seekMode mode = File::START;
+	switch (whence & ~AVSEEK_FORCE) {
+		case SEEK_SET: mode = File::START; break;
+		case SEEK_CUR: mode = File::CURRENT; break;
+		case SEEK_END: mode = File::END; break;
+		default: return -1;
+	}
+
+	const Int pos = file->seek(static_cast<Int>(offset), mode);
+	return pos >= 0 ? static_cast<Int64>(pos) : -1;
+}
+
 /**
  * close all the open FFmpeg handles for an open file.
  */
@@ -245,6 +268,9 @@ Bool FFmpegFile::decodePacket()
 			return false;
 		}
 
+		if (stream.stream_type == AVMEDIA_TYPE_VIDEO) {
+			++m_decodedVideoFrames;
+		}
 		if (m_frameCallback != nullptr) {
 			m_frameCallback(stream.frame, stream_idx, stream.stream_type, m_userData);
 		}
@@ -344,15 +370,22 @@ Int FFmpegFile::getNumFrames() const
 	if (m_fmtCtx == nullptr || stream == nullptr || m_fmtCtx->streams[stream->stream_idx] == nullptr)
 		return 0;
 
-	return (m_fmtCtx->duration / (double)AV_TIME_BASE) * av_q2d(m_fmtCtx->streams[stream->stream_idx]->avg_frame_rate);
+	AVStream *av_stream = m_fmtCtx->streams[stream->stream_idx];
+	if (av_stream->nb_frames > 0)
+		return static_cast<Int>(av_stream->nb_frames);
+
+	double fps = av_q2d(av_stream->avg_frame_rate);
+	if (fps <= 0.0)
+		fps = av_q2d(av_stream->r_frame_rate);
+	if (fps <= 0.0 || m_fmtCtx->duration <= 0)
+		return m_decodedVideoFrames > 0 ? m_decodedVideoFrames + 1 : 1;
+
+	return static_cast<Int>((m_fmtCtx->duration / static_cast<double>(AV_TIME_BASE)) * fps);
 }
 
 Int FFmpegFile::getCurrentFrame() const
 {
-	const FFmpegStream *stream = findMatch(AVMEDIA_TYPE_VIDEO);
-	if (stream == nullptr)
-		return 0;
-	return stream->codec_ctx->frame_num;
+	return m_decodedVideoFrames;
 }
 
 Int FFmpegFile::getPixelFormat() const
@@ -367,7 +400,13 @@ Int FFmpegFile::getPixelFormat() const
 UnsignedInt FFmpegFile::getFrameTime() const
 {
 	const FFmpegStream *stream = findMatch(AVMEDIA_TYPE_VIDEO);
-	if (stream == nullptr)
-		return 0u;
-	return 1000u / av_q2d(m_fmtCtx->streams[stream->stream_idx]->avg_frame_rate);
+	if (m_fmtCtx == nullptr || stream == nullptr || m_fmtCtx->streams[stream->stream_idx] == nullptr)
+		return 33u;
+	AVStream *av_stream = m_fmtCtx->streams[stream->stream_idx];
+	double fps = av_q2d(av_stream->avg_frame_rate);
+	if (fps <= 0.0)
+		fps = av_q2d(av_stream->r_frame_rate);
+	if (fps <= 0.0)
+		return 33u;
+	return static_cast<UnsignedInt>(1000.0 / fps);
 }

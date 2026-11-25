@@ -49,6 +49,9 @@
 #ifdef RTS_HAS_FFMPEG
 #include "VideoDevice/FFmpeg/FFmpegVideoPlayer.h"
 #endif
+#ifdef ZHR_USE_SDL3
+#include "SDLDevice/SDL3Keyboard.h"
+#endif
 #include "Win32Device/GameClient/Win32DIKeyboard.h"
 #include "Win32Device/GameClient/Win32DIMouse.h"
 #include "Win32Device/GameClient/Win32Mouse.h"
@@ -112,7 +115,7 @@ protected:
   /// Manager for display strings
 	virtual DisplayStringManager *createDisplayStringManager() override { return NEW W3DDisplayStringManager; }
 #ifdef RTS_HAS_FFMPEG
-	virtual VideoPlayerInterface *createVideoPlayer() { return NEW FFmpegVideoPlayer; }
+	virtual VideoPlayerInterface *createVideoPlayer() override { return NEW FFmpegVideoPlayer; }
 #else
 	virtual VideoPlayerInterface *createVideoPlayer() override { return NEW BinkVideoPlayer; }
 #endif
@@ -126,7 +129,11 @@ protected:
 
 };
 
+#ifdef ZHR_USE_SDL3
+inline Keyboard *W3DGameClient::createKeyboard() { return NEW SDL3Keyboard; }
+#else
 inline Keyboard *W3DGameClient::createKeyboard() { return NEW DirectInputKeyboard; }
+#endif
 inline Mouse *W3DGameClient::createMouse()
 {
 	//return new DirectInputMouse;

@@ -59,6 +59,8 @@ else()
 endif()
 option(ZHR_USE_VULKAN "Use the Rust Vulkan 1.3 renderer backend instead of DX8" ${_zhr_default_vulkan})
 add_feature_info(VulkanBackend ZHR_USE_VULKAN "Build with Rust Vulkan 1.3 renderer backend (zhr-vulkan)")
+option(ZHR_USE_SDL3 "Use cross-platform SDL3 window and keyboard/mouse input backend" ${_zhr_default_vulkan})
+add_feature_info(SDL3Backend ZHR_USE_SDL3 "Build with SDL3 cross-platform window and input backend")
 
 # Find/Add build dependencies and stubs shared by all projects
 if((WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows") AND ${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT ZHR_USE_VULKAN)
@@ -89,6 +91,8 @@ include(cmake/stb.cmake)
 
 if(NOT IS_VS6_BUILD)
     include(cmake/rust.cmake)
+    include(cmake/sdl3.cmake)
+    include(cmake/ffmpeg.cmake)
 endif()
 
 if(RTS_BUILD_OPTION_PROFILE_TRACY)

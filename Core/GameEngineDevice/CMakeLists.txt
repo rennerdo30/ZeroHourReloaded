@@ -225,7 +225,9 @@ target_link_libraries(corei_gameenginedevice_public INTERFACE
 )
 
 if(RTS_BUILD_OPTION_FFMPEG)
-    find_package(FFMPEG REQUIRED)
+    if(NOT FFMPEG_FOUND)
+        find_package(FFMPEG REQUIRED)
+    endif()
 
     if(FFMPEG_FOUND)
         target_sources(corei_gameenginedevice_private INTERFACE
@@ -239,4 +241,15 @@ if(RTS_BUILD_OPTION_FFMPEG)
         target_link_libraries(corei_gameenginedevice_private INTERFACE ${FFMPEG_LIBRARIES})
         target_compile_definitions(corei_gameenginedevice_public INTERFACE RTS_HAS_FFMPEG)
     endif()
+endif()
+
+if(ZHR_USE_SDL3 AND SDL3_FOUND)
+    target_sources(corei_gameenginedevice_private INTERFACE
+        Include/SDLDevice/SDL3Platform.h
+        Include/SDLDevice/SDL3Keyboard.h
+        Source/SDLDevice/SDL3Platform.cpp
+        Source/SDLDevice/SDL3Keyboard.cpp
+    )
+    target_link_libraries(corei_gameenginedevice_public INTERFACE SDL3::SDL3)
+    target_compile_definitions(corei_gameenginedevice_public INTERFACE ZHR_USE_SDL3=1)
 endif()

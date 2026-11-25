@@ -60,6 +60,9 @@
 #include "GameClient/IMEManager.h"
 #include "Win32Device/GameClient/Win32Mouse.h"
 #include "Win32Device/Common/Win32GameEngine.h"
+#ifdef ZHR_USE_SDL3
+#include "SDLDevice/SDL3Platform.h"
+#endif
 #include "Common/version.h"
 #include "BuildVersion.h"
 #include "GeneratedVersion.h"
@@ -693,6 +696,32 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 //=============================================================================
 static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWindowed )
 {
+#ifdef ZHR_USE_SDL3
+	(void)hInstance;
+	(void)nCmdShow;
+	Int startWidth = DEFAULT_DISPLAY_WIDTH;
+	Int startHeight = DEFAULT_DISPLAY_HEIGHT;
+	if (TheGlobalData)
+	{
+		if (TheGlobalData->m_xResolution > 0) startWidth = TheGlobalData->m_xResolution;
+		if (TheGlobalData->m_yResolution > 0) startHeight = TheGlobalData->m_yResolution;
+	}
+	gInitializing = true;
+	void* nativeHwnd = nullptr;
+	if (!ZhrSDL3Platform::createWindow("ZeroHourReloaded", startWidth, startHeight, runWindowed, &nativeHwnd) || nativeHwnd == nullptr)
+	{
+		gInitializing = false;
+		return false;
+	}
+	ApplicationHWnd = static_cast<HWND>(nativeHwnd);
+	isWinMainActive = true;
+	gInitializing = false;
+	if (!runWindowed)
+	{
+		gDoPaint = false;
+	}
+	return true;
+#else
 	DWORD windowStyle;
 	Int startWidth = DEFAULT_DISPLAY_WIDTH,
 			startHeight = DEFAULT_DISPLAY_HEIGHT;
@@ -765,6 +794,7 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 	}
 
 	return true;  // success
+#endif
 
 }
 
@@ -939,6 +969,9 @@ Int APIENTRY WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
 #ifdef RTS_ENABLE_CRASHDUMP
 	MiniDumper::shutdownMiniDumper();
+#endif
+#ifdef ZHR_USE_SDL3
+	ZhrSDL3Platform::destroyWindow();
 #endif
 	TheUnicodeStringCriticalSection = nullptr;
 	TheDmaCriticalSection = nullptr;

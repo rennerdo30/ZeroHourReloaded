@@ -32,6 +32,28 @@ int32_t zhr_vk_init_win32(
     uint32_t height,
     bool vsync,
     bool enable_validation);
+#elif defined(__APPLE__)
+int32_t zhr_vk_init_macos(
+    void* ns_view,
+    uint32_t width,
+    uint32_t height,
+    bool vsync,
+    bool enable_validation);
+#elif defined(__linux__)
+int32_t zhr_vk_init_xlib(
+    void* display,
+    uint64_t window,
+    uint32_t width,
+    uint32_t height,
+    bool vsync,
+    bool enable_validation);
+int32_t zhr_vk_init_wayland(
+    void* display,
+    void* surface,
+    uint32_t width,
+    uint32_t height,
+    bool vsync,
+    bool enable_validation);
 #endif
 
 void zhr_vk_shutdown(void);
@@ -185,6 +207,13 @@ int32_t zhr_audio_decode_wav_pcm16(
     uint8_t** out_ptr,
     size_t* out_len);
 void zhr_audio_free_buffer(uint8_t* ptr, size_t len);
+void zhr_audio_video_start(uint32_t sample_rate, float volume);
+void zhr_audio_video_push_f32(const float* samples, size_t sample_count, uint16_t channels);
+void zhr_audio_video_set_volume(float volume);
+void zhr_audio_video_stop(void);
+
+// --- Cross-Platform SDL3 Input Translation (zhr-platform) ---
+uint8_t zhr_platform_sdl_scancode_to_zh_key(uint32_t sdl_scancode);
 
 #ifdef __cplusplus
 }

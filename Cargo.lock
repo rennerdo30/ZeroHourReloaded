@@ -1440,7 +1440,15 @@ dependencies = [
  "raw-window-handle",
  "zhr-audio",
  "zhr-core",
+ "zhr-platform",
  "zhr-vulkan",
+]
+
+[[package]]
+name = "zhr-platform"
+version = "0.1.0"
+dependencies = [
+ "zhr-core",
 ]
 
 [[package]]

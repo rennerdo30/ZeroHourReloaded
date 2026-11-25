@@ -150,6 +150,12 @@ Copy-Item $BuiltExe $LaunchExe -Force
 if (Test-Path $BuiltPdb) {
     Copy-Item $BuiltPdb (Join-Path $ResolvedAssets "generalszh.pdb") -Force
 }
+# Stage SDL3 and FFmpeg LGPL runtime DLLs alongside the 64-bit executable
+foreach ($dllPattern in @("SDL3.dll", "avcodec-*.dll", "avformat-*.dll", "avutil-*.dll", "swscale-*.dll", "swresample-*.dll")) {
+    Get-ChildItem -Path $BuildDir -Filter $dllPattern -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $ResolvedAssets $_.Name) -Force
+    }
+}
 
 $gameArgs = @("-nologo")
 if (-not $Fullscreen) { $gameArgs += "-win" }

@@ -2874,6 +2874,25 @@ public:
         HWND hwnd = pPresentationParameters->hDeviceWindow ? pPresentationParameters->hDeviceWindow : hFocusWindow;
         const bool validation = IsValidationRequested();
 
+        if (hwnd != nullptr && pPresentationParameters->Windowed)
+        {
+            RECT curClient{};
+            GetClientRect(hwnd, &curClient);
+            if (static_cast<uint32_t>(curClient.right - curClient.left) != w ||
+                static_cast<uint32_t>(curClient.bottom - curClient.top) != h)
+            {
+                const DWORD style = static_cast<DWORD>(GetWindowLongPtrA(hwnd, GWL_STYLE));
+                const DWORD exStyle = static_cast<DWORD>(GetWindowLongPtrA(hwnd, GWL_EXSTYLE));
+                RECT desired{0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
+                AdjustWindowRectEx(&desired, style, FALSE, exStyle);
+                const int winW = desired.right - desired.left;
+                const int winH = desired.bottom - desired.top;
+                const int posX = std::max(0, (GetSystemMetrics(SM_CXSCREEN) - winW) / 2);
+                const int posY = std::max(0, (GetSystemMetrics(SM_CYSCREEN) - winH) / 2);
+                SetWindowPos(hwnd, nullptr, posX, posY, winW, winH, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+
         int32_t ok = 0;
         if (hwnd != nullptr)
         {

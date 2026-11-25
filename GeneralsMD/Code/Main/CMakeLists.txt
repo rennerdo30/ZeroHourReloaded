@@ -71,3 +71,20 @@ endif()
 if(MINGW AND COMMAND add_debug_strip_target)
     add_debug_strip_target(z_generals)
 endif()
+
+# Stage SDL3 and FFmpeg LGPL runtime DLLs next to generalszh.exe on Windows
+if(WIN32)
+    if(ZHR_SDL3_RUNTIME_DLL AND EXISTS "${ZHR_SDL3_RUNTIME_DLL}")
+        add_custom_command(TARGET z_generals POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ZHR_SDL3_RUNTIME_DLL}" "$<TARGET_FILE_DIR:z_generals>"
+            COMMENT "Staging SDL3.dll next to generalszh.exe"
+        )
+    endif()
+    foreach(_ff_dll ${ZHR_FFMPEG_RUNTIME_DLLS})
+        if(EXISTS "${_ff_dll}")
+            add_custom_command(TARGET z_generals POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_ff_dll}" "$<TARGET_FILE_DIR:z_generals>"
+            )
+        endif()
+    endforeach()
+endif()

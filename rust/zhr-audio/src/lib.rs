@@ -4,7 +4,7 @@
 //! `cpal` + `symphonia` real-time stereo mixer supporting WAV, PCM, IMA-ADPCM, and MP3
 //! 2D SFX, 3D positional battlefield sounds, and streamed music & speech.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -229,12 +229,35 @@ impl Voice {
     }
 }
 
+/// Streaming PCM ring buffer for decoded FFmpeg video cutscenes.
+struct VideoAudioQueue {
+    /// Interleaved stereo `f32` frames (`[L0, R0, L1, R1, ...]`).
+    samples: VecDeque<f32>,
+    sample_rate: u32,
+    cursor: f64,
+    volume: f32,
+    active: bool,
+}
+
+impl Default for VideoAudioQueue {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            sample_rate: 44100,
+            cursor: 0.0,
+            volume: 0.85,
+            active: false,
+        }
+    }
+}
+
 struct MixerState {
     output_rate: u32,
     voices: HashMap<u32, Voice>,
     next_id: u32,
     listener: Listener3D,
     completed: Vec<(u32, VoiceKind)>,
+    video_audio: VideoAudioQueue,
 }
 
 impl MixerState {
@@ -245,6 +268,7 @@ impl MixerState {
             next_id: 1,
             listener: Listener3D::default(),
             completed: Vec::new(),
+            video_audio: VideoAudioQueue::default(),
         }
     }
 
@@ -386,6 +410,44 @@ impl MixerState {
                     out[o + 1] += sr * gain_r;
                 }
                 v.cursor += step;
+            }
+        }
+
+        // Mix decoded FFmpeg video cutscene audio if active.
+        if self.video_audio.active && self.video_audio.samples.len() >= 2 {
+            let step = (self.video_audio.sample_rate as f64 / out_rate).clamp(0.1, 4.0);
+            let vol = self.video_audio.volume.clamp(0.0, 2.0);
+            for frame_i in 0..frames {
+                let avail_frames = self.video_audio.samples.len() / 2;
+                if avail_frames == 0 {
+                    break;
+                }
+                let f0 = (self.video_audio.cursor as usize).min(avail_frames - 1);
+                let f1 = (f0 + 1).min(avail_frames - 1);
+                let frac = (self.video_audio.cursor - f0 as f64) as f32;
+                let l0 = self.video_audio.samples[f0 * 2];
+                let r0 = self.video_audio.samples[f0 * 2 + 1];
+                let l1 = self.video_audio.samples[f1 * 2];
+                let r1 = self.video_audio.samples[f1 * 2 + 1];
+                let sl = (l0 + (l1 - l0) * frac) * vol;
+                let sr = (r0 + (r1 - r0) * frac) * vol;
+
+                let o = frame_i * out_channels;
+                out[o] += sl;
+                if out_channels >= 2 {
+                    out[o + 1] += sr;
+                }
+
+                self.video_audio.cursor += step;
+                let whole = self.video_audio.cursor as usize;
+                if whole > 0 {
+                    let drop_frames = whole.min(avail_frames);
+                    let drop_samples = drop_frames * 2;
+                    for _ in 0..drop_samples {
+                        self.video_audio.samples.pop_front();
+                    }
+                    self.video_audio.cursor -= drop_frames as f64;
+                }
             }
         }
 
@@ -743,6 +805,59 @@ impl AudioEngine {
         }
     }
 
+    /// Starts a streaming audio queue for FFmpeg video cutscene playback.
+    pub fn video_audio_start(&self, sample_rate: u32, volume: f32) {
+        let mut m = self.state.lock().expect("audio mixer poisoned");
+        m.video_audio.samples.clear();
+        m.video_audio.sample_rate = sample_rate.clamp(8000, 192_000);
+        m.video_audio.cursor = 0.0;
+        m.video_audio.volume = volume.clamp(0.0, 2.0);
+        m.video_audio.active = true;
+    }
+
+    /// Pushes interleaved `f32` PCM samples (mono or stereo+) into the video cutscene queue.
+    pub fn video_audio_push_f32(&self, interleaved: &[f32], channels: u16) {
+        if interleaved.is_empty() || channels == 0 {
+            return;
+        }
+        let mut m = self.state.lock().expect("audio mixer poisoned");
+        if !m.video_audio.active {
+            return;
+        }
+        // Cap ring buffer at ~4 seconds of stereo audio to bound memory if video is paused.
+        let max_samples = (m.video_audio.sample_rate as usize) * 2 * 4;
+        if m.video_audio.samples.len() > max_samples {
+            let excess = m.video_audio.samples.len() - max_samples;
+            m.video_audio.samples.drain(..excess);
+        }
+        let ch = channels as usize;
+        if ch == 1 {
+            for &s in interleaved {
+                m.video_audio.samples.push_back(s);
+                m.video_audio.samples.push_back(s);
+            }
+        } else {
+            for frame in interleaved.chunks_exact(ch) {
+                m.video_audio.samples.push_back(frame[0]);
+                m.video_audio.samples.push_back(frame[1]);
+            }
+        }
+    }
+
+    /// Updates playback volume for active FFmpeg video cutscene audio.
+    pub fn video_audio_set_volume(&self, volume: f32) {
+        let mut m = self.state.lock().expect("audio mixer poisoned");
+        m.video_audio.volume = volume.clamp(0.0, 2.0);
+    }
+
+    /// Stops and clears the FFmpeg video cutscene audio queue.
+    pub fn video_audio_stop(&self) {
+        let mut m = self.state.lock().expect("audio mixer poisoned");
+        m.video_audio.active = false;
+        m.video_audio.samples.clear();
+        m.video_audio.cursor = 0.0;
+    }
+
     /// Renders `frames` stereo samples synchronously (for deterministic unit tests).
     pub fn render_offline_stereo(&self, frames: usize) -> Vec<f32> {
         let mut buf = vec![0.0f32; frames * 2];
@@ -813,5 +928,22 @@ mod tests {
         // Render slightly past end -> EOS should fire.
         let _ = engine.render_offline_stereo(256);
         assert_eq!(engine.pop_completed(), Some((id, VoiceKind::Sample3D)));
+    }
+
+    #[test]
+    fn video_audio_stream_resamples_and_mixes_cleanly() {
+        let engine = AudioEngine::new(true);
+        engine.video_audio_start(22050, 0.8);
+        let pcm: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
+        engine.video_audio_push_f32(&pcm, 1);
+        let stereo = engine.render_offline_stereo(512);
+        let energy: f32 = stereo.iter().map(|x| x.abs()).sum();
+        assert!(
+            energy > 20.0,
+            "expected video audio signal, got energy={energy}"
+        );
+        engine.video_audio_stop();
+        let silent = engine.render_offline_stereo(128);
+        assert!(silent.iter().all(|&x| x == 0.0));
     }
 }

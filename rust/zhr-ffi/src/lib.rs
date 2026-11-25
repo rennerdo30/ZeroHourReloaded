@@ -153,6 +153,126 @@ pub extern "C" fn zhr_vk_init_win32(
     }
 }
 
+/// Initializes a windowed Vulkan 1.3 renderer from an X11 Display + Window (Linux).
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_init_xlib(
+    display: *mut c_void,
+    window: u64,
+    width: u32,
+    height: u32,
+    vsync: bool,
+    enable_validation: bool,
+) -> i32 {
+    use raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, XlibDisplayHandle, XlibWindowHandle,
+    };
+    use std::ptr::NonNull;
+
+    let display_handle = RawDisplayHandle::Xlib(XlibDisplayHandle::new(NonNull::new(display), 0));
+    let window_handle = RawWindowHandle::Xlib(XlibWindowHandle::new(window as std::ffi::c_ulong));
+    init_windowed_common(
+        display_handle,
+        window_handle,
+        width,
+        height,
+        vsync,
+        enable_validation,
+    )
+}
+
+/// Initializes a windowed Vulkan 1.3 renderer from a Wayland wl_display + wl_surface (Linux).
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_init_wayland(
+    display: *mut c_void,
+    surface: *mut c_void,
+    width: u32,
+    height: u32,
+    vsync: bool,
+    enable_validation: bool,
+) -> i32 {
+    use raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+    };
+    use std::ptr::NonNull;
+
+    let (Some(disp), Some(surf)) = (NonNull::new(display), NonNull::new(surface)) else {
+        return 0;
+    };
+    let display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(disp));
+    let window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(surf));
+    init_windowed_common(
+        display_handle,
+        window_handle,
+        width,
+        height,
+        vsync,
+        enable_validation,
+    )
+}
+
+/// Initializes a windowed Vulkan 1.3 renderer from a Cocoa NSView (macOS / MoltenVK).
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_init_macos(
+    ns_view: *mut c_void,
+    width: u32,
+    height: u32,
+    vsync: bool,
+    enable_validation: bool,
+) -> i32 {
+    use raw_window_handle::{
+        AppKitDisplayHandle, AppKitWindowHandle, RawDisplayHandle, RawWindowHandle,
+    };
+    use std::ptr::NonNull;
+
+    let Some(view) = NonNull::new(ns_view) else {
+        return 0;
+    };
+    let display_handle = RawDisplayHandle::AppKit(AppKitDisplayHandle::new());
+    let window_handle = RawWindowHandle::AppKit(AppKitWindowHandle::new(view));
+    init_windowed_common(
+        display_handle,
+        window_handle,
+        width,
+        height,
+        vsync,
+        enable_validation,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn init_windowed_common(
+    display: raw_window_handle::RawDisplayHandle,
+    window: raw_window_handle::RawWindowHandle,
+    width: u32,
+    height: u32,
+    vsync: bool,
+    enable_validation: bool,
+) -> i32 {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    guard.renderer = None;
+    let config = RendererConfig {
+        width,
+        height,
+        vsync,
+        enable_validation,
+        ..Default::default()
+    };
+    match VulkanRenderer::new_windowed(config, display, window) {
+        Ok(r) => {
+            guard.renderer = Some(r);
+            cache_device_names(&mut guard);
+            1
+        }
+        Err(e) => {
+            log::error!("zhr_vk_init_windowed failed: {e}");
+            0
+        }
+    }
+}
+
 /// Shuts down the active Vulkan renderer and releases all GPU resources.
 #[unsafe(no_mangle)]
 pub extern "C" fn zhr_vk_shutdown() {
@@ -1127,6 +1247,60 @@ pub unsafe extern "C" fn zhr_audio_free_buffer(ptr: *mut u8, len: usize) {
     // SAFETY: Reconstructs the boxed slice forgotten in `zhr_audio_decode_wav_pcm16`.
     let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
     let _ = unsafe { Box::from_raw(slice_ptr) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_video_start(sample_rate: u32, volume: f32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.video_audio_start(sample_rate, volume);
+    }
+}
+
+/// Pushes interleaved `f32` PCM samples from an FFmpeg video decoder into `zhr-audio`.
+///
+/// # Safety
+/// `samples` must point to `sample_count` readable `f32` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zhr_audio_video_push_f32(
+    samples: *const f32,
+    sample_count: usize,
+    channels: u16,
+) {
+    if samples.is_null() || sample_count == 0 || channels == 0 {
+        return;
+    }
+    // SAFETY: Caller guarantees `samples` is valid for `sample_count` floats.
+    let slice = unsafe { std::slice::from_raw_parts(samples, sample_count) };
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.video_audio_push_f32(slice, channels);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_video_set_volume(volume: f32) {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.video_audio_set_volume(volume);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_audio_video_stop() {
+    let guard = audio_state().lock().expect("audio state poisoned");
+    if let Some(e) = guard.engine.as_ref() {
+        e.video_audio_stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Platform SDL3 Input Translation (zhr-platform)
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_platform_sdl_scancode_to_zh_key(sdl_scancode: u32) -> u8 {
+    zhr_platform::sdl_scancode_to_zh_key(sdl_scancode)
 }
 
 #[cfg(test)]

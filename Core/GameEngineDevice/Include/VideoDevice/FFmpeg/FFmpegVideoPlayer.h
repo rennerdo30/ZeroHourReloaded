@@ -63,6 +63,7 @@ class FFmpegVideoStream : public VideoStream
 		Char			*m_memFile;				///< Pointer to memory resident file
 		UnsignedInt64	m_startTime = 0;		///< Time the stream started
 		UnsignedByte *	m_audioBuffer = nullptr;///< Audio buffer for the stream
+		Bool			m_rustAudioStarted = false;///< Whether zhr-audio video stream was initialized
 
 		FFmpegVideoStream(FFmpegFile* file);																///< only BinkVideoPlayer can create these
 		virtual ~FFmpegVideoStream();
@@ -121,7 +122,7 @@ class FFmpegVideoPlayer : public VideoPlayer
 		virtual VideoStreamInterface*	load( AsciiString movieTitle );	///< Load video file in to memory for playback
 
 		virtual void notifyVideoPlayerOfNewProvider( Bool nowHasValid );
-		virtual void setVolume( Real ) override { }
+		virtual void setVolume( Real volume ) override;
 		virtual void initializeBinkWithMiles();
 };
 

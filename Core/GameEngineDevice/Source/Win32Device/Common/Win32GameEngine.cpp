@@ -32,6 +32,9 @@
 #include <windows.h>
 
 #include "Win32Device/Common/Win32GameEngine.h"
+#ifdef ZHR_USE_SDL3
+#include "SDLDevice/SDL3Platform.h"
+#endif
 #include "Common/PerfTimer.h"
 #include "GameClient/GameText.h"
 
@@ -134,6 +137,10 @@ void Win32GameEngine::update()
 //-------------------------------------------------------------------------------------------------
 void Win32GameEngine::serviceWindowsOS()
 {
+#ifdef ZHR_USE_SDL3
+	ZhrSDL3Platform::pumpEvents();
+	return;
+#else
 	MSG msg;
   Int returnValue;
 
@@ -166,6 +173,7 @@ void Win32GameEngine::serviceWindowsOS()
 		TheMessageTime = 0;
 
 	}
+#endif
 
 }
 

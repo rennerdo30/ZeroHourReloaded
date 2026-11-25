@@ -46,6 +46,12 @@ extern "C" {
 	#include <libswscale/swscale.h>
 }
 
+#ifdef ZHR_USE_VULKAN
+#include <zhr_ffi.h>
+#endif
+
+#include <vector>
+
 #ifdef RTS_HAS_OPENAL
 #include "OpenALAudioDevice/OpenALAudioManager.h"
 #include "OpenALAudioDevice/OpenALAudioStream.h"
@@ -272,6 +278,15 @@ VideoStreamInterface*	FFmpegVideoPlayer::load( AsciiString movieTitle )
 	return open(movieTitle); // load() used to have the same body as open(), so I'm combining them.  Munkee.
 }
 
+void FFmpegVideoPlayer::setVolume( Real volume )
+{
+#ifdef ZHR_USE_VULKAN
+	zhr_audio_video_set_volume(static_cast<float>(volume));
+#else
+	(void)volume;
+#endif
+}
+
 //============================================================================
 //============================================================================
 void FFmpegVideoPlayer::notifyVideoPlayerOfNewProvider( Bool nowHasValid )
@@ -335,6 +350,12 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file)
 
 FFmpegVideoStream::~FFmpegVideoStream()
 {
+#ifdef ZHR_USE_VULKAN
+	if (m_rustAudioStarted) {
+		zhr_audio_video_stop();
+		m_rustAudioStarted = false;
+	}
+#endif
 	av_freep(&m_audioBuffer);
 	av_frame_free(&m_frame);
 	sws_freeContext(m_swsContext);
@@ -343,13 +364,62 @@ FFmpegVideoStream::~FFmpegVideoStream()
 
 void FFmpegVideoStream::onFrame(AVFrame *frame, int stream_idx, int stream_type, void *user_data)
 {
+	(void)stream_idx;
 	FFmpegVideoStream *videoStream = static_cast<FFmpegVideoStream *>(user_data);
 	if (stream_type == AVMEDIA_TYPE_VIDEO) {
 		av_frame_free(&videoStream->m_frame);
 		videoStream->m_frame = av_frame_clone(frame);
 		videoStream->m_gotFrame = true;
 	}
-#ifdef RTS_USE_OPENAL
+#ifdef ZHR_USE_VULKAN
+	else if (stream_type == AVMEDIA_TYPE_AUDIO && frame != nullptr && frame->nb_samples > 0) {
+		const int channels = frame->ch_layout.nb_channels > 0 ? frame->ch_layout.nb_channels : 1;
+		const int sampleRate = frame->sample_rate > 0 ? frame->sample_rate : 22050;
+		if (!videoStream->m_rustAudioStarted) {
+			float vol = 0.85f;
+			if (TheAudio) {
+				vol = TheAudio->getVolume(AudioAffect_Speech);
+			}
+			zhr_audio_video_start(static_cast<uint32_t>(sampleRate), vol);
+			videoStream->m_rustAudioStarted = true;
+		}
+
+		const AVSampleFormat fmt = static_cast<AVSampleFormat>(frame->format);
+		std::vector<float> pcm;
+		pcm.resize(static_cast<size_t>(frame->nb_samples) * static_cast<size_t>(channels), 0.0f);
+
+		auto readSample = [&](int ch, int i) -> float {
+			switch (fmt) {
+				case AV_SAMPLE_FMT_FLTP:
+					return reinterpret_cast<const float*>(frame->data[ch])[i];
+				case AV_SAMPLE_FMT_FLT:
+					return reinterpret_cast<const float*>(frame->data[0])[i * channels + ch];
+				case AV_SAMPLE_FMT_S16P:
+					return static_cast<float>(reinterpret_cast<const int16_t*>(frame->data[ch])[i]) / 32768.0f;
+				case AV_SAMPLE_FMT_S16:
+					return static_cast<float>(reinterpret_cast<const int16_t*>(frame->data[0])[i * channels + ch]) / 32768.0f;
+				case AV_SAMPLE_FMT_S32P:
+					return static_cast<float>(reinterpret_cast<const int32_t*>(frame->data[ch])[i]) / 2147483648.0f;
+				case AV_SAMPLE_FMT_S32:
+					return static_cast<float>(reinterpret_cast<const int32_t*>(frame->data[0])[i * channels + ch]) / 2147483648.0f;
+				case AV_SAMPLE_FMT_U8P:
+					return (static_cast<float>(frame->data[ch][i]) - 128.0f) / 128.0f;
+				case AV_SAMPLE_FMT_U8:
+					return (static_cast<float>(frame->data[0][i * channels + ch]) - 128.0f) / 128.0f;
+				default:
+					return 0.0f;
+			}
+		};
+
+		for (int i = 0; i < frame->nb_samples; ++i) {
+			for (int ch = 0; ch < channels; ++ch) {
+				pcm[static_cast<size_t>(i) * static_cast<size_t>(channels) + static_cast<size_t>(ch)] = readSample(ch, i);
+			}
+		}
+
+		zhr_audio_video_push_f32(pcm.data(), pcm.size(), static_cast<uint16_t>(channels));
+	}
+#elif defined(RTS_USE_OPENAL)
 	else if (stream_type == AVMEDIA_TYPE_AUDIO) {
 		OpenALAudioStream* audioStream = (OpenALAudioStream*)TheAudio->getHandleForBink();
 		audioStream->update();
@@ -505,6 +575,8 @@ void FFmpegVideoStream::frameNext()
 
 Int FFmpegVideoStream::frameIndex()
 {
+	if (!m_good)
+		return frameCount();
 	return m_ffmpegFile->getCurrentFrame();
 }
 
