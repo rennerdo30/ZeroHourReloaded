@@ -734,12 +734,21 @@ pub extern "C" fn zhr_vk_set_remaster_textures(enabled: bool) {
     }
 }
 
-/// Sets a semantic material hint for upcoming draws (`0 = default`, `1 = animated water`).
+/// Sets a semantic material hint for upcoming draws (`0 = default`, `1 = animated water`, `5/6 = vol particles`, `7/8 = cloth`).
 #[unsafe(no_mangle)]
 pub extern "C" fn zhr_vk_set_material_hint(hint: u32) {
     let mut guard = vk_state().lock().expect("vk state poisoned");
     if let Some(ren) = guard.renderer.as_mut() {
         ren.set_material_hint(hint);
+    }
+}
+
+/// Registers a 3D battlefield explosion shockwave that whips nearby flags & canopies outward.
+#[unsafe(no_mangle)]
+pub extern "C" fn zhr_vk_add_wind_impulse(x: f32, y: f32, z: f32, strength: f32) {
+    let mut guard = vk_state().lock().expect("vk state poisoned");
+    if let Some(ren) = guard.renderer.as_mut() {
+        ren.add_wind_impulse(x, y, z, strength);
     }
 }
 

@@ -33,6 +33,7 @@ namespace {
 std::atomic<bool> g_zhr_mesh_smoothing_enabled{true};
 std::atomic<bool> g_zhr_title_banner_dirty{true};
 std::atomic<bool> g_zhr_terrain_pass_active{false};
+std::atomic<uint32_t> g_zhr_cloth_hint{0u};
 std::atomic<uint64_t> g_zhr_next_buf_id{1};
 std::atomic<uint64_t> g_zhr_frame_counter{1};
 
@@ -1487,6 +1488,7 @@ struct CachedGpuMesh
     uint32_t gpu_vb{0};
     uint32_t gpu_ib{0};
     uint32_t index_count{0};
+    uint32_t cloth_hint{0};
     uint64_t last_used_frame{0};
 };
 
@@ -2187,9 +2189,19 @@ public:
                 (m_render_states[D3DRS_STENCILENABLE] != 0 &&
                  m_render_states[D3DRS_STENCILFUNC] == D3DCMP_NEVER);
 
+            const uint32_t cloth_hint_now = g_zhr_cloth_hint.load(std::memory_order_relaxed);
             uint32_t tess_mode = 0u;
             uint64_t extra_key = 0u;
-            if (mesh_smooth_on && terrain_pass_active &&
+            if (remaster_active && cloth_hint_now != 0u &&
+                !terrain_pass_active &&
+                !is_stencil_only_pass &&
+                PrimitiveType == D3DPT_TRIANGLELIST &&
+                primCount >= 2u && primCount <= 128u)
+            {
+                tess_mode = (cloth_hint_now == 8u) ? 4u : 3u;
+                extra_key = cloth_hint_now;
+            }
+            else if (mesh_smooth_on && terrain_pass_active &&
                 g_zhr_terrain_hm.data != nullptr &&
                 g_zhr_terrain_hm.width >= 4 &&
                 g_zhr_terrain_hm.height >= 4 &&
@@ -2205,7 +2217,7 @@ public:
                      !is_stencil_only_pass &&
                      (m_render_states[D3DRS_ALPHABLENDENABLE] == 0) &&
                      PrimitiveType == D3DPT_TRIANGLELIST &&
-                     primCount >= 6u && primCount <= 4000u)
+                     primCount >= 5u && primCount <= 4000u)
             {
                 tess_mode = 1u;
                 ZhrVkTexture8* diffuse_tex =
@@ -2314,7 +2326,16 @@ public:
                     it->second.last_used_frame = cur_frame;
                     EnsureFrameBegun();
                     SyncDrawState(false, tex_count);
+                    const bool push_auto_cloth = (it->second.cloth_hint != 0u && cloth_hint_now == 0u);
+                    if (push_auto_cloth)
+                    {
+                        zhr_vk_set_material_hint(it->second.cloth_hint);
+                    }
                     zhr_vk_draw_indexed(it->second.gpu_vb, it->second.gpu_ib, it->second.index_count, 0u, 0);
+                    if (push_auto_cloth)
+                    {
+                        zhr_vk_set_material_hint(0u);
+                    }
                     if (m_perf_enabled)
                     {
                         ++m_perf_static_hits;
@@ -3054,9 +3075,37 @@ private:
             prim_count <= 4096u &&
             m_scratch_verts.size() <= 16384u;
 
+        const uint32_t explicit_cloth_hint = g_zhr_cloth_hint.load(std::memory_order_relaxed);
+        const bool can_cloth_candidate =
+            !is_rhw &&
+            !terrain_pass_active &&
+            remaster_active &&
+            !is_stencil_only_pass &&
+            prim_type == D3DPT_TRIANGLELIST &&
+            prim_count >= 2u &&
+            prim_count <= 128u &&
+            m_scratch_verts.size() < 4096u;
+        uint32_t effective_cloth_hint = 0u;
+        if (can_cloth_candidate)
+        {
+            if (explicit_cloth_hint != 0u)
+            {
+                effective_cloth_hint = explicit_cloth_hint;
+            }
+            else if (!is_dynamic_vb &&
+                     prim_count <= 24u &&
+                     m_render_states[D3DRS_ALPHABLENDENABLE] == 0 &&
+                     m_render_states[D3DRS_ALPHATESTENABLE] == 0 &&
+                     m_render_states[D3DRS_LIGHTING] != 0)
+            {
+                effective_cloth_hint = DetectUnnamedHingedClothKind();
+            }
+        }
+
         // Only tessellate static rigid .W3D meshes (buildings, vents, vehicles, rocks, props);
         // skip dynamic skinned buffers (D3DUSAGE_DYNAMIC) whose vertices mutate every frame.
         const bool can_smooth_mesh =
+            effective_cloth_hint == 0u &&
             !terrain_pass_active &&
             !is_dynamic_vb &&
             g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) &&
@@ -3067,7 +3116,7 @@ private:
             !is_stencil_only_pass &&
             (m_render_states[D3DRS_ALPHABLENDENABLE] == 0) &&
             prim_type == D3DPT_TRIANGLELIST &&
-            prim_count >= 6u &&
+            prim_count >= 5u &&
             prim_count <= 4000u &&
             m_scratch_verts.size() < 16000u;
 
@@ -3085,7 +3134,17 @@ private:
             const uint16_t* upload_indices = m_scratch_indices.data();
             size_t upload_icount = m_scratch_indices.size();
 
-            if (can_smooth_terrain)
+            if (effective_cloth_hint != 0u)
+            {
+                if (ApplyClothSubdivision(effective_cloth_hint))
+                {
+                    upload_verts = m_subdiv_verts.data();
+                    upload_vcount = m_subdiv_verts.size();
+                    upload_indices = m_subdiv_indices.data();
+                    upload_icount = m_subdiv_indices.size();
+                }
+            }
+            else if (can_smooth_terrain)
             {
                 const auto t0 = m_perf_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 const bool ok = ApplySmartTerrainTessellation();
@@ -3130,6 +3189,11 @@ private:
                 EvictStaticGpuCacheLru(256u);
             }
 
+            const bool push_auto_cloth = (effective_cloth_hint != 0u && explicit_cloth_hint == 0u);
+            if (push_auto_cloth)
+            {
+                zhr_vk_set_material_hint(effective_cloth_hint);
+            }
             const uint32_t gpu_vb = zhr_vk_create_vertex_buffer(upload_verts, upload_vcount);
             const uint32_t gpu_ib = zhr_vk_create_index_buffer(upload_indices, upload_icount);
             if (gpu_vb != 0u && gpu_ib != 0u)
@@ -3138,21 +3202,41 @@ private:
                 cached.gpu_vb = gpu_vb;
                 cached.gpu_ib = gpu_ib;
                 cached.index_count = static_cast<uint32_t>(upload_icount);
+                cached.cloth_hint = effective_cloth_hint;
                 cached.last_used_frame = g_zhr_frame_counter.load(std::memory_order_relaxed);
                 m_static_gpu_cache.emplace(*static_key, cached);
                 zhr_vk_draw_indexed(gpu_vb, gpu_ib, cached.index_count, 0u, 0);
+                if (push_auto_cloth)
+                {
+                    zhr_vk_set_material_hint(0u);
+                }
                 return D3D_OK;
             }
             if (gpu_vb != 0u) zhr_vk_destroy_buffer(gpu_vb);
             if (gpu_ib != 0u) zhr_vk_destroy_buffer(gpu_ib);
 
             zhr_vk_draw_dynamic(upload_verts, upload_vcount, upload_indices, upload_icount);
+            if (push_auto_cloth)
+            {
+                zhr_vk_set_material_hint(0u);
+            }
             return D3D_OK;
         }
 
         if (m_perf_enabled)
         {
             ++m_perf_dynamic_draws;
+        }
+
+        // Dynamic/skinned cloth draws (e.g., skinned FLAG*/BANNER* meshes): subdivide + pin weights in-place.
+        if (effective_cloth_hint != 0u && ApplyClothSubdivision(effective_cloth_hint))
+        {
+            zhr_vk_draw_dynamic(
+                m_subdiv_verts.data(),
+                m_subdiv_verts.size(),
+                m_subdiv_indices.data(),
+                m_subdiv_indices.size());
+            return D3D_OK;
         }
 
         // Dynamic terrain draws (3-way extra blend tiles, roads, or momentarily muzzle-lit tiles):
@@ -3273,6 +3357,203 @@ private:
     //   directly from WorldHeightMap across all VB tile boundaries, 3-way blends, cloud passes, shroud, and roads.
     // - Flat buildable plains (slope == 0) remain 100% flat with zero extra triangles and zero foundation clipping;
     //   hills, cliffs, shorelines, craters, and embankments adaptively refine from 10u -> 5u -> 2.5u with 0 T-junctions.
+    // Detects unnamed hinged cloth sheets (e.g. USA/GLA Command Center `HOUSECOLOR04..15` flag strips
+    // and GLA `MESH21..26`/`PLANE23..24` canopy strips) from their local-space hinged thin-sheet geometry.
+    // Zero Hour models many flags as back-to-back opposing quads (`D3DCULL_CCW`), so we verify that ALL
+    // triangle face normals are nearly parallel/antiparallel to a single sheet axis — rejecting all 3D boxes/crates.
+    uint32_t DetectUnnamedHingedClothKind() const
+    {
+        if (m_scratch_verts.size() < 4 || m_scratch_verts.size() > 64 || m_scratch_indices.size() < 6)
+            return 0u;
+        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f, minZ = 1e9f, maxZ = -1e9f;
+        for (const auto& v : m_scratch_verts)
+        {
+            minX = std::min(minX, v.position[0]); maxX = std::max(maxX, v.position[0]);
+            minY = std::min(minY, v.position[1]); maxY = std::max(maxY, v.position[1]);
+            minZ = std::min(minZ, v.position[2]); maxZ = std::max(maxZ, v.position[2]);
+        }
+        const float sx = maxX - minX;
+        const float sy = maxY - minY;
+        const float sz = maxZ - minZ;
+        const float maxXY = std::max(sx, sy);
+        if (maxXY < 2.2f || maxXY > 22.0f || sz > maxXY * 0.55f)
+            return 0u;
+
+        // Verify thin-sheet normal coherence: every non-degenerate triangle must have |dot(n_ref, n_t)| >= 0.45.
+        // Any 3D box, wall, strut, or crate has orthogonal faces with |dot| ~= 0 and is rejected immediately.
+        float ref_nx = 0.0f, ref_ny = 0.0f, ref_nz = 0.0f;
+        bool has_ref = false;
+        const size_t tcnt = m_scratch_indices.size() / 3;
+        for (size_t t = 0; t < tcnt; ++t)
+        {
+            const float* p0 = m_scratch_verts[m_scratch_indices[t * 3 + 0]].position;
+            const float* p1 = m_scratch_verts[m_scratch_indices[t * 3 + 1]].position;
+            const float* p2 = m_scratch_verts[m_scratch_indices[t * 3 + 2]].position;
+            const float e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+            const float e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
+            const float nx = e1y * e2z - e1z * e2y;
+            const float ny = e1z * e2x - e1x * e2z;
+            const float nz = e1x * e2y - e1y * e2x;
+            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl < 1e-4f) continue;
+            const float inx = nx / nl, iny = ny / nl, inz = nz / nl;
+            if (!has_ref)
+            {
+                ref_nx = inx; ref_ny = iny; ref_nz = inz;
+                has_ref = true;
+            }
+            else
+            {
+                const float d = std::fabs(ref_nx * inx + ref_ny * iny + ref_nz * inz);
+                if (d < 0.45f)
+                    return 0u;
+            }
+        }
+        if (!has_ref)
+            return 0u;
+
+        // Hinged along local X=0 (flags & flowing canopies in Zero Hour bone chains)
+        if (minX >= -0.35f && minX <= 0.35f && maxX >= 2.2f && maxX <= 12.0f && sy >= 3.5f)
+        {
+            return (sy >= 12.0f) ? 8u : 7u;
+        }
+        // Hanging banner hinged along local Y=0 (e.g. China Airfield banners)
+        if (maxY >= -0.35f && maxY <= 0.35f && minY <= -2.2f && minY >= -12.0f && sx >= 2.2f && sz < 1.5f)
+        {
+            return 7u;
+        }
+        return 0u;
+    }
+
+    // Subdivides flags, banners, and canopies into a smooth rippling cloth grid and computes per-vertex
+    // cloth pinning weight (`uv1.x` = flex [0 pinned -> 1 free]) + cross-axis coord (`uv1.y`) for GPU wind sim.
+    bool ApplyClothSubdivision(uint32_t cloth_kind)
+    {
+        if (m_scratch_verts.empty() || m_scratch_indices.size() < 6)
+            return false;
+        m_subdiv_verts = m_scratch_verts;
+        m_subdiv_indices = m_scratch_indices;
+
+        // Uniformly subdivide up to 2-3 levels until the cloth sheet has crisp ripple resolution (~32..160 tris).
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            const size_t tcnt = m_subdiv_indices.size() / 3;
+            if (tcnt >= 32 || tcnt * 4 > 512 || m_subdiv_verts.size() > 1536)
+                break;
+            std::vector<uint16_t> next_indices;
+            next_indices.reserve(m_subdiv_indices.size() * 4);
+            m_edge_midpoints.clear();
+            auto get_mid = [&](uint16_t ia, uint16_t ib) -> uint16_t {
+                const uint32_t lo = ia < ib ? ia : ib;
+                const uint32_t hi = ia < ib ? ib : ia;
+                const uint32_t key = (lo << 16) | hi;
+                auto it = m_edge_midpoints.find(key);
+                if (it != m_edge_midpoints.end()) return it->second;
+                const ZhrVertexWw3d& a = m_subdiv_verts[ia];
+                const ZhrVertexWw3d& b = m_subdiv_verts[ib];
+                ZhrVertexWw3d m{};
+                for (int k = 0; k < 3; ++k) m.position[k] = 0.5f * (a.position[k] + b.position[k]);
+                float nx = a.normal[0] + b.normal[0];
+                float ny = a.normal[1] + b.normal[1];
+                float nz = a.normal[2] + b.normal[2];
+                const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (nl > 1e-4f) { m.normal[0] = nx / nl; m.normal[1] = ny / nl; m.normal[2] = nz / nl; }
+                else { m.normal[0] = a.normal[0]; m.normal[1] = a.normal[1]; m.normal[2] = a.normal[2]; }
+                for (int k = 0; k < 4; ++k) m.color[k] = 0.5f * (a.color[k] + b.color[k]);
+                m.uv0[0] = 0.5f * (a.uv0[0] + b.uv0[0]);
+                m.uv0[1] = 0.5f * (a.uv0[1] + b.uv0[1]);
+                m.uv1[0] = 0.5f * (a.uv1[0] + b.uv1[0]);
+                m.uv1[1] = 0.5f * (a.uv1[1] + b.uv1[1]);
+                const uint16_t idx = static_cast<uint16_t>(m_subdiv_verts.size());
+                m_subdiv_verts.push_back(m);
+                m_edge_midpoints.emplace(key, idx);
+                return idx;
+            };
+            for (size_t t = 0; t < tcnt; ++t)
+            {
+                const uint16_t i0 = m_subdiv_indices[t * 3 + 0];
+                const uint16_t i1 = m_subdiv_indices[t * 3 + 1];
+                const uint16_t i2 = m_subdiv_indices[t * 3 + 2];
+                const uint16_t m01 = get_mid(i0, i1);
+                const uint16_t m12 = get_mid(i1, i2);
+                const uint16_t m20 = get_mid(i2, i0);
+                next_indices.push_back(i0);  next_indices.push_back(m01); next_indices.push_back(m20);
+                next_indices.push_back(m01); next_indices.push_back(i1);  next_indices.push_back(m12);
+                next_indices.push_back(m20); next_indices.push_back(m12); next_indices.push_back(i2);
+                next_indices.push_back(m01); next_indices.push_back(m12); next_indices.push_back(m20);
+            }
+            m_subdiv_indices.swap(next_indices);
+        }
+
+        // Compute local bounds and assign automatic pinning weights into uv1 (x=flex, y=cross_coord).
+        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f, minZ = 1e9f, maxZ = -1e9f;
+        for (const auto& v : m_subdiv_verts)
+        {
+            minX = std::min(minX, v.position[0]); maxX = std::max(maxX, v.position[0]);
+            minY = std::min(minY, v.position[1]); maxY = std::max(maxY, v.position[1]);
+            minZ = std::min(minZ, v.position[2]); maxZ = std::max(maxZ, v.position[2]);
+        }
+        const float sx = std::max(maxX - minX, 0.01f);
+        const float sy = std::max(maxY - minY, 0.01f);
+        const float sz = std::max(maxZ - minZ, 0.01f);
+        const bool hinged_x0 = (minX >= -0.45f && minX <= 0.45f && maxX > 0.9f);
+        const bool hinged_y0 = (!hinged_x0 && maxY >= -0.45f && maxY <= 0.45f && minY < -0.9f);
+        const bool is_canopy = (cloth_kind == 8u);
+        // Zero Hour builds multi-strip animated flags & canopies as chained bone segments (sx ~ 3..5.5u).
+        // Pinning both hinge seams (sin(pi * u)) keeps adjacent segments 100% watertight while billowing smoothly.
+        const bool is_bone_chain_strip = hinged_x0 && (sx < 6.0f);
+
+        for (auto& v : m_subdiv_verts)
+        {
+            float flex = 0.0f;
+            float cross_u = 0.0f;
+            if (is_bone_chain_strip)
+            {
+                const float u = std::clamp((v.position[0] - minX) / sx, 0.0f, 1.0f);
+                const float w = std::clamp((v.position[1] - minY) / sy, 0.0f, 1.0f);
+                flex = std::sin(u * 3.14159265f);
+                cross_u = w;
+            }
+            else if (hinged_x0)
+            {
+                flex = std::clamp((v.position[0] - minX) / sx, 0.0f, 1.0f);
+                cross_u = std::clamp((v.position[1] - minY) / sy, 0.0f, 1.0f);
+            }
+            else if (hinged_y0)
+            {
+                flex = std::clamp((maxY - v.position[1]) / sy, 0.0f, 1.0f);
+                cross_u = std::clamp((v.position[0] - minX) / sx, 0.0f, 1.0f);
+            }
+            else if (is_canopy)
+            {
+                // 4-corner anchored canopy/tarp: corners stay pinned (flex=0), interior & eaves billow smoothly.
+                const float u = std::clamp((v.position[0] - minX) / sx, 0.0f, 1.0f);
+                const float w = std::clamp((v.position[1] - minY) / sy, 0.0f, 1.0f);
+                const float su = std::sin(u * 3.14159265f);
+                const float sw = std::sin(w * 3.14159265f);
+                flex = std::clamp(su * sw * 0.85f + 0.25f * std::max(su * (1.0f - std::fabs(2.0f * w - 1.0f)), sw * (1.0f - std::fabs(2.0f * u - 1.0f))), 0.0f, 1.0f);
+                cross_u = w;
+            }
+            else
+            {
+                // Unhinged single-piece flag: pin along the flagpole edge.
+                if (sx >= sy && sx >= sz)
+                {
+                    flex = std::clamp((v.position[0] - minX) / sx, 0.0f, 1.0f);
+                    cross_u = std::clamp((v.position[1] - minY) / sy, 0.0f, 1.0f);
+                }
+                else
+                {
+                    flex = std::clamp((v.position[1] - minY) / sy, 0.0f, 1.0f);
+                    cross_u = std::clamp((v.position[0] - minX) / sx, 0.0f, 1.0f);
+                }
+            }
+            v.uv1[0] = flex;
+            v.uv1[1] = cross_u;
+        }
+        return true;
+    }
+
     bool ApplySmartTerrainTessellation()
     {
         const ZhrTerrainHeightmapState hm = g_zhr_terrain_hm;
@@ -3639,6 +3920,191 @@ private:
             }
         }
 
+        // --- Pass 0B: Universal 3D Planar Circular-Loop Detector ---
+        // Automatically finds EVERY 2002 low-poly polygonal circle (5..20 sides) in ANY 3D orientation:
+        // wheels & tires (X/Y-axis), tilted radar dishes, cannon barrels, missile tubes, jet nozzles,
+        // domes, spires, cooling towers, AND flat-capped polygonal pillars — while mathematically
+        // rejecting every 90-degree box, wall, crate, doorway, or rectangular roof.
+        struct DetectedCircle3D
+        {
+            float cx, cy, cz;
+            float ax, ay, az; // unit plane normal
+            float r;
+        };
+        std::vector<DetectedCircle3D> detected_circles;
+        std::unordered_map<std::pair<uint64_t, uint64_t>, uint32_t, SpatialEdgeHash> p0_circle_edges;
+        std::unordered_map<std::pair<uint64_t, uint64_t>, uint32_t, SpatialEdgeHash> p1_circle_edges;
+        {
+            std::unordered_map<uint64_t, Vec3f> key_pos;
+            key_pos.reserve(in_vert_count);
+            for (size_t i = 0; i < in_vert_count; ++i)
+            {
+                key_pos.try_emplace(in_v_keys[i], Vec3f{m_scratch_verts[i].position[0], m_scratch_verts[i].position[1], m_scratch_verts[i].position[2]});
+            }
+            std::unordered_map<uint64_t, std::vector<uint64_t>> ring_adj;
+            ring_adj.reserve(key_pos.size());
+            for (const auto& kv : in_edge_map)
+            {
+                const EdgeIncidence& inc = kv.second;
+                bool keep = false;
+                if (inc.count == 1)
+                {
+                    keep = true;
+                }
+                else if (inc.count == 2)
+                {
+                    const Vec3f& n0 = face_normals[inc.t0];
+                    const Vec3f& n1 = face_normals[inc.t1];
+                    const float d = n0.x * n1.x + n0.y * n1.y + n0.z * n1.z;
+                    if (d < 0.985f)
+                    {
+                        keep = true;
+                    }
+                }
+                if (keep)
+                {
+                    ring_adj[kv.first.first].push_back(kv.first.second);
+                    ring_adj[kv.first.second].push_back(kv.first.first);
+                }
+            }
+            std::unordered_set<uint64_t> seen_loop_hashes;
+            std::vector<uint64_t> loop;
+            loop.reserve(24);
+            for (const auto& akv : ring_adj)
+            {
+                const uint64_t start = akv.first;
+                const Vec3f& p0 = key_pos[start];
+                for (uint64_t nxt : akv.second)
+                {
+                    const Vec3f& p1 = key_pos[nxt];
+                    const float d01x = p1.x - p0.x, d01y = p1.y - p0.y, d01z = p1.z - p0.z;
+                    const float l0 = std::sqrt(d01x * d01x + d01y * d01y + d01z * d01z);
+                    if (l0 < 0.1f) continue;
+                    auto it_n = ring_adj.find(nxt);
+                    if (it_n == ring_adj.end()) continue;
+                    for (uint64_t third : it_n->second)
+                    {
+                        if (third == start) continue;
+                        const Vec3f& p2 = key_pos[third];
+                        const float d12x = p2.x - p1.x, d12y = p2.y - p1.y, d12z = p2.z - p1.z;
+                        const float l1 = std::sqrt(d12x * d12x + d12y * d12y + d12z * d12z);
+                        if (l1 < 0.1f || std::max(l0, l1) > std::min(l0, l1) * 1.32f) continue;
+                        const float cos_t = (d01x * d12x + d01y * d12y + d01z * d12z) / (l0 * l1);
+                        // 14..78 deg turn per vertex (5..25-gon); mathematically rejects all 90-deg squares/boxes!
+                        if (cos_t < 0.20f || cos_t > 0.97f) continue;
+                        float pnx = d01y * d12z - d01z * d12y;
+                        float pny = d01z * d12x - d01x * d12z;
+                        float pnz = d01x * d12y - d01y * d12x;
+                        const float pnl = std::sqrt(pnx * pnx + pny * pny + pnz * pnz);
+                        if (pnl < 1e-5f) continue;
+                        pnx /= pnl; pny /= pnl; pnz /= pnl;
+
+                        loop.clear();
+                        loop.push_back(start);
+                        loop.push_back(nxt);
+                        loop.push_back(third);
+                        float prev_ux = d12x / l1, prev_uy = d12y / l1, prev_uz = d12z / l1;
+                        uint64_t cur = third;
+                        bool closed = false;
+                        for (int step = 0; step < 18; ++step)
+                        {
+                            auto it_c = ring_adj.find(cur);
+                            if (it_c == ring_adj.end()) break;
+                            const Vec3f& pc = key_pos[cur];
+                            uint64_t best = 0;
+                            bool has_best = false;
+                            float best_score = 1e9f;
+                            float best_ux = 0.0f, best_uy = 0.0f, best_uz = 0.0f;
+                            for (uint64_t cand : it_c->second)
+                            {
+                                if (cand == start && loop.size() >= 5)
+                                {
+                                    const float dcx = p0.x - pc.x, dcy = p0.y - pc.y, dcz = p0.z - pc.z;
+                                    const float lc = std::sqrt(dcx * dcx + dcy * dcy + dcz * dcz);
+                                    if (lc > 0.1f && std::max(lc, l0) <= std::min(lc, l0) * 1.35f)
+                                    {
+                                        const float ct = (prev_ux * dcx + prev_uy * dcy + prev_uz * dcz) / lc;
+                                        if (std::fabs(ct - cos_t) < 0.22f)
+                                        {
+                                            closed = true;
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                bool in_loop = false;
+                                for (uint64_t lk : loop) { if (lk == cand) { in_loop = true; break; } }
+                                if (in_loop) continue;
+                                const Vec3f& pq = key_pos[cand];
+                                const float pdev = std::fabs((pq.x - p0.x) * pnx + (pq.y - p0.y) * pny + (pq.z - p0.z) * pnz);
+                                if (pdev > l0 * 0.25f) continue;
+                                const float dcx = pq.x - pc.x, dcy = pq.y - pc.y, dcz = pq.z - pc.z;
+                                const float lc = std::sqrt(dcx * dcx + dcy * dcy + dcz * dcz);
+                                if (lc < 0.1f || std::max(lc, l0) > std::min(lc, l0) * 1.35f) continue;
+                                const float ux = dcx / lc, uy = dcy / lc, uz = dcz / lc;
+                                const float ct = prev_ux * ux + prev_uy * uy + prev_uz * uz;
+                                const float crx = prev_uy * uz - prev_uz * uy;
+                                const float cry = prev_uz * ux - prev_ux * uz;
+                                const float crz = prev_ux * uy - prev_uy * ux;
+                                if (crx * pnx + cry * pny + crz * pnz <= 0.0f) continue;
+                                const float err = std::fabs(ct - cos_t) + std::fabs(lc - l0) / l0;
+                                if (std::fabs(ct - cos_t) < 0.22f && err < best_score)
+                                {
+                                    best_score = err;
+                                    best = cand;
+                                    best_ux = ux; best_uy = uy; best_uz = uz;
+                                    has_best = true;
+                                }
+                            }
+                            if (closed || !has_best) break;
+                            loop.push_back(best);
+                            cur = best;
+                            prev_ux = best_ux; prev_uy = best_uy; prev_uz = best_uz;
+                        }
+                        if (closed && loop.size() >= 5 && loop.size() <= 20)
+                        {
+                            // Order-independent loop hash to avoid duplicate circle entries.
+                            uint64_t lhash = 0;
+                            for (uint64_t lk : loop) lhash ^= (lk * 0x9E3779B97F4A7C15ULL + 0x517CC1B727220A95ULL);
+                            if (seen_loop_hashes.find(lhash) != seen_loop_hashes.end()) continue;
+                            float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                            for (uint64_t lk : loop)
+                            {
+                                const Vec3f& pt = key_pos[lk];
+                                cx += pt.x; cy += pt.y; cz += pt.z;
+                            }
+                            const float inv_n = 1.0f / static_cast<float>(loop.size());
+                            cx *= inv_n; cy *= inv_n; cz *= inv_n;
+                            float min_r = 1e9f, max_r = 0.0f, sum_r = 0.0f, max_pdev = 0.0f;
+                            for (uint64_t lk : loop)
+                            {
+                                const Vec3f& pt = key_pos[lk];
+                                const float rx = pt.x - cx, ry = pt.y - cy, rz = pt.z - cz;
+                                const float r = std::sqrt(rx * rx + ry * ry + rz * rz);
+                                min_r = std::min(min_r, r);
+                                max_r = std::max(max_r, r);
+                                sum_r += r;
+                                max_pdev = std::max(max_pdev, std::fabs(rx * pnx + ry * pny + rz * pnz));
+                            }
+                            const float avg_r = sum_r * inv_n;
+                            if (avg_r >= 0.15f && min_r > 1e-4f && (max_r / min_r) <= 1.15f && max_pdev <= avg_r * 0.08f)
+                            {
+                                seen_loop_hashes.insert(lhash);
+                                const uint32_t cid = static_cast<uint32_t>(detected_circles.size());
+                                detected_circles.push_back(DetectedCircle3D{cx, cy, cz, pnx, pny, pnz, avg_r});
+                                for (size_t li = 0; li < loop.size(); ++li)
+                                {
+                                    const uint64_t ka = loop[li];
+                                    const uint64_t kb = loop[(li + 1) % loop.size()];
+                                    p0_circle_edges.try_emplace(make_spatial_edge(ka, kb), cid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Identify true curved-surface ring edges (excludes flat wall edges touching a single 45-deg bevel
         // and excludes interior chords of flat 90-deg cylinder caps).
         std::unordered_set<std::pair<uint64_t, uint64_t>, SpatialEdgeHash> p0_curved_edges;
@@ -3912,6 +4378,25 @@ private:
         std::unordered_set<std::pair<uint64_t, uint64_t>, SpatialEdgeHash> p1_curved_edges;
         p1_curved_edges.reserve(p0_curved_edges.size() * 4 + 32);
 
+        auto snap_midpoint_to_circle3d = [&](ZhrVertexWw3d& mid, uint32_t cid) {
+            const DetectedCircle3D& c = detected_circles[cid];
+            const float vx = mid.position[0] - c.cx;
+            const float vy = mid.position[1] - c.cy;
+            const float vz = mid.position[2] - c.cz;
+            const float proj_a = vx * c.ax + vy * c.ay + vz * c.az;
+            const float px = vx - proj_a * c.ax;
+            const float py = vy - proj_a * c.ay;
+            const float pz = vz - proj_a * c.az;
+            const float plen = std::sqrt(px * px + py * py + pz * pz);
+            if (plen > 1e-4f)
+            {
+                const float inv_p = c.r / plen;
+                mid.position[0] = c.cx + px * inv_p + proj_a * c.ax;
+                mid.position[1] = c.cy + py * inv_p + proj_a * c.ay;
+                mid.position[2] = c.cz + pz * inv_p + proj_a * c.az;
+            }
+        };
+
         auto get_midpoint_p1 = [&](uint16_t ia, uint16_t ib) -> uint16_t {
             const uint32_t lo = ia < ib ? ia : ib;
             const uint32_t hi = ia < ib ? ib : ia;
@@ -3923,7 +4408,17 @@ private:
             }
             const uint64_t ka = subdiv_keys[ia];
             const uint64_t kb = subdiv_keys[ib];
-            const bool is_ring_edge = (ka != kb) &&
+            uint32_t circle_id = UINT32_MAX;
+            if (ka != kb && !p0_circle_edges.empty())
+            {
+                auto cit = p0_circle_edges.find(make_spatial_edge(ka, kb));
+                if (cit != p0_circle_edges.end())
+                {
+                    circle_id = cit->second;
+                }
+            }
+            const bool is_ring_edge = (circle_id == UINT32_MAX) &&
+                                      (ka != kb) &&
                                       subdiv_has_curve[ia] && subdiv_has_curve[ib] &&
                                       (p0_curved_edges.find(make_spatial_edge(ka, kb)) != p0_curved_edges.end());
 
@@ -3932,7 +4427,25 @@ private:
             ZhrVertexWw3d mid = make_phong_midpoint(
                 m_subdiv_verts[ia], m_subdiv_verts[ib],
                 is_ring_edge, subdiv_curve_n[ia], subdiv_curve_n[ib],
-                0.44f, mid_cn, mid_hc);
+                (circle_id != UINT32_MAX) ? 0.0f : 0.44f, mid_cn, mid_hc);
+
+            if (circle_id != UINT32_MAX)
+            {
+                snap_midpoint_to_circle3d(mid, circle_id);
+                // Preserve radial curve normal on exact 3D circles so side walls shade smoothly.
+                const DetectedCircle3D& c = detected_circles[circle_id];
+                const float rx = mid.position[0] - c.cx;
+                const float ry = mid.position[1] - c.cy;
+                const float rz = mid.position[2] - c.cz;
+                const float pa = rx * c.ax + ry * c.ay + rz * c.az;
+                const float px = rx - pa * c.ax, py = ry - pa * c.ay, pz = rz - pa * c.az;
+                const float pl = std::sqrt(px * px + py * py + pz * pz);
+                if (pl > 1e-4f)
+                {
+                    mid_cn = {px / pl, py / pl, pz / pl};
+                    mid_hc = 1;
+                }
+            }
 
             // Preserve radial curve normal along straight axial cylinder edges so mid-height rings also refine in Pass 2.
             if (!mid_hc && subdiv_has_curve[ia] && subdiv_has_curve[ib])
@@ -3962,7 +4475,12 @@ private:
             subdiv_has_curve.push_back(mid_hc);
             m_edge_midpoints.emplace(key, new_idx);
 
-            if (is_ring_edge)
+            if (circle_id != UINT32_MAX)
+            {
+                if (ka != km) p1_circle_edges.try_emplace(make_spatial_edge(ka, km), circle_id);
+                if (km != kb) p1_circle_edges.try_emplace(make_spatial_edge(km, kb), circle_id);
+            }
+            else if (is_ring_edge)
             {
                 if (ka != km) p1_curved_edges.insert(make_spatial_edge(ka, km));
                 if (km != kb) p1_curved_edges.insert(make_spatial_edge(km, kb));
@@ -4028,6 +4546,15 @@ private:
             p2_indices.reserve(m_subdiv_indices.size() * 2);
             m_edge_midpoints.clear();
 
+            auto find_p1_circle = [&](uint16_t ia, uint16_t ib) -> uint32_t {
+                if (p1_circle_edges.empty()) return UINT32_MAX;
+                const uint64_t ka = subdiv_keys[ia];
+                const uint64_t kb = subdiv_keys[ib];
+                if (ka == kb) return UINT32_MAX;
+                auto cit = p1_circle_edges.find(make_spatial_edge(ka, kb));
+                return (cit != p1_circle_edges.end()) ? cit->second : UINT32_MAX;
+            };
+
             auto is_p1_curved_ring = [&](uint16_t ia, uint16_t ib) -> bool {
                 if (!subdiv_has_curve[ia] || !subdiv_has_curve[ib]) return false;
                 const uint64_t ka = subdiv_keys[ia];
@@ -4046,8 +4573,13 @@ private:
                 {
                     return false;
                 }
-                // Compact polygonal cylinders/vents/pipes/wheels (edge >= 0.5 world units -> 12->24+ sides!)
-                if (dist_sq >= 0.25f && is_p1_curved_ring(ia, ib))
+                // Universal 3D detected circles (wheels, tires, radar dishes, gun barrels, pillar caps, domes, spires: 5->20, 6->24, 8->32!)
+                if (dist_sq >= 0.04f && find_p1_circle(ia, ib) != UINT32_MAX)
+                {
+                    return true;
+                }
+                // Compact polygonal cylinders/vents/pipes/wheels (edge >= 0.2 world units -> 12->24+ sides!)
+                if (dist_sq >= 0.04f && is_p1_curved_ring(ia, ib))
                 {
                     return true;
                 }
@@ -4084,13 +4616,18 @@ private:
                 {
                     return it->second;
                 }
-                const bool ring = is_p1_curved_ring(ia, ib);
+                const uint32_t circle_id = find_p1_circle(ia, ib);
+                const bool ring = (circle_id == UINT32_MAX) && is_p1_curved_ring(ia, ib);
                 Vec3f mid_cn{};
                 uint8_t mid_hc = 0;
                 ZhrVertexWw3d mid = make_phong_midpoint(
                     m_subdiv_verts[ia], m_subdiv_verts[ib],
                     ring, subdiv_curve_n[ia], subdiv_curve_n[ib],
-                    0.34f, mid_cn, mid_hc);
+                    (circle_id != UINT32_MAX) ? 0.0f : 0.34f, mid_cn, mid_hc);
+                if (circle_id != UINT32_MAX)
+                {
+                    snap_midpoint_to_circle3d(mid, circle_id);
+                }
                 const uint16_t new_idx = static_cast<uint16_t>(m_subdiv_verts.size());
                 m_subdiv_verts.push_back(mid);
                 m_edge_midpoints.emplace(key, new_idx);
@@ -5155,6 +5692,12 @@ extern "C" void zhr_vk_set_terrain_heightmap(
 extern "C" void zhr_vk_set_terrain_pass_active(bool active)
 {
     g_zhr_terrain_pass_active.store(active, std::memory_order_relaxed);
+}
+
+extern "C" void zhr_vk_set_cloth_hint(uint32_t hint)
+{
+    g_zhr_cloth_hint.store(hint, std::memory_order_relaxed);
+    zhr_vk_set_material_hint(hint);
 }
 
 extern "C" bool zhr_vk_sample_smooth_terrain_z(float wx, float wy, float* out_z)

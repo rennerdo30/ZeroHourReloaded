@@ -47,6 +47,71 @@
 #include "dx8fvf.h"
 #include "dx8caps.h"
 #include "dx8rendererdebugger.h"
+#ifdef ZHR_USE_VULKAN
+#include <cctype>
+extern "C" void zhr_vk_set_cloth_hint(uint32_t hint);
+namespace {
+bool zhrContainsCI(const char* hay, const char* needle)
+{
+	if (!hay || !needle || !*needle) return false;
+	for (const char* p = hay; *p; ++p)
+	{
+		const char* a = p;
+		const char* b = needle;
+		while (*a && *b && std::toupper(static_cast<unsigned char>(*a)) == std::toupper(static_cast<unsigned char>(*b)))
+		{
+			++a;
+			++b;
+		}
+		if (!*b) return true;
+	}
+	return false;
+}
+
+uint32_t zhrClassifyClothMeshName(const char* name)
+{
+	if (!name || !*name) return 0u;
+	if (zhrContainsCI(name, "ESCAPE") || zhrContainsCI(name, "POLE") ||
+	    zhrContainsCI(name, "MAST") || zhrContainsCI(name, "POST"))
+	{
+		return 0u;
+	}
+	if (zhrContainsCI(name, "FLAG") || zhrContainsCI(name, "BANNER") ||
+	    zhrContainsCI(name, "PENNANT") || zhrContainsCI(name, "STREAMER") ||
+	    zhrContainsCI(name, "SAIL"))
+	{
+		return 7u;
+	}
+	if (zhrContainsCI(name, "TARP") || zhrContainsCI(name, "CLOTH") ||
+	    zhrContainsCI(name, "CANOPY") || zhrContainsCI(name, "AWNING") ||
+	    zhrContainsCI(name, "CURTAIN"))
+	{
+		return 8u;
+	}
+	return 0u;
+}
+
+struct ZhrClothHintGuard
+{
+	uint32_t activeHint{0u};
+	explicit ZhrClothHintGuard(const char* meshName)
+	{
+		activeHint = zhrClassifyClothMeshName(meshName);
+		if (activeHint != 0u)
+		{
+			zhr_vk_set_cloth_hint(activeHint);
+		}
+	}
+	~ZhrClothHintGuard()
+	{
+		if (activeHint != 0u)
+		{
+			zhr_vk_set_cloth_hint(0u);
+		}
+	}
+};
+} // namespace
+#endif
 #include "WWDebug/wwdebug.h"
 #include "WWDebug/wwprofile.h"
 #include "WWDebug/wwmemlog.h"
@@ -1868,6 +1933,9 @@ void DX8TextureCategoryClass::Render()
 		*/
 		//(gth) this if statement's contents are not tabbed to avoid perforce merge problems...
 		if (!DX8RendererDebugger::Is_Enabled() || !mesh->Is_Disabled_By_Debugger()) {
+#ifdef ZHR_USE_VULKAN
+		ZhrClothHintGuard zhrClothGuard(mesh->Get_Name());
+#endif
 
 		if ((!!mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)) && WW3D::Is_Sorting_Enabled()) {
 			renderer->Render_Sorted(mesh->Get_Base_Vertex_Offset(),mesh->Get_Bounding_Sphere());

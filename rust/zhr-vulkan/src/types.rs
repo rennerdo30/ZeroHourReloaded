@@ -182,6 +182,8 @@ pub struct DrawUniforms {
     /// `[s0_mode, s0_src_idx, s1_mode, s1_src_idx]`
     /// mode: 0 = passthrough, 1 = transform raw UV, 2 = camera-space pos, 3 = camera-space pos * tex_matrix.
     pub tex_gen_params: [u32; 4],
+    /// `[blast_x, blast_y, blast_z, blast_strength]` — recent explosion shockwave driving reactive cloth sim.
+    pub wind_blast: [f32; 4],
 }
 
 impl Default for DrawUniforms {
@@ -203,6 +205,7 @@ impl Default for DrawUniforms {
             tex_matrix0: Mat4::IDENTITY.to_cols_array_2d(),
             tex_matrix1: Mat4::IDENTITY.to_cols_array_2d(),
             tex_gen_params: [0, 0, 0, 1],
+            wind_blast: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }

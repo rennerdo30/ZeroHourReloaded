@@ -449,6 +449,7 @@ struct DrawUniforms {
     tex_matrix0: mat4x4<f32>,
     tex_matrix1: mat4x4<f32>,
     tex_gen_params: vec4<u32>,
+    wind_blast: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: DrawUniforms;
@@ -493,13 +494,74 @@ fn eval_tex_gen(mode: u32, src_idx: u32, tex_mat: mat4x4<f32>, view_pos: vec4<f3
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let world_pos = u.world * vec4<f32>(in.position, 1.0);
-    let view_pos = u.view * world_pos;
-    let clip_pos = u.projection * view_pos;
+    var world_pos = u.world * vec4<f32>(in.position, 1.0);
 
     let n_world_raw = (u.world * vec4<f32>(in.normal, 0.0)).xyz;
     let n_len = length(n_world_raw);
-    let n_world = select(vec3<f32>(0.0, 0.0, 1.0), n_world_raw / max(n_len, 0.0001), n_len > 0.0001);
+    var n_world = select(vec3<f32>(0.0, 0.0, 1.0), n_world_raw / max(n_len, 0.0001), n_len > 0.0001);
+
+    // Real-Time GPU Wind + Explosion Blast-Reactive Cloth Simulation (flags, banners, tarps & canopies):
+    // `water_params.y == 6.0` (flag/banner), `7.0` (canopy/tarp); `in.uv1.x` = pin flexibility [0..1], `in.uv1.y` = cross coord.
+    if (u.camera_pos_and_pbr.w > 0.5 && u.water_params.y >= 5.5) {
+        let flex = clamp(in.uv1.x, 0.0, 1.0);
+        if (flex > 0.001) {
+            let is_flag = u.water_params.y < 6.5;
+            let t = u.water_params.x;
+            let cross_u = in.uv1.y;
+            let f_env = flex * (0.45 + 0.55 * flex);
+
+            // Canonical sign-invariant sheet normal so back-to-back flag faces displace in exact lockstep (zero ballooning).
+            let n_sign = select(-1.0, 1.0, (n_world.x + n_world.y * 0.73 + n_world.z * 0.41) >= 0.0);
+            let disp_dir = n_world * n_sign;
+
+            // Coherent battlefield wind gust envelope & continuous world-space wave phase (flows seamlessly across multi-strip flags).
+            let gust_phase = world_pos.x * 0.014 + world_pos.y * 0.011;
+            let gust = 0.78 + 0.34 * sin(t * 0.95 + gust_phase) + 0.16 * sin(t * 2.15 - gust_phase * 1.4);
+
+            let speed = select(3.8, 7.6, is_flag);
+            let w_travel = world_pos.x * 0.48 + world_pos.y * 0.38 + world_pos.z * 0.22;
+            let p1 = w_travel - t * speed;
+            let p2 = w_travel * 1.95 - t * (speed * 1.65) + cross_u * 2.8;
+            let p3 = cross_u * 4.4 + w_travel * 0.65 - t * (speed * 0.90);
+
+            let base_amp = select(0.48, 0.85, is_flag) * gust;
+            var disp_n = (sin(p1) * 0.62 + sin(p2) * 0.28 + sin(p3) * 0.16) * base_amp * f_env;
+            var d_wave = (cos(p1) * 0.62 * 0.48 + cos(p2) * 0.28 * 0.94) * base_amp * f_env * 8.0;
+
+            // Blast shockwave impulse from recent battlefield explosions (whips nearby flags & canopies outward).
+            var blast_push = vec3<f32>(0.0);
+            let blast_str = u.wind_blast.w;
+            if (blast_str > 0.01) {
+                let from_blast = world_pos.xyz - u.wind_blast.xyz;
+                let b_dist = length(from_blast);
+                if (b_dist < 240.0) {
+                    let b_fall = (1.0 - b_dist / 240.0);
+                    let b_imp = b_fall * b_fall * blast_str;
+                    let b_dir = from_blast / max(b_dist, 0.01);
+                    let whip = sin(w_travel * 1.6 - t * 22.0);
+                    blast_push = b_dir * (b_imp * 1.85 * f_env);
+                    disp_n = disp_n + whip * b_imp * 0.95 * f_env;
+                    d_wave = d_wave + cos(w_travel * 1.6 - t * 22.0) * b_imp * 3.8 * f_env;
+                }
+            }
+
+            // Subtle gravity drape when wind lulls + horizontal cloth billow along canonical sheet normal.
+            let sag_z = select(-0.16, -0.22, is_flag) * f_env * (1.25 - 0.35 * gust);
+            world_pos = vec4<f32>(world_pos.xyz + disp_dir * disp_n + vec3<f32>(0.0, 0.0, sag_z) + blast_push, 1.0);
+
+            // Analytical cloth normal perturbation in canonical frame (keeps front & back normals exact opposites).
+            let up_ref = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(disp_dir.z) > 0.92);
+            let tangent = normalize(cross(up_ref, disp_dir));
+            let bitangent = normalize(cross(disp_dir, tangent));
+            let slope_u = clamp(d_wave * 0.22, -0.68, 0.68);
+            let slope_v = clamp(cos(p3) * 0.42 * base_amp * f_env, -0.40, 0.40);
+            let n_canon = normalize(disp_dir - tangent * slope_u - bitangent * slope_v);
+            n_world = n_canon * n_sign;
+        }
+    }
+
+    let view_pos = u.view * world_pos;
+    let clip_pos = u.projection * view_pos;
 
     var lit_rgb = in.color.rgb;
     if (u.ambient_and_lighting.w > 0.5) {
@@ -783,7 +845,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
         let vol_density = clamp(col.a * mix(0.84, 1.06, vol_fbm * (0.45 + 0.55 * sphere_z)), 0.0, 1.0);
         col = vec4<f32>(col.rgb * lit_factor, vol_density * soft_depth);
-    } else if (pbr_active && u.water_params.y >= 4.5) {
+    } else if (pbr_active && u.water_params.y >= 4.5 && u.water_params.y < 5.5) {
         // Volumetric 3D Fire, Explosions & Plasma (Additive Particles):
         // - Animated upward 3D FBM flame turbulence + physically-based blackbody HDR core
         // - Soft per-pixel depth intersection fade against terrain & structures
@@ -816,7 +878,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let soft_depth = select(1.0, smoothstep(0.0, 6.0, depth_diff), has_depth);
 
         col = vec4<f32>(fire_rgb * soft_depth, col.a * soft_depth);
-    } else if (pbr_active && u.water_params.y > 0.5) {
+    } else if (pbr_active && u.water_params.y > 0.5 && u.water_params.y < 1.5) {
         // Next-Gen Vulkan 1.3 Modern Coastal & Oceanic Water:
         // - True per-pixel depth & screen-space seabed/rock refraction from pre-water HDR snapshot
         // - Smooth fluid multi-directional ocean swells + soft sunlit capillary sheen

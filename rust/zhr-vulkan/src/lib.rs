@@ -146,6 +146,7 @@ pub struct VulkanRenderer {
     proj_matrix: Mat4,
     graphics: GraphicsSettings,
     material_hint: u32,
+    wind_blast: Option<([f32; 3], f32, Instant)>,
     shader: ShaderKey,
     stencil: StencilState,
     active_texture: TextureId,
@@ -392,6 +393,7 @@ impl VulkanRenderer {
             proj_matrix: Mat4::IDENTITY,
             graphics,
             material_hint: 0,
+            wind_blast: None,
             shader: ShaderKey::OPAQUE_3D,
             stencil: StencilState::default(),
             active_texture: default_white_texture,
@@ -847,6 +849,24 @@ impl VulkanRenderer {
 
     pub fn set_material_hint(&mut self, hint: u32) {
         self.material_hint = hint;
+    }
+
+    /// Registers a 3D battlefield explosion shockwave that whips nearby flags & canopies outward.
+    pub fn add_wind_impulse(&mut self, x: f32, y: f32, z: f32, strength: f32) {
+        if !strength.is_finite() || strength <= 0.01 {
+            return;
+        }
+        let now = Instant::now();
+        let clamped = strength.clamp(0.1, 4.0);
+        // Keep the stronger impulse if an even larger blast is still actively decaying.
+        if let Some((_, cur_str, cur_t)) = self.wind_blast {
+            let dt = now.saturating_duration_since(cur_t).as_secs_f32();
+            let decayed = cur_str * (-dt * 2.4).exp();
+            if decayed > clamped * 1.15 {
+                return;
+            }
+        }
+        self.wind_blast = Some(([x, y, z], clamped, now));
     }
 
     pub fn set_ambient(&mut self, color: Vec3) {
@@ -1513,12 +1533,24 @@ impl VulkanRenderer {
             && self.graphics.mode != GraphicsMode::Classic
             && self.graphics.pbr_lighting
             && af.water_depth_captured;
+        let is_cloth_flag = is_3d_pass
+            && self.material_hint == 7
+            && self.graphics.mode != GraphicsMode::Classic
+            && self.graphics.pbr_lighting;
+        let is_cloth_canopy = is_3d_pass
+            && self.material_hint == 8
+            && self.graphics.mode != GraphicsMode::Classic
+            && self.graphics.pbr_lighting;
         let glass_hint = if use_ui_glass {
             if self.graphics.mode == GraphicsMode::SplitScreen {
                 3.0
             } else {
                 2.0
             }
+        } else if is_cloth_flag {
+            6.0
+        } else if is_cloth_canopy {
+            7.0
         } else if is_vol_fire {
             5.0
         } else if is_vol_smoke {
@@ -1542,6 +1574,22 @@ impl VulkanRenderer {
             .frozen_time_sec
             .unwrap_or_else(|| self.start_time.elapsed().as_secs_f32());
         draw_uniforms.water_params = [time_sec, glass_hint, screen_inv_w, screen_inv_h];
+        if let Some((pos, str0, t0)) = self.wind_blast {
+            let dt = if self.frozen_time_sec.is_some() {
+                0.0
+            } else {
+                Instant::now().saturating_duration_since(t0).as_secs_f32()
+            };
+            let decayed = str0 * (-dt * 2.4).exp();
+            if decayed > 0.015 {
+                draw_uniforms.wind_blast = [pos[0], pos[1], pos[2], decayed];
+            } else {
+                draw_uniforms.wind_blast = [0.0; 4];
+                self.wind_blast = None;
+            }
+        } else {
+            draw_uniforms.wind_blast = [0.0; 4];
+        }
 
         let alignment = self.ctx.min_uniform_offset_alignment as usize;
         let dyn_offset = self.frames[slot_index]

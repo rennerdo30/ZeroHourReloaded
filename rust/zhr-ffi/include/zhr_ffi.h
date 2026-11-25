@@ -143,6 +143,7 @@ uint32_t zhr_vk_create_texture_2d_mips(
 void zhr_vk_set_graphics_mode(uint32_t mode, bool pbr_lighting, bool post_fx);
 void zhr_vk_set_remaster_textures(bool enabled);
 void zhr_vk_set_material_hint(uint32_t hint);
+void zhr_vk_add_wind_impulse(float x, float y, float z, float strength);
 uint32_t zhr_vk_get_graphics_mode(void);
 void zhr_vk_set_freeze_time(bool frozen);
 void zhr_vk_set_wireframe(bool enabled);

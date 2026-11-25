@@ -50,6 +50,9 @@
 #include "GameClient/Drawable.h"
 #include "GameClient/ParticleSys.h"
 #include "GameLogic/PartitionManager.h"
+#ifdef ZHR_USE_VULKAN
+extern "C" void zhr_vk_add_wind_impulse(float x, float y, float z, float strength);
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // PUBLIC DATA ////////////////////////////////////////////////////////////////////////////////////
@@ -391,6 +394,20 @@ public:
 		{
 			if (TheTacticalView)
 				TheTacticalView->shake(primary, m_shake);
+#ifdef ZHR_USE_VULKAN
+			float blastStrength = 1.0f;
+			switch (m_shake)
+			{
+				case View::SHAKE_SUBTLE:       blastStrength = 0.65f; break;
+				case View::SHAKE_NORMAL:       blastStrength = 1.25f; break;
+				case View::SHAKE_STRONG:       blastStrength = 2.0f;  break;
+				case View::SHAKE_SEVERE:       blastStrength = 2.8f;  break;
+				case View::SHAKE_CINE_EXTREME: blastStrength = 3.5f;  break;
+				case View::SHAKE_CINE_INSANE:  blastStrength = 4.0f;  break;
+				default:                       blastStrength = 1.25f; break;
+			}
+			zhr_vk_add_wind_impulse(primary->x, primary->y, primary->z, blastStrength);
+#endif
 		}
 		else
 		{
