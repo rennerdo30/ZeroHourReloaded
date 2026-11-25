@@ -3073,8 +3073,8 @@ private:
             !is_rhw &&
             prim_type == D3DPT_TRIANGLELIST &&
             prim_count >= 2u &&
-            prim_count <= 4096u &&
-            m_scratch_verts.size() <= 16384u;
+            prim_count <= 24000u &&
+            m_scratch_verts.size() <= 32768u;
 
         const uint32_t explicit_cloth_hint = g_zhr_cloth_hint.load(std::memory_order_relaxed);
         const bool can_cloth_candidate =
@@ -3585,6 +3585,7 @@ private:
             const float lin_z = SampleTerrainLinearZ(hm, v.position[0], v.position[1]);
             float bias = v.position[2] - lin_z;
             if (std::fabs(bias) < 0.02f) bias = 0.0f;
+            else if (bias > 0.02f && bias < 0.14f) bias = 0.14f; // scorch marks (+0.0625) clear bicubic terrain cleanly
             else bias = std::clamp(bias, -2.0f, 4.0f);
             v_bias[i] = bias;
 
@@ -3873,59 +3874,15 @@ private:
             }
         }
 
-        // Accumulate radial curve normals strictly across 7..78 degree polygonal creases
-        // (catches 5-sided 72-deg pentagonal vents [dot=0.309], 6-sided 60-deg hexagons [0.50],
-        // 8-sided 45-deg pipes [0.71], 12-gons [0.87], barrel roofs & arches,
-        // while strictly rejecting 90-deg square walls/boxes [dot~0.0] and 4-sided pyramids [dot<0.18]).
+        // --- Pass 0B & 0C: Universal 3D Planar Circular-Loop & Open Circular-Arc Detector ---
+        // Automatically finds EVERY 2002 low-poly polygonal circle (5..20 sides) and true smooth cylindrical arch
+        // (Quonset roofs, arched hangars, tunnels — >=4 equal coplanar segments sweeping >=75 deg on one exact 3D circle)
+        // in ANY 3D orientation (wheels/tires, exhaust fans, cannon barrels, domes, spires, pillars + flat caps)
+        // while mathematically rejecting ALL flat sloped tank armor plates, faceted turrets, boxes, walls, and crates!
         std::unordered_map<uint64_t, Vec3f> curve_normal_map;
-        curve_normal_map.reserve(in_vert_count / 2 + 16);
+        curve_normal_map.reserve(in_vert_count / 4 + 16);
         std::vector<uint8_t> curved_tri(tri_count, 0);
 
-        for (const auto& kv : in_edge_map)
-        {
-            const EdgeIncidence& inc = kv.second;
-            if (inc.count != 2)
-            {
-                continue;
-            }
-            const Vec3f& n0 = face_normals[inc.t0];
-            const Vec3f& n1 = face_normals[inc.t1];
-            const float d = n0.x * n1.x + n0.y * n1.y + n0.z * n1.z;
-            if (d > 0.20f && d < 0.985f)
-            {
-                const float sx = n0.x + n1.x;
-                const float sy = n0.y + n1.y;
-                const float sz = n0.z + n1.z;
-                Vec3f& ca = curve_normal_map[kv.first.first];
-                ca.x += sx; ca.y += sy; ca.z += sz;
-                Vec3f& cb = curve_normal_map[kv.first.second];
-                cb.x += sx; cb.y += sy; cb.z += sz;
-                curved_tri[inc.t0] = 1;
-                curved_tri[inc.t1] = 1;
-            }
-        }
-
-        for (auto it = curve_normal_map.begin(); it != curve_normal_map.end(); )
-        {
-            const float len = std::sqrt(it->second.x * it->second.x + it->second.y * it->second.y + it->second.z * it->second.z);
-            if (len > 0.01f)
-            {
-                it->second.x /= len;
-                it->second.y /= len;
-                it->second.z /= len;
-                ++it;
-            }
-            else
-            {
-                it = curve_normal_map.erase(it);
-            }
-        }
-
-        // --- Pass 0B: Universal 3D Planar Circular-Loop Detector ---
-        // Automatically finds EVERY 2002 low-poly polygonal circle (5..20 sides) in ANY 3D orientation:
-        // wheels & tires (X/Y-axis), tilted radar dishes, cannon barrels, missile tubes, jet nozzles,
-        // domes, spires, cooling towers, AND flat-capped polygonal pillars — while mathematically
-        // rejecting every 90-degree box, wall, crate, doorway, or rectangular roof.
         struct DetectedCircle3D
         {
             float cx, cy, cz;
@@ -3948,16 +3905,16 @@ private:
             {
                 const EdgeIncidence& inc = kv.second;
                 bool keep = false;
-                if (inc.count == 1)
+                if (inc.count != 2)
                 {
                     keep = true;
                 }
-                else if (inc.count == 2)
+                else
                 {
                     const Vec3f& n0 = face_normals[inc.t0];
                     const Vec3f& n1 = face_normals[inc.t1];
                     const float d = n0.x * n1.x + n0.y * n1.y + n0.z * n1.z;
-                    if (d < 0.985f)
+                    if (d < 0.9995f)
                     {
                         keep = true;
                     }
@@ -4064,7 +4021,6 @@ private:
                         }
                         if (closed && loop.size() >= 5 && loop.size() <= 20)
                         {
-                            // Order-independent loop hash to avoid duplicate circle entries.
                             uint64_t lhash = 0;
                             for (uint64_t lk : loop) lhash ^= (lk * 0x9E3779B97F4A7C15ULL + 0x517CC1B727220A95ULL);
                             if (seen_loop_hashes.find(lhash) != seen_loop_hashes.end()) continue;
@@ -4101,7 +4057,139 @@ private:
                                 }
                             }
                         }
+                        else if (!closed && loop.size() >= 4 && loop.size() <= 16 && cos_t >= 0.45f)
+                        {
+                            // Pass 0C: Strict Open Circular Arc (e.g. Quonset hangar roof / arched tunnel).
+                            // Fit circumcircle from (first, mid, last) in the arc plane and require ALL vertices
+                            // to lie strictly on that circle (max_r/min_r <= 1.06) with total sweep >= 72 degrees.
+                            uint64_t lhash = 0xA5C391E7B42D1053ULL;
+                            for (uint64_t lk : loop) lhash ^= (lk * 0x9E3779B97F4A7C15ULL + 0x517CC1B727220A95ULL);
+                            if (seen_loop_hashes.find(lhash) != seen_loop_hashes.end()) continue;
+
+                            const Vec3f& pa = key_pos[loop.front()];
+                            const Vec3f& pm = key_pos[loop[loop.size() / 2]];
+                            const Vec3f& pb = key_pos[loop.back()];
+                            // 2D orthonormal basis (u, v) in arc plane
+                            float ux = pb.x - pa.x, uy = pb.y - pa.y, uz = pb.z - pa.z;
+                            const float ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+                            if (ul < 0.3f) continue;
+                            ux /= ul; uy /= ul; uz /= ul;
+                            const float vx = pny * uz - pnz * uy;
+                            const float vy = pnz * ux - pnx * uz;
+                            const float vz = pnx * uy - pny * ux;
+
+                            const float bx = ul, by = 0.0f;
+                            const float mx = (pm.x - pa.x) * ux + (pm.y - pa.y) * uy + (pm.z - pa.z) * uz;
+                            const float my = (pm.x - pa.x) * vx + (pm.y - pa.y) * vy + (pm.z - pa.z) * vz;
+                            const float denom = 2.0f * (bx * my - by * mx);
+                            if (std::fabs(denom) < 1e-4f) continue;
+                            const float m2 = mx * mx + my * my;
+                            const float b2 = bx * bx;
+                            const float cuc = (b2 * my) / denom;
+                            const float cvc = (bx * m2 - b2 * mx) / denom;
+                            const float cx = pa.x + cuc * ux + cvc * vx;
+                            const float cy = pa.y + cuc * uy + cvc * vy;
+                            const float cz = pa.z + cuc * uz + cvc * vz;
+
+                            float min_r = 1e9f, max_r = 0.0f, sum_r = 0.0f, max_pdev = 0.0f;
+                            float min_e = 1e9f, max_e = 0.0f;
+                            for (size_t li = 0; li < loop.size(); ++li)
+                            {
+                                const Vec3f& pt = key_pos[loop[li]];
+                                const float rx = pt.x - cx, ry = pt.y - cy, rz = pt.z - cz;
+                                const float r = std::sqrt(rx * rx + ry * ry + rz * rz);
+                                min_r = std::min(min_r, r);
+                                max_r = std::max(max_r, r);
+                                sum_r += r;
+                                max_pdev = std::max(max_pdev, std::fabs(rx * pnx + ry * pny + rz * pnz));
+                                if (li + 1 < loop.size())
+                                {
+                                    const Vec3f& q = key_pos[loop[li + 1]];
+                                    const float el = std::sqrt((q.x - pt.x) * (q.x - pt.x) + (q.y - pt.y) * (q.y - pt.y) + (q.z - pt.z) * (q.z - pt.z));
+                                    min_e = std::min(min_e, el);
+                                    max_e = std::max(max_e, el);
+                                }
+                            }
+                            const float avg_r = sum_r / static_cast<float>(loop.size());
+                            const float turn_angle = std::acos(std::clamp(cos_t, -1.0f, 1.0f));
+                            const float total_sweep = turn_angle * static_cast<float>(loop.size() - 1);
+                            if (avg_r >= 1.5f && min_r > 1e-4f &&
+                                (max_r / min_r) <= 1.06f &&
+                                (max_e / std::max(min_e, 1e-4f)) <= 1.15f &&
+                                max_pdev <= avg_r * 0.04f &&
+                                total_sweep >= 1.25f) // >= ~72 deg arc
+                            {
+                                seen_loop_hashes.insert(lhash);
+                                const uint32_t cid = static_cast<uint32_t>(detected_circles.size());
+                                detected_circles.push_back(DetectedCircle3D{cx, cy, cz, pnx, pny, pnz, avg_r});
+                                for (size_t li = 0; li + 1 < loop.size(); ++li)
+                                {
+                                    p0_circle_edges.try_emplace(make_spatial_edge(loop[li], loop[li + 1]), cid);
+                                }
+                            }
+                        }
                     }
+                }
+            }
+        }
+
+        // Fast early-out: if a mesh has ZERO detected 3D circles/arcs and no large architectural wall/rock faces
+        // (e.g. crisp angular tank turrets, tank hulls, Humvees, crates, boxes), leave it 100% untouched & razor-sharp!
+        if (detected_circles.empty())
+        {
+            float max_edge_sq = 0.0f;
+            if (has_hm)
+            {
+                for (size_t t = 0; t < tri_count; ++t)
+                {
+                    const uint16_t i0 = m_scratch_indices[t * 3 + 0];
+                    const uint16_t i1 = m_scratch_indices[t * 3 + 1];
+                    const uint16_t i2 = m_scratch_indices[t * 3 + 2];
+                    const float* p[3] = {m_scratch_verts[i0].position, m_scratch_verts[i1].position, m_scratch_verts[i2].position};
+                    for (int e = 0; e < 3; ++e)
+                    {
+                        const float dx = p[(e + 1) % 3][0] - p[e][0];
+                        const float dy = p[(e + 1) % 3][1] - p[e][1];
+                        const float dz = p[(e + 1) % 3][2] - p[e][2];
+                        max_edge_sq = std::max(max_edge_sq, dx * dx + dy * dy + dz * dz);
+                    }
+                }
+            }
+            if (!has_hm || max_edge_sq < 64.0f)
+            {
+                return false;
+            }
+        }
+
+        // Smooth radial shading normals on vertices lying on detected 3D circles/arcs (side-wall faces only,
+        // leaving 90-degree flat pillar/drum caps and tire sidewalls razor-crisp!) and track per-vertex circle id
+        // so meridian ribs connecting concentric dome rings also curve smoothly in longitude.
+        std::unordered_map<uint64_t, uint32_t> vert_circle_map;
+        if (!p0_circle_edges.empty())
+        {
+            vert_circle_map.reserve(p0_circle_edges.size() * 2);
+            for (const auto& kv : p0_circle_edges)
+            {
+                vert_circle_map.try_emplace(kv.first.first, kv.second);
+                vert_circle_map.try_emplace(kv.first.second, kv.second);
+            }
+            for (const auto& kv : vert_circle_map)
+            {
+                const DetectedCircle3D& c = detected_circles[kv.second];
+                for (size_t i = 0; i < in_vert_count; ++i)
+                {
+                    if (in_v_keys[i] != kv.first) continue;
+                    const float rx = m_scratch_verts[i].position[0] - c.cx;
+                    const float ry = m_scratch_verts[i].position[1] - c.cy;
+                    const float rz = m_scratch_verts[i].position[2] - c.cz;
+                    const float pa = rx * c.ax + ry * c.ay + rz * c.az;
+                    const float px = rx - pa * c.ax, py = ry - pa * c.ay, pz = rz - pa * c.az;
+                    const float pl = std::sqrt(px * px + py * py + pz * pz);
+                    if (pl > 1e-4f)
+                    {
+                        curve_normal_map.try_emplace(kv.first, Vec3f{px / pl, py / pl, pz / pl});
+                    }
+                    break;
                 }
             }
         }
@@ -4172,9 +4260,9 @@ private:
             {
                 subdiv_curve_n[i] = it->second;
                 subdiv_has_curve[i] = 1;
-                // Smooth shading normals strictly on curved side-wall faces (eliminates flat hexagonal facet seams)
-                // while leaving flat 90-deg cap vertices (|dot| <= 0.35) completely untouched.
-                if (vert_in_active_curve[i])
+                // Smooth shading normals strictly on curved side-wall faces of detected 3D circles/arcs
+                // (eliminates flat 5/6-sided shading seams on pillars, domes, exhaust fans & Quonset arches)
+                // while leaving flat 90-deg cap vertices (|align| <= 0.35) completely untouched.
                 {
                     ZhrVertexWw3d& v = m_subdiv_verts[i];
                     const float align = v.normal[0] * it->second.x +
@@ -4183,9 +4271,20 @@ private:
                     if (std::fabs(align) > 0.35f)
                     {
                         const float s = align >= 0.0f ? 1.0f : -1.0f;
-                        v.normal[0] = it->second.x * s;
-                        v.normal[1] = it->second.y * s;
-                        v.normal[2] = it->second.z * s;
+                        // Preserve axial/vertical tilt on sloped domes & cones while smoothing azimuthal facets.
+                        const float rx = it->second.x * s;
+                        const float ry = it->second.y * s;
+                        const float rz = it->second.z * s;
+                        const float bx = v.normal[0] * 0.35f + rx * 0.65f;
+                        const float by = v.normal[1] * 0.35f + ry * 0.65f;
+                        const float bz = v.normal[2] * 0.35f + rz * 0.65f;
+                        const float bl = std::sqrt(bx * bx + by * by + bz * bz);
+                        if (bl > 1e-4f)
+                        {
+                            v.normal[0] = bx / bl;
+                            v.normal[1] = by / bl;
+                            v.normal[2] = bz / bl;
+                        }
                     }
                 }
             }
@@ -4318,7 +4417,7 @@ private:
                     out_has_curve = 1;
                 }
             }
-            else if (dist_sq > 1e-4f && dist_sq < 40000.0f)
+            else if (fallback_alpha > 0.001f && dist_sq > 1e-4f && dist_sq < 40000.0f)
             {
                 const float nax = va.normal[0], nay = va.normal[1], naz = va.normal[2];
                 const float nbx = vb.normal[0], nby = vb.normal[1], nbz = vb.normal[2];
@@ -4423,12 +4522,53 @@ private:
                                       subdiv_has_curve[ia] && subdiv_has_curve[ib] &&
                                       (p0_curved_edges.find(make_spatial_edge(ka, kb)) != p0_curved_edges.end());
 
+            // Smooth coaxial dome/cylinder ribs AND quad diagonals connecting two concentric detected 3D circles:
+            // Without projecting the diagonal midpoint `(ringA[k], ringB[k+1])` radially out to `r_mid`,
+            // every 6-sided dome/collar quad pinches inward by `1 - cos(30 deg) = 13.4%` along its diagonal!
+            float meridian_alpha = 0.0f;
+            bool has_coaxial_mid = false;
+            DetectedCircle3D coaxial_mid_c{};
+            if (circle_id == UINT32_MAX && !vert_circle_map.empty())
+            {
+                auto itca = vert_circle_map.find(ka);
+                auto itcb = vert_circle_map.find(kb);
+                if (itca != vert_circle_map.end() && itcb != vert_circle_map.end() && itca->second != itcb->second)
+                {
+                    const DetectedCircle3D& cA = detected_circles[itca->second];
+                    const DetectedCircle3D& cB = detected_circles[itcb->second];
+                    const float axis_dot = cA.ax * cB.ax + cA.ay * cB.ay + cA.az * cB.az;
+                    if (std::fabs(axis_dot) > 0.96f)
+                    {
+                        const float dcx = cB.cx - cA.cx, dcy = cB.cy - cA.cy, dcz = cB.cz - cA.cz;
+                        const float along = dcx * cA.ax + dcy * cA.ay + dcz * cA.az;
+                        const float px = dcx - along * cA.ax, py = dcy - along * cA.ay, pz = dcz - along * cA.az;
+                        const float offset_perp = std::sqrt(px * px + py * py + pz * pz);
+                        const float max_r = std::max(cA.r, cB.r);
+                        if (offset_perp <= max_r * 0.20f)
+                        {
+                            has_coaxial_mid = true;
+                            coaxial_mid_c.cx = 0.5f * (cA.cx + cB.cx);
+                            coaxial_mid_c.cy = 0.5f * (cA.cy + cB.cy);
+                            coaxial_mid_c.cz = 0.5f * (cA.cz + cB.cz);
+                            coaxial_mid_c.ax = cA.ax;
+                            coaxial_mid_c.ay = cA.ay;
+                            coaxial_mid_c.az = cA.az;
+                            coaxial_mid_c.r  = 0.5f * (cA.r + cB.r);
+                            if (std::fabs(cA.r - cB.r) > 0.25f)
+                            {
+                                meridian_alpha = 0.48f;
+                            }
+                        }
+                    }
+                }
+            }
+
             Vec3f mid_cn{};
             uint8_t mid_hc = 0;
             ZhrVertexWw3d mid = make_phong_midpoint(
                 m_subdiv_verts[ia], m_subdiv_verts[ib],
                 is_ring_edge, subdiv_curve_n[ia], subdiv_curve_n[ib],
-                (circle_id != UINT32_MAX) ? 0.0f : 0.44f, mid_cn, mid_hc);
+                meridian_alpha, mid_cn, mid_hc);
 
             if (circle_id != UINT32_MAX)
             {
@@ -4441,6 +4581,32 @@ private:
                 const float pa = rx * c.ax + ry * c.ay + rz * c.az;
                 const float px = rx - pa * c.ax, py = ry - pa * c.ay, pz = rz - pa * c.az;
                 const float pl = std::sqrt(px * px + py * py + pz * pz);
+                if (pl > 1e-4f)
+                {
+                    mid_cn = {px / pl, py / pl, pz / pl};
+                    mid_hc = 1;
+                }
+            }
+            else if (has_coaxial_mid)
+            {
+                // Project coaxial diagonal/rib midpoint radially onto the interpolated circle (eliminates 6-sided quad pinching!).
+                const float rx = mid.position[0] - coaxial_mid_c.cx;
+                const float ry = mid.position[1] - coaxial_mid_c.cy;
+                const float rz = mid.position[2] - coaxial_mid_c.cz;
+                const float pa = rx * coaxial_mid_c.ax + ry * coaxial_mid_c.ay + rz * coaxial_mid_c.az;
+                const float px = rx - pa * coaxial_mid_c.ax;
+                const float py = ry - pa * coaxial_mid_c.ay;
+                const float pz = rz - pa * coaxial_mid_c.az;
+                const float pl = std::sqrt(px * px + py * py + pz * pz);
+                if (pl > 1e-4f && pl < coaxial_mid_c.r)
+                {
+                    // If meridian_alpha already pushed outward past r_mid on a dome rib, keep the larger radius;
+                    // if diagonal chord pinched inward below r_mid, pop it cleanly out to r_mid!
+                    const float inv_p = coaxial_mid_c.r / pl;
+                    mid.position[0] = coaxial_mid_c.cx + px * inv_p + pa * coaxial_mid_c.ax;
+                    mid.position[1] = coaxial_mid_c.cy + py * inv_p + pa * coaxial_mid_c.ay;
+                    mid.position[2] = coaxial_mid_c.cz + pz * inv_p + pa * coaxial_mid_c.az;
+                }
                 if (pl > 1e-4f)
                 {
                     mid_cn = {px / pl, py / pl, pz / pl};
@@ -4530,7 +4696,7 @@ private:
             m_subdiv_indices.push_back(m20); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(i2);
             m_subdiv_indices.push_back(m01); m_subdiv_indices.push_back(m12); m_subdiv_indices.push_back(m20);
 
-            if (active_curve_tri[t])
+            if (active_curve_tri[t] || (subdiv_has_curve[i0] && subdiv_has_curve[i1] && subdiv_has_curve[i2]))
             {
                 register_p1_tri_curved_edges(i0, m01, m20);
                 register_p1_tri_curved_edges(m01, i1, m12);
@@ -4624,7 +4790,7 @@ private:
                 ZhrVertexWw3d mid = make_phong_midpoint(
                     m_subdiv_verts[ia], m_subdiv_verts[ib],
                     ring, subdiv_curve_n[ia], subdiv_curve_n[ib],
-                    (circle_id != UINT32_MAX) ? 0.0f : 0.34f, mid_cn, mid_hc);
+                    0.0f, mid_cn, mid_hc);
                 if (circle_id != UINT32_MAX)
                 {
                     snap_midpoint_to_circle3d(mid, circle_id);
@@ -4814,12 +4980,12 @@ private:
                 {
                     continue;
                 }
-                if (node.min_edge < 1.1f || node.max_edge > node.min_edge * 4.5f)
+                if (node.min_edge < 4.0f || node.max_edge > node.min_edge * 4.5f)
                 {
                     continue;
                 }
                 const float h_avg = node.h_sum / static_cast<float>(node.v_count);
-                const float disp_amp = std::min(node.min_edge * 0.16f, 0.85f);
+                const float disp_amp = std::min(node.min_edge * 0.065f, 0.35f);
                 const float disp = h_avg * disp_amp;
                 ZhrVertexWw3d& v = m_subdiv_verts[i];
                 v.position[0] += node.nx * disp;

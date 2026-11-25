@@ -2181,7 +2181,13 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 		DX8Wrapper::Set_Texture(1,nullptr);
 		m_stageTwoTexture->restore();
 
+#ifdef ZHR_USE_VULKAN
+		zhr_vk_set_terrain_pass_active(true);
+#endif
 		drawScorches();
+#ifdef ZHR_USE_VULKAN
+		zhr_vk_set_terrain_pass_active(false);
+#endif
 
 		DX8Wrapper::Set_Texture(0,nullptr);
 		DX8Wrapper::Set_Texture(1,nullptr);
