@@ -7,6 +7,7 @@
 
 #include "Common/Debug.h"
 #include "Common/GameEngine.h"
+#include "GameClient/Display.h"
 #include "GameClient/GameClient.h"
 #include "GameClient/Mouse.h"
 
@@ -34,10 +35,25 @@ namespace
 			int winW = 0, winH = 0, pixW = 0, pixH = 0;
 			SDL_GetWindowSize(g_sdlWindow, &winW, &winH);
 			SDL_GetWindowSizeInPixels(g_sdlWindow, &pixW, &pixH);
-			if (winW > 0 && winH > 0 && pixW > 0 && pixH > 0 && (pixW != winW || pixH != winH))
+
+			int targetW = pixW;
+			int targetH = pixH;
+			if (TheDisplay && TheDisplay->getWidth() > 0 && TheDisplay->getHeight() > 0)
 			{
-				outX = static_cast<int>(x * (static_cast<float>(pixW) / static_cast<float>(winW)) + 0.5f);
-				outY = static_cast<int>(y * (static_cast<float>(pixH) / static_cast<float>(winH)) + 0.5f);
+				targetW = static_cast<int>(TheDisplay->getWidth());
+				targetH = static_cast<int>(TheDisplay->getHeight());
+			}
+
+			if (winW > 0 && winH > 0 && targetW > 0 && targetH > 0)
+			{
+				int mappedX = static_cast<int>(x * (static_cast<float>(targetW) / static_cast<float>(winW)) + 0.5f);
+				int mappedY = static_cast<int>(y * (static_cast<float>(targetH) / static_cast<float>(winH)) + 0.5f);
+				if (mappedX < 0) mappedX = 0;
+				if (mappedY < 0) mappedY = 0;
+				if (mappedX >= targetW) mappedX = targetW - 1;
+				if (mappedY >= targetH) mappedY = targetH - 1;
+				outX = mappedX;
+				outY = mappedY;
 				return;
 			}
 		}

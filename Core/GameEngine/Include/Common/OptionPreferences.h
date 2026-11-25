@@ -141,4 +141,6 @@ public:
 	UnsignedInt getZhrMaxRenderFps() const;
 	/// Returns 0.0f for Auto (DPI-Aware), -1.0f for Classic 2003 stretched, or [0.55f..1.00f] explicit height fraction.
 	Real getZhrUiScale() const;
+	/// Returns camera default & max zoom-out multiplier (1.0f = Classic 2003, 1.6f = Modern default, up to 2.5f).
+	Real getZhrCameraZoomScale() const;
 };

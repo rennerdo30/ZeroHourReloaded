@@ -209,10 +209,12 @@ void Win32Mouse::translateEvent( UnsignedInt eventIndex, MouseIO *result )
 		{
 			POINT p;
 
-			// translate the screen mouse position to be relative to the application window
 			p.x = LOWORD( lParam );
 			p.y = HIWORD( lParam );
+#ifndef ZHR_USE_SDL3
+			// translate the screen mouse position to be relative to the application window
 			ScreenToClient( ApplicationHWnd, &p );
+#endif
 
 			// note the short cast here to keep signed information in tact
 			result->wheelPos = (Short)HIWORD( wParam );

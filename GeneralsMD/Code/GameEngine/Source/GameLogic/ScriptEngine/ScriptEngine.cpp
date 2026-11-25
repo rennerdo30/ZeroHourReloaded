@@ -32,6 +32,7 @@
 #include "Common/file.h"
 #include "Common/FileSystem.h"
 #include "Common/FramePacer.h"
+#include "Common/FrameRateLimit.h"
 #include "Common/GameState.h"
 #include "Common/GameUtility.h"
 #include "Common/LatchRestore.h"
@@ -5263,9 +5264,16 @@ void ScriptEngine::init()
 //-------------------------------------------------------------------------------------------------
 void ScriptEngine::reset()
 {
-	// setting FPS limit in case a script had changed it
+	// setting FPS limit in case a script had changed it (preserve ZeroHourReloaded decoupled high-FPS render cap)
 	if (TheFramePacer && TheGlobalData)
-		TheFramePacer->setFramesPerSecondLimit(TheGlobalData->m_framesPerSecondLimit);
+	{
+		const Int targetFps = TheGlobalData->m_useFpsLimit
+			? TheGlobalData->m_framesPerSecondLimit
+			: RenderFpsPreset::UncappedFpsValue;
+		TheFramePacer->setFramesPerSecondLimit(targetFps);
+		TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
+		TheFramePacer->enableLogicTimeScale(!TheGlobalData->m_useFpsLimit || targetFps > LOGICFRAMES_PER_SECOND);
+	}
 
 	if (TheScriptActions) {
 		TheScriptActions->reset();

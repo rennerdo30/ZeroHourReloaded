@@ -589,6 +589,8 @@ Bool W3DDisplay::setDisplayMode( UnsignedInt xres, UnsignedInt yres, UnsignedInt
 	{
 		Render2DClass::Set_Screen_Resolution(RectClass(0, 0, xres, yres));
 		Display::setDisplayMode(xres, yres, bitdepth, windowed);
+		if (TheMouse)
+			TheMouse->setMouseLimits();
 
 		// TheSuperHackers @tweak Font point sizes are scaled from the resolution, so every glyph
 		// cached for the old resolution is now dead weight. Discard the current glyphs and start

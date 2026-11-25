@@ -29,6 +29,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/GameEngine.h"
+#include "Common/OptionPreferences.h"
 #include "Common/Xfer.h"
 #include "GameClient/Drawable.h"
 #include "GameClient/GameClient.h"
@@ -96,7 +97,11 @@ void View::init()
 	m_zoomLimited = TRUE;
 
 	m_zoom = 1.0f;
-	m_maxHeightAboveGround = TheGlobalData->m_maxCameraHeight;
+	{
+		OptionPreferences zoomPrefs;
+		m_zhrCameraZoomScale = zoomPrefs.getZhrCameraZoomScale();
+	}
+	m_maxHeightAboveGround = TheGlobalData->m_maxCameraHeight * m_zhrCameraZoomScale;
 	m_minHeightAboveGround = TheGlobalData->m_minCameraHeight;
 	m_okToAdjustHeight = FALSE;
 
@@ -104,6 +109,29 @@ void View::init()
 	m_defaultPitch = DEG_TO_RADF(TheGlobalData->m_cameraPitch);
 	m_angle = m_defaultAngle;
 	m_pitch = m_defaultPitch;
+}
+
+void View::setZhrCameraZoomScale( Real scale )
+{
+	const Real clamped = clamp(1.00f, scale, 2.50f);
+	const Real oldScale = (m_zhrCameraZoomScale >= 1.0f) ? m_zhrCameraZoomScale : 1.0f;
+	m_zhrCameraZoomScale = clamped;
+	if (TheGlobalData && TheGlobalData->m_maxCameraHeight > 1.0f)
+	{
+		const Bool wasAtMax = (m_heightAboveGround >= m_maxHeightAboveGround - 1.0f);
+		const Real baseMax = m_maxHeightAboveGround / oldScale;
+		m_maxHeightAboveGround = (baseMax > 1.0f) ? (baseMax * clamped) : (TheGlobalData->m_maxCameraHeight * clamped);
+		if (m_minHeightAboveGround > m_maxHeightAboveGround)
+			m_maxHeightAboveGround = m_minHeightAboveGround;
+		if (wasAtMax)
+		{
+			setHeightAboveGround(m_maxHeightAboveGround);
+		}
+		else if (m_heightAboveGround > m_maxHeightAboveGround)
+		{
+			setHeightAboveGround(m_maxHeightAboveGround);
+		}
+	}
 }
 
 void View::reset()
@@ -126,7 +154,10 @@ View *View::prependViewToList( View *list )
 
 void View::zoom( Real height )
 {
-	setHeightAboveGround(getHeightAboveGround() + height);
+	// Scale scroll-wheel zoom delta gently with the configured zoom-out range so scrolling
+	// from close-up to max tactical zoom stays crisp and responsive.
+	const Real stepScale = (m_zhrCameraZoomScale > 1.0f) ? (0.5f + 0.5f * m_zhrCameraZoomScale) : 1.0f;
+	setHeightAboveGround(getHeightAboveGround() + height * stepScale);
 }
 
 /**

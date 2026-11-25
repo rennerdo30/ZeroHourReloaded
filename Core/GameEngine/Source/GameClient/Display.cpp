@@ -149,6 +149,10 @@ void Display::getUiTransform(
 		outOffsetX = sw - virtualW;
 		outOffsetY = (sh - virtualH) * 0.5f;
 		break;
+	case UI_ANCHOR_BOTTOM_RIGHT:
+		outOffsetX = sw - virtualW;
+		outOffsetY = sh - virtualH;
+		break;
 	case UI_ANCHOR_CENTER:
 	default:
 		outOffsetX = (sw - virtualW) * 0.5f;

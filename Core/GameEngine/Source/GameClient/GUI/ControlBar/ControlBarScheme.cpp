@@ -986,6 +986,17 @@ void ControlBarSchemeManager::setControlBarSchemeByPlayerTemplate( const PlayerT
 		side.concat("Small");
 	if(m_currentScheme && (m_currentScheme->m_side.compare(side) == 0))
 	{
+		Real ox = 0.0f, oy = 0.0f;
+		TheDisplay->getUiTransform(
+			m_currentScheme->m_ScreenCreationRes.x,
+			m_currentScheme->m_ScreenCreationRes.y,
+			Display::UI_ANCHOR_BOTTOM_CENTER,
+			m_multiplier.x,
+			m_multiplier.y,
+			ox,
+			oy);
+		m_origin.x = REAL_TO_INT_FLOOR(ox + 0.5f);
+		m_origin.y = REAL_TO_INT_FLOOR(oy + 0.5f);
 		m_currentScheme->init();
 
 		DEBUG_LOG(("setControlBarSchemeByPlayer already is using %s as its side", side.str()));
@@ -1063,6 +1074,17 @@ void ControlBarSchemeManager::setControlBarSchemeByPlayer(Player *p)
 	AsciiString side = p->getSide();
 	if(m_currentScheme && (m_currentScheme->m_side.compare(side) == 0))
 	{
+		Real ox = 0.0f, oy = 0.0f;
+		TheDisplay->getUiTransform(
+			m_currentScheme->m_ScreenCreationRes.x,
+			m_currentScheme->m_ScreenCreationRes.y,
+			Display::UI_ANCHOR_BOTTOM_CENTER,
+			m_multiplier.x,
+			m_multiplier.y,
+			ox,
+			oy);
+		m_origin.x = REAL_TO_INT_FLOOR(ox + 0.5f);
+		m_origin.y = REAL_TO_INT_FLOOR(oy + 0.5f);
 		m_currentScheme->init();
 
 		DEBUG_LOG(("setControlBarSchemeByPlayer already is using %s as its side", side.str()));

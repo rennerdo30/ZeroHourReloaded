@@ -32,10 +32,12 @@
 
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
+#include "Common/FrameRateLimit.h"
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
 #include "Common/GlobalData.h"
 #include "Common/NameKeyGenerator.h"
+#include "Common/OptionPreferences.h"
 #include "Common/ThingFactory.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
@@ -884,12 +886,31 @@ bool GameLogic::onNewGame(MAYBE_UNUSED GameMessage *msg)
 
 	if ( msg->getArgumentCount() >= 4 )
 	{
-		Int maxFPS = msg->getArgument( 3 )->integer;
-		if (maxFPS < 1 || maxFPS > 1000)
-			maxFPS = TheGlobalData->m_framesPerSecondLimit;
-		DEBUG_LOG(("Setting max FPS limit to %d FPS", maxFPS));
-		TheFramePacer->setFramesPerSecondLimit(maxFPS);
-		TheWritableGlobalData->m_useFpsLimit = true;
+		// ZeroHourReloaded: MSG_NEW_GAME arg 3 is the skirmish simulation/logic speed (typically 30 Hz).
+		// Apply it to decoupled logic stepping while preserving the user's configured high-FPS render cap.
+		Int logicFps = msg->getArgument( 3 )->integer;
+		if (logicFps < 1 || logicFps > 1000)
+			logicFps = LOGICFRAMES_PER_SECOND;
+		TheFramePacer->setLogicTimeScaleFps(logicFps);
+
+		OptionPreferences zhrFpsPrefs;
+		const UnsignedInt maxRenderFps = zhrFpsPrefs.getZhrMaxRenderFps();
+		if (maxRenderFps >= RenderFpsPreset::UncappedFpsValue)
+		{
+			TheWritableGlobalData->m_framesPerSecondLimit = RenderFpsPreset::UncappedFpsValue;
+			TheWritableGlobalData->m_useFpsLimit = FALSE;
+			TheFramePacer->setFramesPerSecondLimit(RenderFpsPreset::UncappedFpsValue);
+			TheFramePacer->enableLogicTimeScale(TRUE);
+		}
+		else
+		{
+			const Int renderFps = MAX(logicFps, (Int)maxRenderFps);
+			TheWritableGlobalData->m_framesPerSecondLimit = renderFps;
+			TheWritableGlobalData->m_useFpsLimit = TRUE;
+			TheFramePacer->setFramesPerSecondLimit(renderFps);
+			TheFramePacer->enableLogicTimeScale(renderFps > logicFps);
+		}
+		DEBUG_LOG(("Setting logic speed to %d Hz, render cap to %u FPS", logicFps, maxRenderFps));
 	}
 
 	// prepare for new game

@@ -241,6 +241,10 @@ public:
 	virtual void setFieldOfView( Real angle ) { m_FOV = angle; }				///< Set the horizontal field of view angle
 	virtual Real getFieldOfView() { return m_FOV; }								///< Get the horizontal field of view angle
 
+	/// ZeroHourReloaded: configurable camera default & max zoom-out multiplier (1.0x = Classic, 1.6x = Modern default, up to 2.5x).
+	virtual void setZhrCameraZoomScale( Real scale );
+	Real getZhrCameraZoomScale() const { return m_zhrCameraZoomScale; }
+
   Bool worldToScreen( const Coord3D *w, ICoord2D *s ) { return worldToScreenTriReturn( w, s ) == WTS_INSIDE_FRUSTUM; }	///< Transform world coordinate "w" into screen coordinate "s"
   virtual WorldToScreenReturn worldToScreenTriReturn(const Coord3D *w, ICoord2D *s ) = 0; ///< Like worldToScreen(), but with a more informative return value
 
@@ -351,6 +355,7 @@ protected:
 	Bool m_snapImmediate;																				///< Should we immediately snap to the object we're following?
 
 	Coord2D m_guardBandBias; ///< Extra beefy margins so huge thins can stay "on-screen"
+	Real m_zhrCameraZoomScale = 1.60f; ///< ZeroHourReloaded default & max zoom-out multiplier (1.0x..2.5x)
 
 };
 

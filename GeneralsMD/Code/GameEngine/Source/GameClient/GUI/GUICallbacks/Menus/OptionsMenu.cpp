@@ -50,6 +50,7 @@
 #include "GameClient/GameClient.h"
 #include "GameClient/InGameUI.h"
 #include "GameClient/LookAtXlat.h"
+#include "GameClient/View.h"
 #include "GameClient/WindowLayout.h"
 #include "GameClient/Gadget.h"
 #include "GameClient/GadgetCheckBox.h"
@@ -256,6 +257,9 @@ static UnsignedInt s_zhrCurMaxFps = 144u;
 static Real s_zhrSavedUiScale = 0.0f;
 static Real s_zhrCurUiScale = 0.0f;
 
+static Real s_zhrSavedCameraZoom = 1.60f;
+static Real s_zhrCurCameraZoom = 1.60f;
+
 // Dynamic ZHR controls (owned as children of OptionsMenuParent; destroyed with layout)
 static NameKeyType s_zhrTabIDs[ZHR_TAB_COUNT] = { NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID };
 static GameWindow *s_zhrTabButtons[ZHR_TAB_COUNT] = { nullptr, nullptr, nullptr, nullptr };
@@ -305,6 +309,9 @@ static GameWindow *s_zhrLblVoiceVol = nullptr;
 static GameWindow *s_zhrCardControls = nullptr;
 static GameWindow *s_zhrLblControlsHdr = nullptr;
 static GameWindow *s_zhrLblScrollSpeed = nullptr;
+static GameWindow *s_zhrLblCameraZoom = nullptr;
+static NameKeyType s_zhrComboCameraZoomID = NAMEKEY_INVALID;
+static GameWindow *s_zhrComboCameraZoom = nullptr;
 
 // Network tab dynamic widgets
 static GameWindow *s_zhrCardNetwork = nullptr;
@@ -360,6 +367,8 @@ static void clearZhrOptionsWidgets()
 	s_zhrCardControls = nullptr;
 	s_zhrLblControlsHdr = nullptr;
 	s_zhrLblScrollSpeed = nullptr;
+	s_zhrLblCameraZoom = nullptr;
+	s_zhrComboCameraZoom = nullptr;
 
 	s_zhrCardNetwork = nullptr;
 	s_zhrLblNetworkHdr = nullptr;
@@ -483,6 +492,25 @@ static Real zhrComboIdxToUiScale(Int idx)
 {
 	if (idx < 0 || idx >= 6) return 0.0f;
 	return s_zhrUiScaleChoices[idx];
+}
+
+static const Real s_zhrCameraZoomChoices[] = {
+	1.00f, 1.35f, 1.60f, 2.00f, 2.50f
+};
+
+static Int zhrCameraZoomToComboIdx(Real scale)
+{
+	if (scale <= 1.17f) return 0; // Classic (1.0x)
+	if (scale <= 1.47f) return 1; // Extended (1.35x)
+	if (scale <= 1.80f) return 2; // Modern (1.6x)
+	if (scale <= 2.25f) return 3; // Tactical (2.0x)
+	return 4;                     // Strategic (2.5x)
+}
+
+static Real zhrComboIdxToCameraZoom(Int idx)
+{
+	if (idx < 0 || idx >= 5) return 1.60f;
+	return s_zhrCameraZoomChoices[idx];
 }
 
 static void placeComboBox(GameWindow *combo, Int x, Int y, Int w, Int h)
@@ -789,6 +817,7 @@ static void selectZhrOptionsTab(Int tabIndex)
 	if (comboBoxDetail) GadgetComboBoxHideList(comboBoxDetail);
 	if (s_zhrComboMaxFps) GadgetComboBoxHideList(s_zhrComboMaxFps);
 	if (s_zhrComboUiScale) GadgetComboBoxHideList(s_zhrComboUiScale);
+	if (s_zhrComboCameraZoom) GadgetComboBoxHideList(s_zhrComboCameraZoom);
 	if (s_zhrComboVisualMode) GadgetComboBoxHideList(s_zhrComboVisualMode);
 	if (comboBoxOnlineIP) GadgetComboBoxHideList(comboBoxOnlineIP);
 	if (comboBoxLANIP) GadgetComboBoxHideList(comboBoxLANIP);
@@ -859,6 +888,8 @@ static void selectZhrOptionsTab(Int tabIndex)
 	showZhrWidget(checkRetaliation, isCtl);
 	showZhrWidget(s_zhrLblScrollSpeed, isCtl);
 	showZhrWidget(sliderScrollSpeed, isCtl);
+	showZhrWidget(s_zhrLblCameraZoom, isCtl);
+	showZhrWidget(s_zhrComboCameraZoom, isCtl);
 
 	// Network tab
 	showZhrWidget(s_zhrNetworkGroup, isNet);
@@ -1345,6 +1376,27 @@ static void buildModernTabbedOptionsLayout(GameWindow *parent)
 		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
 	cy += lblH + 6;
 	placeSlider(sliderScrollSpeed, singleCardX + scPadX, cy, scCtrlW, sliderH);
+	cy += sliderH + rowGap * 2;
+
+	s_zhrLblCameraZoom = createZhrLabel(
+		ctlParent, "OptionsMenu.wnd:ZhrLblCameraZoom", UnicodeString(L"Camera Zoom Out (Default & Max)"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+	s_zhrComboCameraZoom = createZhrComboBox(
+		ctlParent, "OptionsMenu.wnd:ZhrComboCameraZoom",
+		singleCardX + scPadX, cy, scCtrlW, leftComboH, bodyFont, s_zhrComboCameraZoomID);
+	if (s_zhrComboCameraZoom)
+	{
+		const Color entryCol = GameMakeColor(236, 246, 255, 255);
+		GadgetComboBoxReset(s_zhrComboCameraZoom);
+		GadgetComboBoxSetMaxDisplay(s_zhrComboCameraZoom, 5);
+		GadgetComboBoxAddEntry(s_zhrComboCameraZoom, UnicodeString(L"Classic (1.0x)"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboCameraZoom, UnicodeString(L"Extended (1.35x)"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboCameraZoom, UnicodeString(L"Modern (1.6x) - Recommended"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboCameraZoom, UnicodeString(L"Tactical (2.0x)"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboCameraZoom, UnicodeString(L"Strategic (2.5x)"), entryCol);
+		GadgetComboBoxSetSelectedPos(s_zhrComboCameraZoom, zhrCameraZoomToComboIdx(s_zhrCurCameraZoom));
+	}
 
 	// 6. TAB 3 — NETWORK (centered spacious card)
 	s_zhrCardNetwork = createZhrPanel(host, "OptionsMenu.wnd:ZhrSubPanelNetwork", singleCardX, bodyY, singleCardW, bodyH);
@@ -1541,6 +1593,7 @@ static void setDefaults()
 	// ZeroHourReloaded Vulkan 1.3 Remaster, UI Scale & Frame Pacing defaults (Remastered all-ON, 144 FPS, Auto DPI UI)
 	s_zhrCurMaxFps = 144u;
 	s_zhrCurUiScale = 0.0f;
+	s_zhrCurCameraZoom = 1.60f;
 	{
 		const Bool prevIgn = ignoreSelected;
 		ignoreSelected = TRUE;
@@ -1548,9 +1601,13 @@ static void setDefaults()
 			GadgetComboBoxSetSelectedPos(s_zhrComboMaxFps, zhrFpsToComboIdx(s_zhrCurMaxFps));
 		if (s_zhrComboUiScale)
 			GadgetComboBoxSetSelectedPos(s_zhrComboUiScale, zhrUiScaleToComboIdx(s_zhrCurUiScale));
+		if (s_zhrComboCameraZoom)
+			GadgetComboBoxSetSelectedPos(s_zhrComboCameraZoom, zhrCameraZoomToComboIdx(s_zhrCurCameraZoom));
 		ignoreSelected = prevIgn;
 	}
 	applyLiveMaxRenderFps(s_zhrCurMaxFps);
+	if (TheTacticalView)
+		TheTacticalView->setZhrCameraZoomScale(s_zhrCurCameraZoom);
 
 	if (s_zhrHasVulkan)
 	{
@@ -2142,6 +2199,15 @@ static void saveOptions()
 			s_zhrSavedUiScale = s_zhrCurUiScale;
 			zhrUiScaleChanged = TRUE;
 		}
+
+		{
+			AsciiString zoomStr;
+			zoomStr.format("%.2f", s_zhrCurCameraZoom);
+			(*pref)["ZhrCameraZoom"] = zoomStr;
+			if (TheTacticalView)
+				TheTacticalView->setZhrCameraZoomScale(s_zhrCurCameraZoom);
+			s_zhrSavedCameraZoom = s_zhrCurCameraZoom;
+		}
 	}
 
 	if (s_zhrHasVulkan && TheDisplay)
@@ -2320,6 +2386,8 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 	s_zhrCurMaxFps = s_zhrSavedMaxFps;
 	s_zhrSavedUiScale = TheDisplay ? TheDisplay->getUiScalePreference() : pref->getZhrUiScale();
 	s_zhrCurUiScale = s_zhrSavedUiScale;
+	s_zhrSavedCameraZoom = TheTacticalView ? TheTacticalView->getZhrCameraZoomScale() : pref->getZhrCameraZoomScale();
+	s_zhrCurCameraZoom = s_zhrSavedCameraZoom;
 
 	s_zhrHasVulkan = (TheDisplay && TheDisplay->hasVulkanRemasterBackend()) ? TRUE : FALSE;
 	if (s_zhrHasVulkan)
@@ -2992,6 +3060,14 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 					GadgetComboBoxGetSelectedPos(s_zhrComboUiScale, &index);
 					s_zhrCurUiScale = zhrComboIdxToUiScale(index);
 				}
+				else if (controlID == s_zhrComboCameraZoomID)
+				{
+					Int index = 0;
+					GadgetComboBoxGetSelectedPos(s_zhrComboCameraZoom, &index);
+					s_zhrCurCameraZoom = zhrComboIdxToCameraZoom(index);
+					if (TheTacticalView)
+						TheTacticalView->setZhrCameraZoomScale(s_zhrCurCameraZoom);
+				}
 				else if (controlID == s_zhrComboVisualModeID && s_zhrHasVulkan)
 				{
 					Int index = 0;
@@ -3012,8 +3088,10 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 
 			if( controlID == buttonBack )
 			{
-				// Revert live Max Render FPS & Vulkan 1.3 Remaster preview back to the snapshot taken on open
+				// Revert live Max Render FPS, Camera Zoom & Vulkan 1.3 Remaster preview back to the snapshot taken on open
 				applyLiveMaxRenderFps(s_zhrSavedMaxFps);
+				if (TheTacticalView)
+					TheTacticalView->setZhrCameraZoomScale(s_zhrSavedCameraZoom);
 				if (s_zhrHasVulkan && TheDisplay)
 				{
 					TheDisplay->setVulkanRemasterSettings(

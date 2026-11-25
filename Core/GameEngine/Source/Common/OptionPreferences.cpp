@@ -990,3 +990,15 @@ Real OptionPreferences::getZhrUiScale() const
 		val *= 0.01f; // Accept percentage format like "75" -> 0.75f
 	return clamp(0.55f, val, 1.00f);
 }
+
+Real OptionPreferences::getZhrCameraZoomScale() const
+{
+	OptionPreferences::const_iterator it = find("ZhrCameraZoom");
+	if (it == end())
+		return 1.60f; // Default: comfortable modern widescreen/4K zoom-out (1.6x classic height)
+
+	Real val = static_cast<Real>(atof(it->second.str()));
+	if (val <= 0.01f)
+		return 1.60f;
+	return clamp(1.00f, val, 2.50f);
+}

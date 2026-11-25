@@ -203,7 +203,8 @@ public:
 		UI_ANCHOR_STRETCH = 0,       ///< Full-screen stretch (loading screens / Classic Stretched mode)
 		UI_ANCHOR_CENTER,            ///< Aspect-correct uniform scale, centered on screen
 		UI_ANCHOR_BOTTOM_CENTER,     ///< Aspect-correct uniform scale, anchored bottom-center (ControlBar)
-		UI_ANCHOR_RIGHT_CENTER,      ///< Aspect-correct uniform scale, anchored right-center (MainMenu / Shortcuts)
+		UI_ANCHOR_RIGHT_CENTER,      ///< Aspect-correct uniform scale, anchored right-center (MainMenu)
+		UI_ANCHOR_BOTTOM_RIGHT,      ///< Aspect-correct uniform scale, anchored bottom-right (GenPowersShortcutBar)
 	};
 
 	void setDpiScale(Real scale);

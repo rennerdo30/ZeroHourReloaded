@@ -2233,7 +2233,7 @@ void W3DView::setDefaultView(Real pitch, Real angle, Real maxHeight)
 	// MDC - we no longer want to rotate maps (design made all of them right to begin with)
 	//	m_defaultAngle = angle * WWMATH_PI/180.0f;
 	setDefaultPitch(pitch);
-	m_maxHeightAboveGround = TheGlobalData->m_maxCameraHeight*maxHeight;
+	m_maxHeightAboveGround = TheGlobalData->m_maxCameraHeight * maxHeight * m_zhrCameraZoomScale;
 	if (m_minHeightAboveGround > m_maxHeightAboveGround)
 		m_maxHeightAboveGround = m_minHeightAboveGround;
 }
@@ -3724,6 +3724,23 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 		// and uses terrain oversize if it needs to enlarge.
 		dimensions.x = WorldHeightMap::NORMAL_DRAW_WIDTH;
 		dimensions.y = WorldHeightMap::NORMAL_DRAW_HEIGHT;
+		// ZeroHourReloaded: expand terrain draw window smoothly when zoomed out above classic height
+		// so wide/4K monitors never clip map corners at 1.6x-2.5x zoom-out.
+		if (m_isUserControlled && TheGlobalData && TheGlobalData->m_maxCameraHeight > 1.0f &&
+			m_currentHeightAboveGround > TheGlobalData->m_maxCameraHeight * 1.05f)
+		{
+			const Real zoomRatio = clamp(1.0f, m_currentHeightAboveGround / TheGlobalData->m_maxCameraHeight, 2.75f);
+			dimensions.x = REAL_TO_INT_CEIL(static_cast<Real>(dimensions.x) * zoomRatio);
+			dimensions.y = REAL_TO_INT_CEIL(static_cast<Real>(dimensions.y) * zoomRatio);
+			if (TheTerrainRenderObject)
+			{
+				if (const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap())
+				{
+					dimensions.x = MIN(dimensions.x, heightMap->getXExtent());
+					dimensions.y = MIN(dimensions.y, heightMap->getYExtent());
+				}
+			}
+		}
 		return true;
 	}
 

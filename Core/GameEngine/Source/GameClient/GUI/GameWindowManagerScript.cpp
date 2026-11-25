@@ -561,8 +561,13 @@ static Display::UiScaleAnchor zhrClassifyScriptAnchor(const char *filename)
 	{
 		return Display::UI_ANCHOR_BOTTOM_CENTER;
 	}
-	if (zhrContainsNoCase(filename, "MainMenu") ||
+	if (zhrContainsNoCase(filename, "GenPowersShortcut") ||
+		zhrContainsNoCase(filename, "ShortcutBar") ||
 		zhrContainsNoCase(filename, "SpecialPowerShortcut"))
+	{
+		return Display::UI_ANCHOR_BOTTOM_RIGHT;
+	}
+	if (zhrContainsNoCase(filename, "MainMenu"))
 	{
 		return Display::UI_ANCHOR_RIGHT_CENTER;
 	}
