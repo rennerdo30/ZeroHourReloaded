@@ -28,6 +28,8 @@ pub struct VkContext {
     pub min_uniform_offset_alignment: u64,
     pub max_anisotropy: f32,
     pub fill_mode_non_solid: bool,
+    pub swapchain_colorspace_supported: bool,
+    pub hdr_metadata_supported: bool,
     pub depth_format: vk::Format,
     pub allocator: Option<Allocator>,
     /// All enumerated Vulkan 1.3 capable GPUs (for `Renderer::Get_Render_Device_*`).
@@ -87,10 +89,15 @@ impl VkContext {
             );
         }
 
+        let mut swapchain_colorspace_supported = false;
         if let Some(display) = display_handle {
             extensions.push(ash::khr::surface::NAME.as_ptr());
             for ext in required_surface_extensions(display)? {
                 extensions.push(ext.as_ptr());
+            }
+            if has_ext(ash::ext::swapchain_colorspace::NAME) {
+                extensions.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+                swapchain_colorspace_supported = true;
             }
         }
 
@@ -223,8 +230,24 @@ impl VkContext {
             .queue_priorities(&queue_priority)];
 
         let mut device_exts: Vec<*const i8> = Vec::new();
+        let mut hdr_metadata_supported = false;
         if display_handle.is_some() {
             device_exts.push(ash::khr::swapchain::NAME.as_ptr());
+            // Enable VK_EXT_hdr_metadata when supported so HDR10 monitors receive real ST.2086 mastering metadata.
+            if let Ok(avail_dev_exts) = unsafe {
+                instance.enumerate_device_extension_properties(physical_device)
+            } {
+                let has_dev_ext = |name: &CStr| {
+                    avail_dev_exts.iter().any(|e| {
+                        // SAFETY: Vulkan guarantees null-terminated extension names.
+                        unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name }
+                    })
+                };
+                if has_dev_ext(ash::ext::hdr_metadata::NAME) {
+                    device_exts.push(ash::ext::hdr_metadata::NAME.as_ptr());
+                    hdr_metadata_supported = true;
+                }
+            }
         }
 
         let enabled_features = vk::PhysicalDeviceFeatures::default()
@@ -284,6 +307,8 @@ impl VkContext {
             min_uniform_offset_alignment,
             max_anisotropy,
             fill_mode_non_solid,
+            swapchain_colorspace_supported,
+            hdr_metadata_supported,
             depth_format,
             allocator: Some(allocator),
             available_devices,

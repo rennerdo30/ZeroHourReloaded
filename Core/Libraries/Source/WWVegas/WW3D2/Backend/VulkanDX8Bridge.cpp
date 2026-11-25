@@ -3670,7 +3670,14 @@ private:
                     const float dot_c = ita->second.x * itb->second.x +
                                         ita->second.y * itb->second.y +
                                         ita->second.z * itb->second.z;
-                    if (dot_c > 0.18f && dot_c < 0.992f)
+                    const float axy = std::sqrt(ita->second.x * ita->second.x + ita->second.y * ita->second.y);
+                    const float bxy = std::sqrt(itb->second.x * itb->second.x + itb->second.y * itb->second.y);
+                    float dot_xy = 1.0f;
+                    if (axy > 0.14f && bxy > 0.14f)
+                    {
+                        dot_xy = (ita->second.x * itb->second.x + ita->second.y * itb->second.y) / (axy * bxy);
+                    }
+                    if ((dot_c > 0.18f && dot_c < 0.992f) || (dot_xy > 0.18f && dot_xy < 0.985f))
                     {
                         p0_curved_edges.insert(make_spatial_edge(ka, kb));
                         tri_has_curve_arc = true;
@@ -3780,16 +3787,59 @@ private:
 
             if (use_curve_ring && dist_sq > 1e-4f && dist_sq < 40000.0f)
             {
-                const float dot_c = ca.x * cb.x + ca.y * cb.y + ca.z * cb.z;
-                if (dot_c > 0.18f && dot_c < 0.995f)
+                const float dist_xy = std::sqrt(dx * dx + dy * dy);
+                const float axy = std::sqrt(ca.x * ca.x + ca.y * ca.y);
+                const float bxy = std::sqrt(cb.x * cb.x + cb.y * cb.y);
+                bool used_xy_ring = false;
+                // Surface-of-revolution horizontal ring (domes, cones, spires, beveled collars):
+                // Project in the horizontal XY plane using normalized radial XY normals so sloped 6-sided
+                // domes (where nz ~ 0.5..0.95 shrinks 3D normal divergence) still circularize with exact
+                // 60-deg arc sagitta all the way from base collar to spire tip!
+                if (dist_xy > 0.05f && std::fabs(dz) <= 0.45f * dist_xy && axy > 0.14f && bxy > 0.14f)
                 {
-                    // Exact analytic circle sagitta factor: 1 / (cos(theta/2) * (1 + cos(theta/2)))
-                    // 72-deg pentagon -> 0.683 (exact 10-gon -> 20-gon), 60-deg hexagon -> 0.619 (12 -> 24), 45-deg -> 0.563.
-                    const float cos_half = std::sqrt(std::max(0.5f * (1.0f + dot_c), 0.25f));
-                    const float exact_alpha = std::clamp(1.0f / (cos_half * (1.0f + cos_half)), 0.48f, 0.72f);
-                    project_circular_midpoint(va.position, vb.position,
-                                              ca.x, ca.y, ca.z, cb.x, cb.y, cb.z,
-                                              dot_c, exact_alpha, mid.position);
+                    const float hax = ca.x / axy, hay = ca.y / axy;
+                    const float hbx = cb.x / bxy, hby = cb.y / bxy;
+                    const float dot_xy = hax * hbx + hay * hby;
+                    if (dot_xy > 0.18f && dot_xy < 0.995f)
+                    {
+                        const float cos_half = std::sqrt(std::max(0.5f * (1.0f + dot_xy), 0.25f));
+                        const float exact_alpha = std::clamp(1.0f / (cos_half * (1.0f + cos_half)), 0.48f, 0.72f);
+                        const float mx = mid.position[0];
+                        const float my = mid.position[1];
+                        const float da = (mx - va.position[0]) * hax + (my - va.position[1]) * hay;
+                        const float db = (mx - vb.position[0]) * hbx + (my - vb.position[1]) * hby;
+                        const float pax = mx - da * hax;
+                        const float pay = my - da * hay;
+                        const float pbx = mx - db * hbx;
+                        const float pby = my - db * hby;
+                        float ox = exact_alpha * (0.5f * (pax + pbx) - mx);
+                        float oy = exact_alpha * (0.5f * (pay + pby) - my);
+                        const float off_sq = ox * ox + oy * oy;
+                        const float max_off = 0.24f * dist_xy;
+                        if (off_sq > max_off * max_off && off_sq > 1e-12f)
+                        {
+                            const float sc = max_off / std::sqrt(off_sq);
+                            ox *= sc;
+                            oy *= sc;
+                        }
+                        mid.position[0] = mx + ox;
+                        mid.position[1] = my + oy;
+                        used_xy_ring = true;
+                    }
+                }
+                if (!used_xy_ring)
+                {
+                    const float dot_c = ca.x * cb.x + ca.y * cb.y + ca.z * cb.z;
+                    if (dot_c > 0.18f && dot_c < 0.995f)
+                    {
+                        // Exact analytic circle sagitta factor: 1 / (cos(theta/2) * (1 + cos(theta/2)))
+                        // 72-deg pentagon -> 0.683 (exact 10-gon -> 20-gon), 60-deg hexagon -> 0.619 (12 -> 24), 45-deg -> 0.563.
+                        const float cos_half = std::sqrt(std::max(0.5f * (1.0f + dot_c), 0.25f));
+                        const float exact_alpha = std::clamp(1.0f / (cos_half * (1.0f + cos_half)), 0.48f, 0.72f);
+                        project_circular_midpoint(va.position, vb.position,
+                                                  ca.x, ca.y, ca.z, cb.x, cb.y, cb.z,
+                                                  dot_c, exact_alpha, mid.position);
+                    }
                 }
                 const float cx = ca.x + cb.x;
                 const float cy = ca.y + cb.y;
@@ -3933,7 +3983,14 @@ private:
                 const float dot_c = subdiv_curve_n[u].x * subdiv_curve_n[v].x +
                                     subdiv_curve_n[u].y * subdiv_curve_n[v].y +
                                     subdiv_curve_n[u].z * subdiv_curve_n[v].z;
-                if (dot_c > 0.18f && dot_c < 0.992f)
+                const float uxy = std::sqrt(subdiv_curve_n[u].x * subdiv_curve_n[u].x + subdiv_curve_n[u].y * subdiv_curve_n[u].y);
+                const float vxy = std::sqrt(subdiv_curve_n[v].x * subdiv_curve_n[v].x + subdiv_curve_n[v].y * subdiv_curve_n[v].y);
+                float dot_xy = 1.0f;
+                if (uxy > 0.14f && vxy > 0.14f)
+                {
+                    dot_xy = (subdiv_curve_n[u].x * subdiv_curve_n[v].x + subdiv_curve_n[u].y * subdiv_curve_n[v].y) / (uxy * vxy);
+                }
+                if ((dot_c > 0.18f && dot_c < 0.992f) || (dot_xy > 0.18f && dot_xy < 0.988f))
                 {
                     p1_curved_edges.insert(make_spatial_edge(ku, kv));
                 }
@@ -5098,4 +5155,25 @@ extern "C" void zhr_vk_set_terrain_heightmap(
 extern "C" void zhr_vk_set_terrain_pass_active(bool active)
 {
     g_zhr_terrain_pass_active.store(active, std::memory_order_relaxed);
+}
+
+extern "C" bool zhr_vk_sample_smooth_terrain_z(float wx, float wy, float* out_z)
+{
+    if (!out_z || !g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed))
+    {
+        return false;
+    }
+    const uint32_t gfx_packed = zhr_vk_get_graphics_mode();
+    if ((gfx_packed & 0x3u) == 0u)
+    {
+        return false;
+    }
+    const auto& hm = g_zhr_terrain_hm;
+    if (hm.data == nullptr || hm.width < 4 || hm.height < 4)
+    {
+        return false;
+    }
+    float dummy_n[3];
+    SampleTerrainSmooth(hm, wx, wy, *out_z, dummy_n);
+    return true;
 }

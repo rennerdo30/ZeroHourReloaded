@@ -433,8 +433,20 @@ void Win32Mouse::setCursor( MouseCursor cursor )
 //-------------------------------------------------------------------------------------------------
 /** Capture the mouse to our application */
 //-------------------------------------------------------------------------------------------------
+#include <cstdlib>
+
+static bool zhrIsHeadlessRenderActive()
+{
+	const char* env = std::getenv("ZHR_HEADLESS_RENDER");
+	return (env != nullptr && env[0] != '\0' && env[0] != '0');
+}
+
 void Win32Mouse::capture()
 {
+	if (zhrIsHeadlessRenderActive())
+	{
+		return;
+	}
 
 	RECT rect;
 	::GetClientRect(ApplicationHWnd, &rect);
@@ -467,6 +479,10 @@ void Win32Mouse::capture()
 //-------------------------------------------------------------------------------------------------
 void Win32Mouse::releaseCapture()
 {
+	if (zhrIsHeadlessRenderActive())
+	{
+		return;
+	}
 
 	if (::ClipCursor(nullptr))
 	{

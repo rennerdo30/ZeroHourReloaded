@@ -31,7 +31,7 @@ use crate::offscreen::{OffscreenTarget, write_rgba8_png};
 use crate::pipeline::PipelineCache;
 use crate::postprocess::{HDR_FORMAT, PostProcessPipeline};
 use crate::shader::{DepthCompare, DstBlend, ShaderKey, SrcBlend, StencilState};
-use crate::surface::SwapchainState;
+use crate::surface::{HdrDisplayConfig, SwapchainState};
 use crate::texture::{GpuTexture, SamplerCache};
 use crate::types::{
     BufferId, ClearState, DeviceInfo, DrawUniforms, FogState, GpuLight, GraphicsMode,
@@ -1341,10 +1341,12 @@ impl VulkanRenderer {
     fn bind_draw_state(&mut self) -> Result<(vk::CommandBuffer, usize)> {
         let is_3d_pass =
             self.shader.depth_compare() != DepthCompare::Always || self.shader.depth_write();
-        // Snapshot opaque 3D depth before the first water draw so water gets exact per-pixel depth
-        // for Beer-Lambert coastal absorption, soft shoreline edges, animated rock foam, and caustics.
+        // Snapshot opaque 3D depth before the first water OR volumetric particle draw so both water
+        // (Beer-Lambert refraction/foam/caustics) and volumetric smoke/fire/explosions (soft depth fade)
+        // have exact per-pixel scene depth even on land-only maps.
+        let needs_scene_depth = matches!(self.material_hint, 1 | 5 | 6);
         if is_3d_pass
-            && self.material_hint == 1
+            && needs_scene_depth
             && self.graphics.mode != GraphicsMode::Classic
             && self.graphics.pbr_lighting
             && self.active_frame.as_ref().is_some_and(|af| {
@@ -1497,8 +1499,17 @@ impl VulkanRenderer {
             && self.material_hint == 2
             && self.graphics.mode != GraphicsMode::Classic
             && af.backdrop_captured;
+        let stage1_free = self.uniforms.stage1_ops[0] == 0;
+        let is_vol_smoke = is_3d_pass
+            && self.material_hint == 5
+            && self.graphics.mode != GraphicsMode::Classic
+            && self.graphics.pbr_lighting;
+        let is_vol_fire = is_3d_pass
+            && self.material_hint == 6
+            && self.graphics.mode != GraphicsMode::Classic
+            && self.graphics.pbr_lighting;
         let use_water_depth = is_3d_pass
-            && self.material_hint == 1
+            && (self.material_hint == 1 || (matches!(self.material_hint, 5 | 6) && stage1_free))
             && self.graphics.mode != GraphicsMode::Classic
             && self.graphics.pbr_lighting
             && af.water_depth_captured;
@@ -1508,6 +1519,10 @@ impl VulkanRenderer {
             } else {
                 2.0
             }
+        } else if is_vol_fire {
+            5.0
+        } else if is_vol_smoke {
+            4.0
         } else if is_3d_pass && self.material_hint == 1 {
             1.0
         } else {
@@ -1748,7 +1763,11 @@ impl VulkanRenderer {
             unsafe { self.ctx.device.cmd_end_rendering(cmd) };
         }
 
-        // Execute HDR bloom + filmic tonemapping + CAS sharpening + A/B split-screen composite into target.
+        // Execute HDR bloom + filmic tonemapping (or native HDR10 PQ / scRGB output) + CAS sharpening + A/B split-screen.
+        let hdr_display = match &self.target {
+            Some(RenderTarget::Windowed(sc)) => sc.hdr,
+            _ => HdrDisplayConfig::default(),
+        };
         if let Some(pp) = &mut self.postprocess {
             pp.execute(
                 &self.ctx.device,
@@ -1759,6 +1778,7 @@ impl VulkanRenderer {
                 af.target_old_layout,
                 af.extent,
                 self.graphics,
+                hdr_display,
             )?;
             self.hdr_initialized = true;
         }

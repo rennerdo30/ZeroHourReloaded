@@ -936,7 +936,10 @@ void GameEngine::update()
 				TheSkirmishGameInfo->setMapCRC(matchedMeta->m_CRC);
 				TheSkirmishGameInfo->setMapSize(matchedMeta->m_filesize);
 
-				Int usaTemplate = ThePlayerTemplateStore ? ThePlayerTemplateStore->getTemplateNumByName("FactionAmerica") : 0;
+				const char* factionEnv = std::getenv("ZHR_HEADLESS_SKIRMISH_FACTION");
+				const char* factionName = (factionEnv != nullptr && factionEnv[0] != '\0') ? factionEnv : "FactionAmerica";
+				Int usaTemplate = ThePlayerTemplateStore ? ThePlayerTemplateStore->getTemplateNumByName(factionName) : 0;
+				if (usaTemplate < 0 && ThePlayerTemplateStore) usaTemplate = ThePlayerTemplateStore->getTemplateNumByName("FactionAmerica");
 				if (usaTemplate < 0) usaTemplate = 0;
 
 				GameSlot* s0 = TheSkirmishGameInfo->getSlot(0);

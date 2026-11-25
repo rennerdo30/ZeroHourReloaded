@@ -37,6 +37,28 @@
 #include "W3DDevice/GameClient/W3DTerrainParticles.h"
 #include "WW3D2/camera.h"
 
+#ifdef ZHR_USE_VULKAN
+#include "zhr_ffi.h"
+namespace {
+struct ZhrParticleHintGuard
+{
+	explicit ZhrParticleHintGuard(ParticleSystemInfo::ParticleShaderType shaderType)
+	{
+		uint32_t hint = 0u;
+		if (shaderType == ParticleSystemInfo::ALPHA)
+			hint = 5u; // Volumetric depth-softened smoke / dust / clouds
+		else if (shaderType == ParticleSystemInfo::ADDITIVE)
+			hint = 6u; // Volumetric blackbody fire / explosions / plasma
+		zhr_vk_set_material_hint(hint);
+	}
+	~ZhrParticleHintGuard()
+	{
+		zhr_vk_set_material_hint(0u);
+	}
+};
+}
+#endif
+
 
 //------------------------------------------------------------------------------ Performance Timers
 //#include "Common/PerfMetrics.h"
@@ -337,7 +359,14 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 
 
 			//RENDER STREAK!
+#ifdef ZHR_USE_VULKAN
+			{
+				ZhrParticleHintGuard particleGuard(sys->getShaderType());
+				m_streakLine->Render( rinfo );
+			}
+#else
 			m_streakLine->Render( rinfo );
+#endif
 			m_onScreenParticleCount += (pointCount - startCount);
 			pointCount = startCount;
 		}
@@ -380,7 +409,14 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 			/// @todo lorenzen sez: unimplemented code wastes cpu cycles
 			m_pointGroup->Set_Point_Frame( 0 );
 
+#ifdef ZHR_USE_VULKAN
+			{
+				ZhrParticleHintGuard particleGuard(sys->getShaderType());
+				m_pointGroup->RenderVolumeParticle( rinfo, volumeParticleDepth);
+			}
+#else
 			m_pointGroup->RenderVolumeParticle( rinfo, volumeParticleDepth);
+#endif
 			m_onScreenParticleCount += (pointCount - startCount);
 			pointCount = startCount;
 		}
@@ -479,7 +515,14 @@ void W3DParticleSystemManager::flushParticleBatch(RenderInfoClass& rinfo, Unsign
 			m_pointGroup->Set_Arrays(m_posBuffer, m_RGBABuffer, nullptr, m_sizeBuffer, m_angleBuffer, nullptr, pointCount);
 			m_pointGroup->Set_Billboard(m_batchParticleAlignment == ParticleSystemInfo::PARTICLE_ALIGNMENT_BILLBOARD);
 			m_pointGroup->Set_Point_Frame(0);
+#ifdef ZHR_USE_VULKAN
+			{
+				ZhrParticleHintGuard particleGuard(m_batchShaderType);
+				m_pointGroup->Render(rinfo);
+			}
+#else
 			m_pointGroup->Render(rinfo);
+#endif
 		}
 
 		pointCount = 0;

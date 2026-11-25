@@ -716,7 +716,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    if (u.water_params.y > 1.5) {
+    if (u.water_params.y > 1.5 && u.water_params.y < 3.5) {
         // Modern Vulkan 1.3 Frosted-Glass UI Backdrop (respects F9 split-screen wipe).
         let glass_active = (u.water_params.y < 2.5) || (in.clip_pos.x >= u.render_flags.z);
         if (glass_active) {
@@ -729,6 +729,93 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 + vec3<f32>(sheen * 0.55, sheen * 0.82, sheen * 1.15);
             col = vec4<f32>(glass_rgb, 0.96);
         }
+    } else if (pbr_active && u.water_params.y >= 3.5 && u.water_params.y < 4.5) {
+        // Volumetric 3D Smoke / Dust / Billowing Clouds (Alpha Particles):
+        // - Spherical optical thickness + animated 3D convection FBM billowing density
+        // - Sun-directional Beer-Lambert self-shadowing + Henyey-Greenstein silver lining
+        // - True soft-particle depth intersection fade against terrain & buildings
+        let t = u.water_params.x;
+        let to_cam = u.camera_pos_and_pbr.xyz - in.world_pos;
+        let cam_dist = length(to_cam);
+        let v_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), to_cam, cam_dist > 0.0001));
+
+        var sun_dir = normalize(vec3<f32>(0.42, 0.28, 0.86));
+        var sun_col = vec3<f32>(1.0, 0.95, 0.86);
+        if (u.lights[0].pos_or_dir_and_kind.w > 0.5 && u.lights[0].pos_or_dir_and_kind.w < 1.5) {
+            sun_dir = normalize(-u.lights[0].pos_or_dir_and_kind.xyz);
+            sun_col = max(u.lights[0].diffuse_and_range.rgb, vec3<f32>(0.78));
+        }
+
+        // Reconstruct volumetric puff thickness & 3D billowing turbulence.
+        let p_uv = clamp(in.uv0 * 2.0 - vec2<f32>(1.0), vec2<f32>(-1.0), vec2<f32>(1.0));
+        let r2 = dot(p_uv, p_uv);
+        let sphere_z = sqrt(max(1.0 - r2, 0.0));
+        let rise = vec2<f32>(in.world_pos.x * 0.055 + t * 0.14, in.world_pos.y * 0.055 + in.world_pos.z * 0.065 - t * 0.55);
+        let billow_a = value_noise(rise);
+        let billow_b = value_noise(rise * 2.15 + vec2<f32>(7.3, -t * 0.72));
+        let vol_fbm = billow_a * 0.64 + billow_b * 0.36;
+
+        // 3D volumetric normal tilted toward sky/sun with billowing curl perturbation.
+        let cam_right = normalize(cross(vec3<f32>(0.0, 0.0, 1.0), v_dir) + vec3<f32>(0.0001, 0.0, 0.0));
+        let cam_up = normalize(cross(v_dir, cam_right));
+        let n_puff = normalize(
+            cam_right * (p_uv.x * 0.78 + (billow_b - 0.5) * 0.45)
+            - cam_up * (p_uv.y * 0.78 - (billow_a - 0.5) * 0.45)
+            + v_dir * (0.45 + 0.85 * sphere_z)
+        );
+
+        // Beer-Lambert self-shadowing across the puff volume + Henyey-Greenstein forward scatter.
+        let ndotl = dot(n_puff, sun_dir) * 0.5 + 0.5;
+        let optical_depth = clamp((1.0 - ndotl) * 1.15 + (1.0 - vol_fbm) * 0.45, 0.0, 1.8);
+        let transmittance = exp(-optical_depth * 0.82);
+        let cos_theta = dot(-v_dir, sun_dir);
+        let hg = 0.085 / pow(max(1.0 + 0.25 - 1.0 * cos_theta, 0.22), 1.5);
+        let rim = pow(clamp(1.0 - sphere_z, 0.0, 1.0), 1.8) * (0.45 + 0.55 * vol_fbm);
+
+        let amb_smoke = max(u.ambient_and_lighting.rgb, vec3<f32>(0.32, 0.34, 0.38));
+        let lit_factor = mix(amb_smoke * 0.88, sun_col * 1.16, transmittance)
+            + sun_col * (hg * 0.22 + rim * 0.14 * ndotl);
+
+        // Soft per-pixel depth fade prevents hard quad clipping into terrain or buildings.
+        let has_depth = u.water_params.z > 0.0 && backdrop_sample.a > 0.01 && backdrop_sample.a < 9500.0;
+        let depth_diff = max(backdrop_sample.a - in.view_z, 0.0);
+        let soft_depth = select(1.0, smoothstep(0.0, 8.5, depth_diff), has_depth);
+
+        let vol_density = clamp(col.a * mix(0.84, 1.06, vol_fbm * (0.45 + 0.55 * sphere_z)), 0.0, 1.0);
+        col = vec4<f32>(col.rgb * lit_factor, vol_density * soft_depth);
+    } else if (pbr_active && u.water_params.y >= 4.5) {
+        // Volumetric 3D Fire, Explosions & Plasma (Additive Particles):
+        // - Animated upward 3D FBM flame turbulence + physically-based blackbody HDR core
+        // - Soft per-pixel depth intersection fade against terrain & structures
+        let t = u.water_params.x;
+        let p_uv = clamp(in.uv0 * 2.0 - vec2<f32>(1.0), vec2<f32>(-1.0), vec2<f32>(1.0));
+        let r2 = dot(p_uv, p_uv);
+        let sphere_z = sqrt(max(1.0 - r2, 0.0));
+
+        let flame_coord = vec2<f32>(in.world_pos.x * 0.075, in.world_pos.y * 0.075 + in.world_pos.z * 0.085 - t * 2.65);
+        let f_n1 = value_noise(flame_coord);
+        let f_n2 = value_noise(flame_coord * 2.35 + vec2<f32>(4.1, -t * 3.4));
+        let flame_fbm = f_n1 * 0.62 + f_n2 * 0.38;
+
+        let base_luma = max(col.r, max(col.g, col.b));
+        let warmth = smoothstep(0.04, 0.32, col.r - col.b * 0.72);
+
+        // Blackbody thermal gradient: deep ember -> roaring fire orange -> blinding HDR white-yellow core.
+        let temp = clamp(base_luma * (0.68 + 0.66 * sphere_z) * (0.76 + 0.52 * flame_fbm), 0.0, 2.2);
+        let c_ember = vec3<f32>(0.85, 0.14, 0.02);
+        let c_flame = vec3<f32>(1.45, 0.56, 0.08);
+        let c_core = vec3<f32>(2.95, 2.35, 1.35);
+        let bb_low = mix(c_ember, c_flame, smoothstep(0.08, 0.55, temp));
+        let bb_col = mix(bb_low, c_core, smoothstep(0.55, 1.35, temp)) * smoothstep(0.02, 0.25, temp);
+
+        let energy_boost = col.rgb * (1.0 + 1.15 * smoothstep(0.28, 0.95, base_luma));
+        let fire_rgb = mix(energy_boost, mix(energy_boost * 1.15, bb_col, 0.62), warmth);
+
+        let has_depth = u.water_params.z > 0.0 && backdrop_sample.a > 0.01 && backdrop_sample.a < 9500.0;
+        let depth_diff = max(backdrop_sample.a - in.view_z, 0.0);
+        let soft_depth = select(1.0, smoothstep(0.0, 6.0, depth_diff), has_depth);
+
+        col = vec4<f32>(fire_rgb * soft_depth, col.a * soft_depth);
     } else if (pbr_active && u.water_params.y > 0.5) {
         // Next-Gen Vulkan 1.3 Modern Coastal & Oceanic Water:
         // - True per-pixel depth & screen-space seabed/rock refraction from pre-water HDR snapshot

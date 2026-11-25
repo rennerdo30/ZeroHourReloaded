@@ -2071,9 +2071,35 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 			}
 		}
 
+		const FrustumClass& tileFrustum = rinfo.Camera.Get_Frustum();
+		const Real maxTileSpan = static_cast<Real>(VERTEX_BUFFER_TILE_LENGTH + 2) * MAP_XY_FACTOR;
 		for (j=0; j<m_numVBTilesY; j++)
 			for (i=0; i<m_numVBTilesX; i++)
 			{
+				// Fast conservative per-tile frustum cull so expanded zoom-out draw windows stay
+				// constant across zoom levels without wasting GPU vertex work on off-screen tiles.
+				if (m_vertexBufferBackup != nullptr)
+				{
+					const VERTEX_FORMAT* tv = getVertexBufferBackup(i, j);
+					const VERTEX_FORMAT& v0 = tv[0];
+					const VERTEX_FORMAT& v1 = tv[(VERTEX_BUFFER_TILE_LENGTH - 1) * 4 + 3];
+					const VERTEX_FORMAT& v2 = tv[(VERTEX_BUFFER_TILE_LENGTH - 1) * VERTEX_BUFFER_TILE_LENGTH * 4];
+					const VERTEX_FORMAT& v3 = tv[HEIGHTMAP_VERTEX_NUM - 1];
+					const Real minX = MIN(MIN(v0.x, v1.x), MIN(v2.x, v3.x));
+					const Real maxX = MAX(MAX(v0.x, v1.x), MAX(v2.x, v3.x));
+					const Real minY = MIN(MIN(v0.y, v1.y), MIN(v2.y, v3.y));
+					const Real maxY = MAX(MAX(v0.y, v1.y), MAX(v2.y, v3.y));
+					if ((maxX - minX) <= maxTileSpan && (maxY - minY) <= maxTileSpan)
+					{
+						MinMaxAABoxClass tileBox(
+							Vector3(minX - MAP_XY_FACTOR, minY - MAP_XY_FACTOR, -50.0f),
+							Vector3(maxX + MAP_XY_FACTOR, maxY + MAP_XY_FACTOR, 255.0f * MAP_HEIGHT_SCALE + 50.0f));
+						if (CollisionMath::Overlap_Test(tileFrustum, tileBox) == CollisionMath::OUTSIDE)
+						{
+							continue;
+						}
+					}
+				}
 				DX8Wrapper::Set_Vertex_Buffer(getVertexBufferTile(i, j));
 #ifdef PRE_TRANSFORM_VERTEX
 				if (m_xformedVertexBuffer && pass==0) {
@@ -2212,9 +2238,33 @@ void HeightMapRenderObjClass::renderTerrainPass(CameraClass *pCamera)
 
 	DX8Wrapper::Set_Index_Buffer(m_indexBuffer,0);
 
+	const FrustumClass* passFrustum = pCamera ? &pCamera->Get_Frustum() : nullptr;
+	const Real maxTileSpan = static_cast<Real>(VERTEX_BUFFER_TILE_LENGTH + 2) * MAP_XY_FACTOR;
 	for (Int j=0; j<m_numVBTilesY; j++)
 		for (Int i=0; i<m_numVBTilesX; i++)
 		{
+			if (passFrustum != nullptr && m_vertexBufferBackup != nullptr)
+			{
+				const VERTEX_FORMAT* tv = getVertexBufferBackup(i, j);
+				const VERTEX_FORMAT& v0 = tv[0];
+				const VERTEX_FORMAT& v1 = tv[(VERTEX_BUFFER_TILE_LENGTH - 1) * 4 + 3];
+				const VERTEX_FORMAT& v2 = tv[(VERTEX_BUFFER_TILE_LENGTH - 1) * VERTEX_BUFFER_TILE_LENGTH * 4];
+				const VERTEX_FORMAT& v3 = tv[HEIGHTMAP_VERTEX_NUM - 1];
+				const Real minX = MIN(MIN(v0.x, v1.x), MIN(v2.x, v3.x));
+				const Real maxX = MAX(MAX(v0.x, v1.x), MAX(v2.x, v3.x));
+				const Real minY = MIN(MIN(v0.y, v1.y), MIN(v2.y, v3.y));
+				const Real maxY = MAX(MAX(v0.y, v1.y), MAX(v2.y, v3.y));
+				if ((maxX - minX) <= maxTileSpan && (maxY - minY) <= maxTileSpan)
+				{
+					MinMaxAABoxClass tileBox(
+						Vector3(minX - MAP_XY_FACTOR, minY - MAP_XY_FACTOR, -50.0f),
+						Vector3(maxX + MAP_XY_FACTOR, maxY + MAP_XY_FACTOR, 255.0f * MAP_HEIGHT_SCALE + 50.0f));
+					if (CollisionMath::Overlap_Test(*passFrustum, tileBox) == CollisionMath::OUTSIDE)
+					{
+						continue;
+					}
+				}
+			}
 			DX8Wrapper::Set_Vertex_Buffer(getVertexBufferTile(i, j));
 #ifdef PRE_TRANSFORM_VERTEX
 			if (m_xformedVertexBuffer && pass==0) {

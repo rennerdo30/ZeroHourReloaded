@@ -58,6 +58,10 @@
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
 
+#ifdef ZHR_USE_VULKAN
+extern "C" bool zhr_vk_sample_smooth_terrain_z(float wx, float wy, float* out_z);
+#endif
+
 
 /** @todo: We're going to have a pool of a couple rendertargets to use
 in rare cases when dynamic shadows need to be generated.  Maybe we can
@@ -1071,7 +1075,15 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 				for (i=startX; i <= endX; i++)
 				{
 					hmapVertex.X=(float)(i-borderSize)*MAP_XY_FACTOR;
-					hmapVertex.Z=(float)hmap->getHeight(i,j)*MAP_HEIGHT_SCALE+0.01f * MAP_XY_FACTOR;
+					float decalZ = (float)hmap->getHeight(i,j)*MAP_HEIGHT_SCALE + 0.015f * MAP_XY_FACTOR;
+#ifdef ZHR_USE_VULKAN
+					float smoothZ = 0.0f;
+					if (zhr_vk_sample_smooth_terrain_z(hmapVertex.X, hmapVertex.Y, &smoothZ))
+					{
+						decalZ = std::max(decalZ, smoothZ + 0.015f * MAP_XY_FACTOR);
+					}
+#endif
+					hmapVertex.Z = decalZ;
 					pvVertices->x=hmapVertex.X;
 					pvVertices->y=hmapVertex.Y;
 					pvVertices->z=hmapVertex.Z;
@@ -1731,8 +1743,14 @@ W3DProjectedShadow* W3DProjectedShadowManager::addShadow(RenderObjClass *robj, S
 	Char texture_name[ARRAY_SIZE(shadowInfo->m_ShadowName)];
 
 
-	if (!m_dynamicRenderTarget || !robj || !TheGlobalData->m_useShadowDecals)
-		return nullptr;	//right now we require hardware render-to-texture support
+	if (!robj || !TheGlobalData->m_useShadowDecals)
+		return nullptr;
+
+	// Only dynamic SHADOW_PROJECTION requires hardware render-to-texture; static SHADOW_DECAL
+	// (infantry, GLA workers, trees using premade ShadowI.tga/Shadow.tga) renders directly onto terrain.
+	const Bool isStaticDecal = (shadowInfo != nullptr && shadowInfo->m_type == SHADOW_DECAL);
+	if (!isStaticDecal && !m_dynamicRenderTarget)
+		return nullptr;
 
 
 	if (shadowInfo)

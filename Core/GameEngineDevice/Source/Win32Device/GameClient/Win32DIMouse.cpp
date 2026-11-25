@@ -348,10 +348,14 @@ void DirectInputMouse::init()
 	openMouse();
 
 	// move the window mouse to the location we have initialized in our system
-	p.x = m_currMouse.pos.x;
-	p.y = m_currMouse.pos.y;
-	ClientToScreen( ApplicationHWnd, &p );
-	SetCursorPos( p.x, p.y );
+	const char* headlessEnv = std::getenv("ZHR_HEADLESS_RENDER");
+	if (headlessEnv == nullptr || headlessEnv[0] == '\0' || headlessEnv[0] == '0')
+	{
+		p.x = m_currMouse.pos.x;
+		p.y = m_currMouse.pos.y;
+		ClientToScreen( ApplicationHWnd, &p );
+		SetCursorPos( p.x, p.y );
+	}
 //	ShowCursor( FALSE );
 
 }
@@ -413,7 +417,9 @@ void DirectInputMouse::setMouseLimits()
 	// window cause it's annoying to mouse out of the window and click
 	// on a background window.
 	//
-	if( TheDisplay && TheDisplay->getWindowed() == TRUE )
+	const char* headlessEnv = std::getenv("ZHR_HEADLESS_RENDER");
+	const bool isHeadless = (headlessEnv != nullptr && headlessEnv[0] != '\0' && headlessEnv[0] != '0');
+	if( !isHeadless && TheDisplay && TheDisplay->getWindowed() == TRUE )
 	{
 		RECT windowRect;
 
@@ -436,6 +442,12 @@ void DirectInputMouse::setPosition( Int x, Int y )
 
 	// extending functionality
 	Mouse::setPosition( x, y );
+
+	const char* headlessEnv = std::getenv("ZHR_HEADLESS_RENDER");
+	if (headlessEnv != nullptr && headlessEnv[0] != '\0' && headlessEnv[0] != '0')
+	{
+		return;
+	}
 
 	// set the windows cursor
 	p.x = x;

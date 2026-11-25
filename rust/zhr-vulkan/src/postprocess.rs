@@ -9,6 +9,7 @@ use crate::context::VkContext;
 use crate::error::Result;
 use crate::offscreen::create_attachment;
 use crate::shader::{compile_wgsl_to_spirv, create_shader_module};
+use crate::surface::HdrDisplayConfig;
 use crate::types::{GraphicsMode, GraphicsSettings};
 
 pub const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -118,15 +119,16 @@ fn fs_ssao_raw(in: VsOut) -> @location(0) vec4<f32> {
         n_view = -n_view;
     }
 
-    // Distance-adaptive world-space radius (works seamlessly from close-up units to high RTS camera).
-    let world_radius = clamp(z_c * 0.020, 0.25, 11.0);
+    // Distance-adaptive world-space radius (crisp contact AO on small workers/infantry AND large buildings,
+    // with tighter max screen_radius so close-up 4K zoom stays cache-friendly at high FPS).
+    let world_radius = clamp(z_c * 0.018, 0.22, 9.5);
     let screen_radius = clamp(
         vec2<f32>(
             world_radius / max(z_c * u.params2.x * 2.0, 0.001),
             world_radius / max(z_c * u.params2.y * 2.0, 0.001)
         ),
         texel * 2.0,
-        vec2<f32>(0.045, 0.045)
+        vec2<f32>(0.028, 0.028)
     );
 
     // Interleaved Gradient Noise per-pixel rotation (zero grid banding).
@@ -135,8 +137,8 @@ fn fs_ssao_raw(in: VsOut) -> @location(0) vec4<f32> {
     let golden_step = 2.3999632;
 
     var occ = 0.0;
-    let samples: u32 = 12u;
-    let bias = world_radius * 0.045;
+    let samples: u32 = 8u;
+    let bias = world_radius * 0.032;
     for (var i: u32 = 0u; i < samples; i = i + 1u) {
         let fi = (f32(i) + 0.5) / f32(samples);
         let r = sqrt(fi);
@@ -286,20 +288,72 @@ fn filmic_tonemap_hdr(hdr: vec3<f32>) -> vec3<f32> {
     return clamp(mix(soft, srgb, 0.65), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+fn rec709_to_rec2020(c: vec3<f32>) -> vec3<f32> {
+    let r = 0.6274040 * c.r + 0.3292820 * c.g + 0.0433136 * c.b;
+    let g = 0.0690970 * c.r + 0.9195400 * c.g + 0.0113612 * c.b;
+    let b = 0.0163916 * c.r + 0.0880132 * c.g + 0.8955950 * c.b;
+    return max(vec3<f32>(r, g, b), vec3<f32>(0.0));
+}
+
+fn linear_to_st2084_pq(lin_10k: vec3<f32>) -> vec3<f32> {
+    // SMPTE ST.2084 (PQ) OETF for normalized luminance in [0..1] where 1.0 = 10,000 nits.
+    let y = clamp(lin_10k, vec3<f32>(0.0), vec3<f32>(1.0));
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let ym1 = pow(y, vec3<f32>(m1));
+    return pow((vec3<f32>(c1) + c2 * ym1) / (vec3<f32>(1.0) + c3 * ym1), vec3<f32>(m2));
+}
+
+fn encode_display_hdr(lin_rec709: vec3<f32>, hdr_mode: f32, paper_white_nits: f32, max_nits: f32) -> vec3<f32> {
+    let peak_ratio = max(max_nits / max(paper_white_nits, 80.0), 1.5);
+    // Smooth luminance-preserving HDR highlight shoulder: diffuse [0..1] stays faithful at paper white,
+    // while HDR explosions, fireballs, sun glints, and lasers roll smoothly up to display peak nits.
+    let luma = max(dot(lin_rec709, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0001);
+    var mapped = lin_rec709;
+    if (luma > 0.85) {
+        let excess = luma - 0.85;
+        let headroom = max(peak_ratio - 0.85, 0.5);
+        let compressed = 0.85 + headroom * (excess / (excess + headroom));
+        mapped = lin_rec709 * (compressed / luma);
+    }
+    if (hdr_mode < 1.5) {
+        // Native HDR10 PQ (`A2B10G10R10_UNORM_PACK32` + `HDR10_ST2084_EXT`)
+        let rec2020 = rec709_to_rec2020(mapped);
+        let nits_norm = rec2020 * (paper_white_nits / 10000.0);
+        return linear_to_st2084_pq(nits_norm);
+    }
+    // Windows scRGB linear (`R16G16B16A16_SFLOAT` + `EXTENDED_SRGB_LINEAR_EXT`, 1.0 = 80 nits)
+    return mapped * (paper_white_nits / 80.0);
+}
+
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let raw = textureSample(t_src0, s_samp, in.uv);
     let post_enabled = u.params0.x > 0.5;
     let split_x = u.params0.y;
     let texel = vec2<f32>(u.params0.z, u.params0.w);
+    let hdr_mode = u.params2.x;
+    let paper_white_nits = max(u.params2.y, 100.0);
+    let max_nits = max(u.params2.z, 250.0);
 
     if (split_x > 0.0 && abs(in.uv.x - split_x) < texel.x * 1.5) {
-        return vec4<f32>(1.0, 0.82, 0.28, 1.0);
+        let divider = vec3<f32>(1.0, 0.82, 0.28);
+        if (hdr_mode > 0.5) {
+            return vec4<f32>(encode_display_hdr(pow(divider, vec3<f32>(2.2)), hdr_mode, paper_white_nits, max_nits), 1.0);
+        }
+        return vec4<f32>(divider, 1.0);
     }
 
     let use_remastered = post_enabled && (split_x <= 0.0 || in.uv.x >= split_x);
     if (!use_remastered) {
-        return vec4<f32>(clamp(raw.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), raw.a);
+        let sdr = clamp(raw.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+        if (hdr_mode > 0.5) {
+            return vec4<f32>(encode_display_hdr(pow(sdr, vec3<f32>(2.2)), hdr_mode, paper_white_nits, max_nits), raw.a);
+        }
+        return vec4<f32>(sdr, raw.a);
     }
 
     // AMD FidelityFX-style Contrast-Adaptive Sharpening (5-tap cross, clamped to avoid halos).
@@ -317,6 +371,19 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let bloom = textureSample(t_src1, s_samp, in.uv).rgb;
     let hdr = max(cas_rgb + bloom * u.params1.w, vec3<f32>(0.0));
 
+    let centered = in.uv * 2.0 - vec2<f32>(1.0);
+    let vig = clamp(1.0 - dot(centered, centered) * 0.055, 0.88, 1.0);
+
+    if (hdr_mode > 0.5) {
+        // Real Hardware HDR Display Output (HDR10 ST.2084 PQ or scRGB linear):
+        // Preserve full linear HDR headroom for explosions, fireballs, lasers, and sunlit water glints!
+        let lin_base = pow(max(hdr, vec3<f32>(0.0)), vec3<f32>(2.2));
+        let luma = dot(lin_base, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let vib_lin = max(mix(vec3<f32>(luma), lin_base, 1.07), vec3<f32>(0.0)) * vig;
+        let out_hdr = encode_display_hdr(vib_lin, hdr_mode, paper_white_nits, max_nits);
+        return vec4<f32>(out_hdr, 1.0);
+    }
+
     var col = filmic_tonemap_hdr(hdr);
 
     let luma = dot(col, vec3<f32>(0.299, 0.587, 0.114));
@@ -325,10 +392,7 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let sat = max_c - min_c;
     let vib = (1.0 - sat) * 0.08;
     col = clamp(mix(vec3<f32>(luma), col, 1.0 + vib), vec3<f32>(0.0), vec3<f32>(1.0));
-
-    let centered = in.uv * 2.0 - vec2<f32>(1.0);
-    let vig = 1.0 - dot(centered, centered) * 0.055;
-    col = col * clamp(vig, 0.88, 1.0);
+    col = col * vig;
 
     return vec4<f32>(col, 1.0);
 }
@@ -1527,6 +1591,7 @@ impl PostProcessPipeline {
         target_old_layout: vk::ImageLayout,
         target_extent: vk::Extent2D,
         settings: GraphicsSettings,
+        hdr_display: HdrDisplayConfig,
     ) -> Result<()> {
         let post_active = settings.mode != GraphicsMode::Classic && settings.post_fx;
         let split_x_uv = if settings.mode == GraphicsMode::SplitScreen {
@@ -1569,7 +1634,12 @@ impl PostProcessPipeline {
                 inv_h,
             ],
             params1: [0.0, 0.0, 1.14, 0.24],
-            params2: [0.0; 4],
+            params2: [
+                (hdr_display.mode as u32) as f32,
+                hdr_display.paper_white_nits,
+                hdr_display.max_luminance_nits,
+                0.0,
+            ],
         };
 
         self.params_ubo

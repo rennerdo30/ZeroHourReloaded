@@ -3716,6 +3716,31 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 		return false;
 	}
 
+	if (m_isUserControlled)
+	{
+		// ZeroHourReloaded: keep a single constant terrain draw window for the user camera based on
+		// the configured max zoom scale (`m_zhrCameraZoomScale`) and low-angle pitch width, rather than
+		// varying dimensions frame-by-frame with live camera height/pitch. Varying dimensions every frame
+		// during zoom called `setTerrainDrawSize()` -> `initHeightData()`, rebuilding all terrain VBs/IBs
+		// and invalidating the Vulkan VRAM tile cache (causing 400 -> 100 FPS drops while zooming).
+		const Real zoomRatio = clamp(1.0f, m_zhrCameraZoomScale, 2.75f);
+		dimensions.x = MAX(
+			REAL_TO_INT_CEIL(static_cast<Real>(WorldHeightMap::NORMAL_DRAW_WIDTH) * zoomRatio),
+			static_cast<Int>(WorldHeightMap::LOW_ANGLE_DRAW_WIDTH));
+		dimensions.y = MAX(
+			REAL_TO_INT_CEIL(static_cast<Real>(WorldHeightMap::NORMAL_DRAW_HEIGHT) * zoomRatio),
+			static_cast<Int>(WorldHeightMap::LOW_ANGLE_DRAW_HEIGHT));
+		if (TheTerrainRenderObject)
+		{
+			if (const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap())
+			{
+				dimensions.x = MIN(dimensions.x, heightMap->getXExtent());
+				dimensions.y = MIN(dimensions.y, heightMap->getYExtent());
+			}
+		}
+		return true;
+	}
+
 	const Real cameraPitch = asin(fabs(m_3DCamera->Get_Forward_Dir().Z));
 
 	if (cameraPitch > ViewDefaultLowPitchRadians || !m_isUserControlled)
@@ -3724,23 +3749,6 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 		// and uses terrain oversize if it needs to enlarge.
 		dimensions.x = WorldHeightMap::NORMAL_DRAW_WIDTH;
 		dimensions.y = WorldHeightMap::NORMAL_DRAW_HEIGHT;
-		// ZeroHourReloaded: expand terrain draw window smoothly when zoomed out above classic height
-		// so wide/4K monitors never clip map corners at 1.6x-2.5x zoom-out.
-		if (m_isUserControlled && TheGlobalData && TheGlobalData->m_maxCameraHeight > 1.0f &&
-			m_currentHeightAboveGround > TheGlobalData->m_maxCameraHeight * 1.05f)
-		{
-			const Real zoomRatio = clamp(1.0f, m_currentHeightAboveGround / TheGlobalData->m_maxCameraHeight, 2.75f);
-			dimensions.x = REAL_TO_INT_CEIL(static_cast<Real>(dimensions.x) * zoomRatio);
-			dimensions.y = REAL_TO_INT_CEIL(static_cast<Real>(dimensions.y) * zoomRatio);
-			if (TheTerrainRenderObject)
-			{
-				if (const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap())
-				{
-					dimensions.x = MIN(dimensions.x, heightMap->getXExtent());
-					dimensions.y = MIN(dimensions.y, heightMap->getYExtent());
-				}
-			}
-		}
 		return true;
 	}
 
