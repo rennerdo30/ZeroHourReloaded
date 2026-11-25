@@ -98,8 +98,10 @@ struct ActiveFrame {
     depth_format: vk::Format,
     extent: vk::Extent2D,
     rendering_begun: bool,
+    msaa_active: bool,
     has_3d_depth_writes: bool,
     ssao_applied: bool,
+    smaa_applied: bool,
     backdrop_captured: bool,
     water_depth_captured: bool,
     last_3d_proj: Mat4,
@@ -1142,6 +1144,11 @@ impl VulkanRenderer {
         // SAFETY: Valid image barrier on recording command buffer.
         unsafe { self.ctx.device.cmd_pipeline_barrier2(cmd, &dep) };
 
+        let msaa_active = self.graphics.mode != GraphicsMode::Classic
+            && self.ctx.msaa_samples != vk::SampleCountFlags::TYPE_1
+            && pp.hdr_msaa_view().is_some()
+            && pp.depth_msaa_view().is_some();
+
         self.pending_clear = None;
         self.active_frame = Some(ActiveFrame {
             slot_index,
@@ -1156,8 +1163,10 @@ impl VulkanRenderer {
             depth_format,
             extent,
             rendering_begun: false,
+            msaa_active,
             has_3d_depth_writes: false,
             ssao_applied: false,
+            smaa_applied: false,
             backdrop_captured: false,
             water_depth_captured: false,
             last_3d_proj: Mat4::IDENTITY,
@@ -1245,41 +1254,113 @@ impl VulkanRenderer {
             ..Default::default()
         });
 
-        let color_att = [vk::RenderingAttachmentInfo::default()
-            .image_view(af.hdr_view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(if clear.clear_color {
-                vk::AttachmentLoadOp::CLEAR
-            } else {
-                vk::AttachmentLoadOp::LOAD
-            })
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: clear.color,
-                },
-            })];
-
-        let depth_att = vk::RenderingAttachmentInfo::default()
-            .image_view(af.depth_view)
-            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .load_op(if clear.clear_depth_stencil {
-                vk::AttachmentLoadOp::CLEAR
-            } else {
-                vk::AttachmentLoadOp::LOAD
-            })
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: clear.depth,
-                    stencil: clear.stencil,
-                },
-            });
-
         let has_stencil = matches!(
             af.depth_format,
             vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D24_UNORM_S8_UINT
         );
+
+        let pp_msaa = if af.msaa_active {
+            self.postprocess
+                .as_ref()
+                .and_then(|pp| Some((pp.hdr_msaa_view()?, pp.depth_msaa_view()?)))
+        } else {
+            None
+        };
+
+        let color_att = [if let Some((hdr_msaa_view, _)) = pp_msaa {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(hdr_msaa_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                .resolve_image_view(af.hdr_view)
+                .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(if clear.clear_color {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                })
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: clear.color,
+                    },
+                })
+        } else {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(af.hdr_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(if clear.clear_color {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                })
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: clear.color,
+                    },
+                })
+        }];
+
+        let (depth_att, stencil_att) = if let Some((_, depth_msaa_view)) = pp_msaa {
+            let d = vk::RenderingAttachmentInfo::default()
+                .image_view(depth_msaa_view)
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                .resolve_image_view(af.depth_view)
+                .resolve_image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(if clear.clear_depth_stencil {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                })
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: clear.depth,
+                        stencil: clear.stencil,
+                    },
+                });
+            let mut s = vk::RenderingAttachmentInfo::default()
+                .image_view(depth_msaa_view)
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(if clear.clear_depth_stencil {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                })
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: clear.depth,
+                        stencil: clear.stencil,
+                    },
+                });
+            if !self.ctx.independent_resolve_none && self.ctx.stencil_resolve_sample_zero {
+                s = s
+                    .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                    .resolve_image_view(af.depth_view)
+                    .resolve_image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            }
+            (d, s)
+        } else {
+            let d = vk::RenderingAttachmentInfo::default()
+                .image_view(af.depth_view)
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(if clear.clear_depth_stencil {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                })
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: clear.depth,
+                        stencil: clear.stencil,
+                    },
+                });
+            (d, d)
+        };
 
         let mut rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
@@ -1290,7 +1371,7 @@ impl VulkanRenderer {
             .color_attachments(&color_att)
             .depth_attachment(&depth_att);
         if has_stencil {
-            rendering_info = rendering_info.stencil_attachment(&depth_att);
+            rendering_info = rendering_info.stencil_attachment(&stencil_att);
         }
 
         let cmd = self.frames[af.slot_index].cmd;
@@ -1311,6 +1392,14 @@ impl VulkanRenderer {
                 && self.graphics.mode != GraphicsMode::Classic
                 && self.graphics.pbr_lighting
         });
+        let do_smaa = self.active_frame.as_ref().is_some_and(|af| {
+            af.rendering_begun
+                && af.has_3d_depth_writes
+                && !af.smaa_applied
+                && self.graphics.mode != GraphicsMode::Classic
+                && self.graphics.post_fx
+                && self.ctx.smaa_enabled
+        });
         let do_backdrop = capture_backdrop
             && self.graphics.mode != GraphicsMode::Classic
             && self.active_frame.as_ref().is_some_and(|af| {
@@ -1318,7 +1407,14 @@ impl VulkanRenderer {
                     && !af.backdrop_captured
                     && (af.has_3d_depth_writes || self.material_hint == 2)
             });
-        if !do_ssao && !do_backdrop {
+        // Transition 3D MSAA pass -> resolved 1x target when entering 2D HUD/UI so UI renders at crisp native 1x
+        // without overwriting SSAO/SMAA.
+        let finish_msaa_for_ui = capture_backdrop
+            && self
+                .active_frame
+                .as_ref()
+                .is_some_and(|af| af.rendering_begun && af.msaa_active && af.has_3d_depth_writes);
+        if !do_ssao && !do_smaa && !do_backdrop && !finish_msaa_for_ui {
             return Ok(());
         }
         let (slot_index, depth_image, depth_format, last_3d_proj) = {
@@ -1326,8 +1422,14 @@ impl VulkanRenderer {
             if do_ssao {
                 af.ssao_applied = true;
             }
+            if do_smaa {
+                af.smaa_applied = true;
+            }
             if do_backdrop {
                 af.backdrop_captured = true;
+            }
+            if do_ssao || do_smaa || finish_msaa_for_ui {
+                af.msaa_active = false;
             }
             af.rendering_begun = false;
             af.last_pipeline = None;
@@ -1341,7 +1443,7 @@ impl VulkanRenderer {
             )
         };
         let cmd = self.frames[slot_index].cmd;
-        // SAFETY: `cmd_begin_rendering` was active for the 3D scene pass.
+        // SAFETY: `cmd_begin_rendering` was active for the 3D scene pass (auto-resolves 4x MSAA -> 1x hdr_scene + depth).
         unsafe { self.ctx.device.cmd_end_rendering(cmd) };
         if let Some(pp) = &mut self.postprocess {
             if do_ssao {
@@ -1354,6 +1456,9 @@ impl VulkanRenderer {
                     last_3d_proj,
                     self.graphics,
                 )?;
+            }
+            if do_smaa {
+                pp.apply_smaa(&self.ctx.device, cmd, slot_index, self.graphics)?;
             }
             if do_backdrop {
                 pp.capture_ui_backdrop(&self.ctx.device, cmd, slot_index)?;
@@ -1442,6 +1547,11 @@ impl VulkanRenderer {
             && !is_stencil_only_pass
             && (is_mesh_wire || is_terrain_wire);
 
+        let active_samples = if af.msaa_active {
+            self.ctx.msaa_samples
+        } else {
+            vk::SampleCountFlags::TYPE_1
+        };
         let pso = self.pipelines.get_or_create(
             &self.ctx.device,
             self.shader,
@@ -1449,6 +1559,7 @@ impl VulkanRenderer {
             HDR_FORMAT,
             af.depth_format,
             draw_wireframe,
+            active_samples,
         )?;
         let cmd = self.frames[slot_index].cmd;
 

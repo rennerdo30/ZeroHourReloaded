@@ -162,6 +162,29 @@ pub fn create_attachment(
     usage: vk::ImageUsageFlags,
     aspect: vk::ImageAspectFlags,
 ) -> Result<(vk::Image, vk::ImageView, Allocation)> {
+    create_attachment_msaa(
+        ctx,
+        name,
+        width,
+        height,
+        format,
+        usage,
+        aspect,
+        vk::SampleCountFlags::TYPE_1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_attachment_msaa(
+    ctx: &mut VkContext,
+    name: &str,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    aspect: vk::ImageAspectFlags,
+    samples: vk::SampleCountFlags,
+) -> Result<(vk::Image, vk::ImageView, Allocation)> {
     let img_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
@@ -172,7 +195,7 @@ pub fn create_attachment(
         })
         .mip_levels(1)
         .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
+        .samples(samples)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -218,8 +241,8 @@ pub fn create_attachment(
     // SAFETY: `image` is valid and bound.
     let view = unsafe { ctx.device.create_image_view(&view_info, None)? };
 
-    // Transition depth/stencil attachments once into DEPTH_STENCIL_ATTACHMENT_OPTIMAL so
-    // dynamic rendering never observes UNDEFINED layout.
+    // Transition depth/stencil attachments (and MSAA color attachments) once into their attachment
+    // layouts so dynamic rendering with LOAD never observes UNDEFINED layout.
     if aspect.contains(vk::ImageAspectFlags::DEPTH) {
         let mut barrier_aspect = vk::ImageAspectFlags::DEPTH;
         if matches!(
@@ -243,6 +266,28 @@ pub fn create_attachment(
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(barrier_aspect)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )];
+            let dep = vk::DependencyInfo::default().image_memory_barriers(&barrier);
+            // SAFETY: Valid image transition inside one-shot command buffer.
+            unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
+        })?;
+    } else if aspect.contains(vk::ImageAspectFlags::COLOR) && samples != vk::SampleCountFlags::TYPE_1 {
+        ctx.submit_immediate(|device, cmd| {
+            let barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
                         .base_mip_level(0)
                         .level_count(1)
                         .base_array_layer(0)

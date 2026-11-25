@@ -7,14 +7,14 @@ use gpu_allocator::vulkan::Allocation;
 use crate::buffer::GpuBuffer;
 use crate::context::VkContext;
 use crate::error::Result;
-use crate::offscreen::create_attachment;
+use crate::offscreen::create_attachment_msaa;
 use crate::shader::{compile_wgsl_to_spirv, create_shader_module};
 use crate::surface::HdrDisplayConfig;
 use crate::types::{GraphicsMode, GraphicsSettings};
 
 pub const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-const SLOTS_PER_FRAME: usize = 12;
+const SLOTS_PER_FRAME: usize = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -396,6 +396,218 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
 
     return vec4<f32>(col, 1.0);
 }
+
+// ============================================================================
+// 3-Pass SMAA 1x (Subpixel Morphological Anti-Aliasing) on Resolved 3D Scene
+// Cleans alpha-tested barbed wire, fences, palm fronds, shadows & specular edges
+// with zero desert-sand texture blur and zero softening of 2D HUD/UI.
+// ============================================================================
+
+fn smaa_perceptual(c: vec3<f32>) -> vec3<f32> {
+    // Reinhard-like perceptual compression so HDR highlights never cause false super-edges.
+    let clamped = max(c, vec3<f32>(0.0));
+    return clamped / (vec3<f32>(1.0) + clamped);
+}
+
+fn smaa_color_delta(a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let d = abs(a - b);
+    return max(max(d.r, d.g), d.b);
+}
+
+@fragment
+fn fs_smaa_edges(in: VsOut) -> @location(0) vec4<f32> {
+    let split_x = u.params0.y;
+    if (u.params0.x < 0.5 || (split_x > 0.0 && in.uv.x < split_x)) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    let texel = vec2<f32>(u.params0.z, u.params0.w);
+    let threshold = u.params1.z; // ~0.075 perceptual delta
+
+    let c   = smaa_perceptual(textureSampleLevel(t_src0, s_samp, in.uv, 0.0).rgb);
+    let c_l = smaa_perceptual(textureSampleLevel(t_src0, s_samp, in.uv + vec2<f32>(-texel.x, 0.0), 0.0).rgb);
+    let c_t = smaa_perceptual(textureSampleLevel(t_src0, s_samp, in.uv + vec2<f32>(0.0, -texel.y), 0.0).rgb);
+
+    let d_left = smaa_color_delta(c, c_l);
+    let d_top  = smaa_color_delta(c, c_t);
+
+    var edge_l = select(0.0, 1.0, d_left >= threshold);
+    var edge_t = select(0.0, 1.0, d_top  >= threshold);
+
+    if (edge_l + edge_t < 0.5) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
+    // Local Contrast Adaptation (Jimenez SMAA): suppress weak noisy edges next to strong edges
+    // so fine sand grain and tank rivets stay crisp while true silhouettes/wires get smoothed.
+    let c_r  = smaa_perceptual(textureSampleLevel(t_src0, s_samp, in.uv + vec2<f32>( texel.x, 0.0), 0.0).rgb);
+    let c_b  = smaa_perceptual(textureSampleLevel(t_src0, s_samp, in.uv + vec2<f32>(0.0,  texel.y), 0.0).rgb);
+    let c_ll = smaa_perceptual(textureSampleLevel(t_src0, s_samp, in.uv + vec2<f32>(-2.0 * texel.x, 0.0), 0.0).rgb);
+    let c_tt = smaa_perceptual(textureSampleLevel(t_src0, s_samp, in.uv + vec2<f32>(0.0, -2.0 * texel.y), 0.0).rgb);
+
+    let max_d = max(
+        max(max(d_left, d_top), max(smaa_color_delta(c, c_r), smaa_color_delta(c, c_b))),
+        max(smaa_color_delta(c_l, c_ll), smaa_color_delta(c_t, c_tt))
+    );
+    let adapt = max_d * 0.5;
+    edge_l = select(0.0, edge_l, d_left >= adapt);
+    edge_t = select(0.0, edge_t, d_top  >= adapt);
+    return vec4<f32>(edge_l, edge_t, 0.0, 1.0);
+}
+
+fn smaa_search_x_left(uv: vec2<f32>, texel: vec2<f32>) -> f32 {
+    var d = 0.0;
+    for (var i: i32 = 1; i <= 14; i = i + 1) {
+        let e = textureSampleLevel(t_src0, s_samp, uv + vec2<f32>(-f32(i) * texel.x, 0.0), 0.0);
+        if (e.g < 0.5) {
+            break;
+        }
+        d = f32(i);
+        if (e.r > 0.5) {
+            break;
+        }
+    }
+    return d;
+}
+
+fn smaa_search_x_right(uv: vec2<f32>, texel: vec2<f32>) -> f32 {
+    var d = 0.0;
+    for (var i: i32 = 1; i <= 14; i = i + 1) {
+        let e = textureSampleLevel(t_src0, s_samp, uv + vec2<f32>(f32(i) * texel.x, 0.0), 0.0);
+        if (e.g < 0.5) {
+            break;
+        }
+        d = f32(i);
+        if (e.r > 0.5) {
+            break;
+        }
+    }
+    return d;
+}
+
+fn smaa_search_y_up(uv: vec2<f32>, texel: vec2<f32>) -> f32 {
+    var d = 0.0;
+    for (var i: i32 = 1; i <= 14; i = i + 1) {
+        let e = textureSampleLevel(t_src0, s_samp, uv + vec2<f32>(0.0, -f32(i) * texel.y), 0.0);
+        if (e.r < 0.5) {
+            break;
+        }
+        d = f32(i);
+        if (e.g > 0.5) {
+            break;
+        }
+    }
+    return d;
+}
+
+fn smaa_search_y_down(uv: vec2<f32>, texel: vec2<f32>) -> f32 {
+    var d = 0.0;
+    for (var i: i32 = 1; i <= 14; i = i + 1) {
+        let e = textureSampleLevel(t_src0, s_samp, uv + vec2<f32>(0.0, f32(i) * texel.y), 0.0);
+        if (e.r < 0.5) {
+            break;
+        }
+        d = f32(i);
+        if (e.g > 0.5) {
+            break;
+        }
+    }
+    return d;
+}
+
+/// Analytical trapezoid coverage for SMAA 1x (exact equivalent of AreaTex for L/Z/U crossing shapes).
+/// `c1_pos`/`c1_neg` indicate crossing edges at left/top end (above/below), `c2_pos`/`c2_neg` at right/bottom end.
+fn smaa_area_analytic(d1: f32, d2: f32, c1_pos: f32, c1_neg: f32, c2_pos: f32, c2_neg: f32) -> vec2<f32> {
+    let total = d1 + d2 + 1.0;
+    let t = (d1 + 0.5) / total;
+    // Height on the positive side (+0.5 at crossing, 0 at non-crossing) vs negative side (-0.5 at crossing).
+    let y1 = (c1_pos - c1_neg) * 0.5;
+    let y2 = (c2_pos - c2_neg) * 0.5;
+    let h = mix(y1, y2, t);
+    // Clamp coverage and dampen isolated 1px crossings so fine 1px details never vanish.
+    let w_pos = clamp(h, 0.0, 0.5);
+    let w_neg = clamp(-h, 0.0, 0.5);
+    return vec2<f32>(w_pos, w_neg);
+}
+
+@fragment
+fn fs_smaa_weights(in: VsOut) -> @location(0) vec4<f32> {
+    let e = textureSampleLevel(t_src0, s_samp, in.uv, 0.0).rg;
+    if (e.r + e.g < 0.5) {
+        return vec4<f32>(0.0);
+    }
+    let texel = vec2<f32>(u.params0.z, u.params0.w);
+    var weights = vec4<f32>(0.0); // (top, bottom, left, right)
+
+    // Horizontal edge (top border of current pixel): search left & right along X.
+    if (e.g > 0.5) {
+        let dl = smaa_search_x_left(in.uv, texel);
+        let dr = smaa_search_x_right(in.uv, texel);
+        let uv_l = in.uv + vec2<f32>(-dl * texel.x, 0.0);
+        let uv_r = in.uv + vec2<f32>((dr + 1.0) * texel.x, 0.0);
+        // Crossing vertical edges above (-Y) and below (+0) each endpoint.
+        let c1_up   = textureSampleLevel(t_src0, s_samp, uv_l + vec2<f32>(0.0, -texel.y), 0.0).r;
+        let c1_down = textureSampleLevel(t_src0, s_samp, uv_l, 0.0).r;
+        let c2_up   = textureSampleLevel(t_src0, s_samp, uv_r + vec2<f32>(0.0, -texel.y), 0.0).r;
+        let c2_down = textureSampleLevel(t_src0, s_samp, uv_r, 0.0).r;
+        let area = smaa_area_analytic(dl, dr, c1_up, c1_down, c2_up, c2_down);
+        weights.x = area.x;
+        weights.y = area.y;
+    }
+
+    // Vertical edge (left border of current pixel): search up & down along Y.
+    if (e.r > 0.5) {
+        let du = smaa_search_y_up(in.uv, texel);
+        let dd = smaa_search_y_down(in.uv, texel);
+        let uv_u = in.uv + vec2<f32>(0.0, -du * texel.y);
+        let uv_d = in.uv + vec2<f32>(0.0, (dd + 1.0) * texel.y);
+        // Crossing horizontal edges left (-X) and right (+0) of each endpoint.
+        let c1_left  = textureSampleLevel(t_src0, s_samp, uv_u + vec2<f32>(-texel.x, 0.0), 0.0).g;
+        let c1_right = textureSampleLevel(t_src0, s_samp, uv_u, 0.0).g;
+        let c2_left  = textureSampleLevel(t_src0, s_samp, uv_d + vec2<f32>(-texel.x, 0.0), 0.0).g;
+        let c2_right = textureSampleLevel(t_src0, s_samp, uv_d, 0.0).g;
+        let area = smaa_area_analytic(du, dd, c1_left, c1_right, c2_left, c2_right);
+        weights.z = area.x;
+        weights.w = area.y;
+    }
+
+    return weights;
+}
+
+@fragment
+fn fs_smaa_blend(in: VsOut) -> @location(0) vec4<f32> {
+    let texel = vec2<f32>(u.params0.z, u.params0.w);
+    let w_cur   = textureSampleLevel(t_src1, s_samp, in.uv, 0.0);
+    let w_right = textureSampleLevel(t_src1, s_samp, in.uv + vec2<f32>(texel.x, 0.0), 0.0).w;
+    let w_down  = textureSampleLevel(t_src1, s_samp, in.uv + vec2<f32>(0.0, texel.y), 0.0).y;
+
+    // Neighborhood weights: a.x = right, a.y = bottom, a.z = left, a.w = top.
+    let a = vec4<f32>(w_right, w_down, w_cur.z, w_cur.x);
+    if (dot(a, vec4<f32>(1.0)) < 0.0001) {
+        return textureSampleLevel(t_src0, s_samp, in.uv, 0.0);
+    }
+
+    let horiz = max(a.x, a.z) > max(a.y, a.w);
+    var blend_uv0 = in.uv;
+    var blend_uv1 = in.uv;
+    var blend_w = vec2<f32>(0.0);
+
+    if (horiz) {
+        blend_uv0 = in.uv + vec2<f32>(a.x * texel.x, 0.0);
+        blend_uv1 = in.uv - vec2<f32>(a.z * texel.x, 0.0);
+        blend_w = vec2<f32>(a.x, a.z);
+    } else {
+        blend_uv0 = in.uv + vec2<f32>(0.0, a.y * texel.y);
+        blend_uv1 = in.uv - vec2<f32>(0.0, a.w * texel.y);
+        blend_w = vec2<f32>(a.y, a.w);
+    }
+
+    let w_sum = max(blend_w.x + blend_w.y, 0.0001);
+    blend_w = blend_w / w_sum;
+
+    let c0 = textureSampleLevel(t_src0, s_samp, blend_uv0, 0.0);
+    let c1 = textureSampleLevel(t_src0, s_samp, blend_uv1, 0.0);
+    return c0 * blend_w.x + c1 * blend_w.y;
+}
 "#;
 
 struct ImageTarget {
@@ -418,19 +630,35 @@ impl ImageTarget {
         height: u32,
         format: vk::Format,
     ) -> Result<Self> {
-        let w = width.max(1);
-        let h = height.max(1);
-        let (image, view, alloc) = create_attachment(
+        Self::new_with_usage(
             ctx,
             name,
-            w,
-            h,
+            width,
+            height,
             format,
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_DST,
             vk::ImageAspectFlags::COLOR,
-        )?;
+            vk::SampleCountFlags::TYPE_1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_usage(
+        ctx: &mut VkContext,
+        name: &str,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        aspect: vk::ImageAspectFlags,
+        samples: vk::SampleCountFlags,
+    ) -> Result<Self> {
+        let w = width.max(1);
+        let h = height.max(1);
+        let (image, view, alloc) =
+            create_attachment_msaa(ctx, name, w, h, format, usage, aspect, samples)?;
         Ok(Self {
             image,
             view,
@@ -452,16 +680,22 @@ impl ImageTarget {
     }
 }
 
-/// Manages the Vulkan 1.3 HDR scene target (`R16G16B16A16_SFLOAT`), half-res bilateral SSAO buffers,
-/// quarter-res bloom ping-pong buffers, and fullscreen composite pass.
+/// Manages the Vulkan 1.3 HDR scene target (`R16G16B16A16_SFLOAT`), optional 4x MSAA scene+depth targets,
+/// half-res bilateral SSAO buffers, 3-pass SMAA 1x buffers, quarter-res bloom ping-pong buffers, and composite pass.
 pub struct PostProcessPipeline {
     hdr_scene: ImageTarget,
+    hdr_msaa: Option<ImageTarget>,
+    depth_msaa: Option<ImageTarget>,
+    msaa_samples: vk::SampleCountFlags,
     bloom_a: ImageTarget,
     bloom_b: ImageTarget,
     ui_backdrop: ImageTarget,
     water_depth: ImageTarget,
     ssao_a: ImageTarget,
     ssao_b: ImageTarget,
+    smaa_edges: ImageTarget,
+    smaa_weights: ImageTarget,
+    smaa_temp: ImageTarget,
     depth_sample_view: vk::ImageView,
     linear_sampler: vk::Sampler,
     nearest_sampler: vk::Sampler,
@@ -477,6 +711,9 @@ pub struct PostProcessPipeline {
     set_ssao_blur_v: vk::DescriptorSet,
     set_ssao_apply: vk::DescriptorSet,
     set_water_snapshot: vk::DescriptorSet,
+    set_smaa_edges: vk::DescriptorSet,
+    set_smaa_weights: vk::DescriptorSet,
+    set_smaa_blend: vk::DescriptorSet,
     params_ubo: GpuBuffer,
     slot_stride: usize,
     vs_module: vk::ShaderModule,
@@ -488,6 +725,9 @@ pub struct PostProcessPipeline {
     fs_ssao_raw_module: vk::ShaderModule,
     fs_ssao_blur_module: vk::ShaderModule,
     fs_ssao_apply_module: vk::ShaderModule,
+    fs_smaa_edges_module: vk::ShaderModule,
+    fs_smaa_weights_module: vk::ShaderModule,
+    fs_smaa_blend_module: vk::ShaderModule,
     water_depth_pipeline: vk::Pipeline,
     backdrop_copy_pipeline: vk::Pipeline,
     extract_pipeline: vk::Pipeline,
@@ -496,6 +736,9 @@ pub struct PostProcessPipeline {
     ssao_raw_pipeline: vk::Pipeline,
     ssao_blur_pipeline: vk::Pipeline,
     ssao_apply_pipeline: vk::Pipeline,
+    smaa_edges_pipeline: vk::Pipeline,
+    smaa_weights_pipeline: vk::Pipeline,
+    smaa_blend_pipeline: vk::Pipeline,
     output_format: vk::Format,
     water_depth_format: vk::Format,
 }
@@ -535,7 +778,33 @@ impl PostProcessPipeline {
             }
         };
 
+        let msaa_samples = ctx.msaa_samples;
         let hdr_scene = ImageTarget::new(ctx, "zhr_hdr_scene", w, h)?;
+        let (hdr_msaa, depth_msaa) = if msaa_samples != vk::SampleCountFlags::TYPE_1 {
+            let hc = ImageTarget::new_with_usage(
+                ctx,
+                "zhr_hdr_msaa",
+                w,
+                h,
+                HDR_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::ImageAspectFlags::COLOR,
+                msaa_samples,
+            )?;
+            let dm = ImageTarget::new_with_usage(
+                ctx,
+                "zhr_depth_msaa",
+                w,
+                h,
+                ctx.depth_format,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageAspectFlags::DEPTH,
+                msaa_samples,
+            )?;
+            (Some(hc), Some(dm))
+        } else {
+            (None, None)
+        };
         let bloom_a = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let bloom_b = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
         let ui_backdrop = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
@@ -543,6 +812,28 @@ impl PostProcessPipeline {
             ImageTarget::new_with_format(ctx, "zhr_water_snapshot", w, h, water_depth_format)?;
         let ssao_a = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let ssao_b = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
+        let smaa_edges =
+            ImageTarget::new_with_format(ctx, "zhr_smaa_edges", w, h, vk::Format::R8G8_UNORM)?;
+        let smaa_weights = ImageTarget::new_with_format(
+            ctx,
+            "zhr_smaa_weights",
+            w,
+            h,
+            vk::Format::R8G8B8A8_UNORM,
+        )?;
+        let smaa_temp = ImageTarget::new_with_usage(
+            ctx,
+            "zhr_smaa_temp",
+            w,
+            h,
+            HDR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageAspectFlags::COLOR,
+            vk::SampleCountFlags::TYPE_1,
+        )?;
 
         transition_images_to_shader_read(
             ctx,
@@ -553,6 +844,9 @@ impl PostProcessPipeline {
                 water_depth.image,
                 ssao_a.image,
                 ssao_b.image,
+                smaa_edges.image,
+                smaa_weights.image,
+                smaa_temp.image,
             ],
         )?;
 
@@ -611,28 +905,28 @@ impl PostProcessPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 18,
+                descriptor_count: 24,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: 9,
+                descriptor_count: 12,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                descriptor_count: 9,
+                descriptor_count: 12,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(9)
+            .max_sets(12)
             .pool_sizes(&pool_sizes);
         // SAFETY: `device` is valid.
         let descriptor_pool = unsafe { ctx.device.create_descriptor_pool(&pool_info, None)? };
 
-        let alloc_layouts = [set_layout; 9];
+        let alloc_layouts = [set_layout; 12];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&alloc_layouts);
-        // SAFETY: Pool has room for 9 sets.
+        // SAFETY: Pool has room for 12 sets.
         let sets = unsafe { ctx.device.allocate_descriptor_sets(&alloc_info)? };
 
         let align = ctx.min_uniform_offset_alignment as usize;
@@ -686,6 +980,21 @@ impl PostProcessPipeline {
             naga::ShaderStage::Fragment,
             "fs_ssao_apply",
         )?;
+        let fs_smaa_edges_spv = compile_wgsl_to_spirv(
+            POSTPROCESS_WGSL,
+            naga::ShaderStage::Fragment,
+            "fs_smaa_edges",
+        )?;
+        let fs_smaa_weights_spv = compile_wgsl_to_spirv(
+            POSTPROCESS_WGSL,
+            naga::ShaderStage::Fragment,
+            "fs_smaa_weights",
+        )?;
+        let fs_smaa_blend_spv = compile_wgsl_to_spirv(
+            POSTPROCESS_WGSL,
+            naga::ShaderStage::Fragment,
+            "fs_smaa_blend",
+        )?;
 
         let vs_module = create_shader_module(&ctx.device, &vs_spv)?;
         let fs_water_depth_module = create_shader_module(&ctx.device, &fs_water_depth_spv)?;
@@ -696,6 +1005,9 @@ impl PostProcessPipeline {
         let fs_ssao_raw_module = create_shader_module(&ctx.device, &fs_ssao_raw_spv)?;
         let fs_ssao_blur_module = create_shader_module(&ctx.device, &fs_ssao_blur_spv)?;
         let fs_ssao_apply_module = create_shader_module(&ctx.device, &fs_ssao_apply_spv)?;
+        let fs_smaa_edges_module = create_shader_module(&ctx.device, &fs_smaa_edges_spv)?;
+        let fs_smaa_weights_module = create_shader_module(&ctx.device, &fs_smaa_weights_spv)?;
+        let fs_smaa_blend_module = create_shader_module(&ctx.device, &fs_smaa_blend_spv)?;
 
         let water_depth_pipeline = create_fullscreen_pipeline(
             &ctx.device,
@@ -769,15 +1081,48 @@ impl PostProcessPipeline {
             HDR_FORMAT,
             true,
         )?;
+        let smaa_edges_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_smaa_edges_module,
+            c"fs_smaa_edges",
+            vk::Format::R8G8_UNORM,
+            false,
+        )?;
+        let smaa_weights_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_smaa_weights_module,
+            c"fs_smaa_weights",
+            vk::Format::R8G8B8A8_UNORM,
+            false,
+        )?;
+        let smaa_blend_pipeline = create_fullscreen_pipeline(
+            &ctx.device,
+            pipeline_layout,
+            vs_module,
+            fs_smaa_blend_module,
+            c"fs_smaa_blend",
+            HDR_FORMAT,
+            false,
+        )?;
 
         let me = Self {
             hdr_scene,
+            hdr_msaa,
+            depth_msaa,
+            msaa_samples,
             bloom_a,
             bloom_b,
             ui_backdrop,
             water_depth,
             ssao_a,
             ssao_b,
+            smaa_edges,
+            smaa_weights,
+            smaa_temp,
             depth_sample_view,
             linear_sampler,
             nearest_sampler,
@@ -793,6 +1138,9 @@ impl PostProcessPipeline {
             set_ssao_blur_v: sets[6],
             set_ssao_apply: sets[7],
             set_water_snapshot: sets[8],
+            set_smaa_edges: sets[9],
+            set_smaa_weights: sets[10],
+            set_smaa_blend: sets[11],
             params_ubo,
             slot_stride,
             vs_module,
@@ -804,6 +1152,9 @@ impl PostProcessPipeline {
             fs_ssao_raw_module,
             fs_ssao_blur_module,
             fs_ssao_apply_module,
+            fs_smaa_edges_module,
+            fs_smaa_weights_module,
+            fs_smaa_blend_module,
             water_depth_pipeline,
             backdrop_copy_pipeline,
             extract_pipeline,
@@ -812,6 +1163,9 @@ impl PostProcessPipeline {
             ssao_raw_pipeline,
             ssao_blur_pipeline,
             ssao_apply_pipeline,
+            smaa_edges_pipeline,
+            smaa_weights_pipeline,
+            smaa_blend_pipeline,
             output_format,
             water_depth_format,
         };
@@ -825,6 +1179,18 @@ impl PostProcessPipeline {
 
     pub fn hdr_view(&self) -> vk::ImageView {
         self.hdr_scene.view
+    }
+
+    pub fn hdr_msaa_view(&self) -> Option<vk::ImageView> {
+        self.hdr_msaa.as_ref().map(|t| t.view)
+    }
+
+    pub fn depth_msaa_view(&self) -> Option<vk::ImageView> {
+        self.depth_msaa.as_ref().map(|t| t.view)
+    }
+
+    pub fn msaa_samples(&self) -> vk::SampleCountFlags {
+        self.msaa_samples
     }
 
     pub fn ui_backdrop_view(&self) -> vk::ImageView {
@@ -855,6 +1221,31 @@ impl PostProcessPipeline {
         let sh = (h / 2).max(1);
 
         let new_hdr = ImageTarget::new(ctx, "zhr_hdr_scene", w, h)?;
+        let (new_hdr_msaa, new_depth_msaa) = if self.msaa_samples != vk::SampleCountFlags::TYPE_1 {
+            let hc = ImageTarget::new_with_usage(
+                ctx,
+                "zhr_hdr_msaa",
+                w,
+                h,
+                HDR_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::ImageAspectFlags::COLOR,
+                self.msaa_samples,
+            )?;
+            let dm = ImageTarget::new_with_usage(
+                ctx,
+                "zhr_depth_msaa",
+                w,
+                h,
+                ctx.depth_format,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageAspectFlags::DEPTH,
+                self.msaa_samples,
+            )?;
+            (Some(hc), Some(dm))
+        } else {
+            (None, None)
+        };
         let new_ba = ImageTarget::new(ctx, "zhr_bloom_a", bw, bh)?;
         let new_bb = ImageTarget::new(ctx, "zhr_bloom_b", bw, bh)?;
         let new_ui = ImageTarget::new(ctx, "zhr_ui_backdrop", bw, bh)?;
@@ -862,6 +1253,28 @@ impl PostProcessPipeline {
             ImageTarget::new_with_format(ctx, "zhr_water_snapshot", w, h, self.water_depth_format)?;
         let new_sa = ImageTarget::new(ctx, "zhr_ssao_a", sw, sh)?;
         let new_sb = ImageTarget::new(ctx, "zhr_ssao_b", sw, sh)?;
+        let new_se =
+            ImageTarget::new_with_format(ctx, "zhr_smaa_edges", w, h, vk::Format::R8G8_UNORM)?;
+        let new_sw = ImageTarget::new_with_format(
+            ctx,
+            "zhr_smaa_weights",
+            w,
+            h,
+            vk::Format::R8G8B8A8_UNORM,
+        )?;
+        let new_st = ImageTarget::new_with_usage(
+            ctx,
+            "zhr_smaa_temp",
+            w,
+            h,
+            HDR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageAspectFlags::COLOR,
+            vk::SampleCountFlags::TYPE_1,
+        )?;
         transition_images_to_shader_read(
             ctx,
             &[
@@ -871,23 +1284,40 @@ impl PostProcessPipeline {
                 new_wd.image,
                 new_sa.image,
                 new_sb.image,
+                new_se.image,
+                new_sw.image,
+                new_st.image,
             ],
         )?;
 
         let old_hdr = std::mem::replace(&mut self.hdr_scene, new_hdr);
+        let old_hdr_msaa = std::mem::replace(&mut self.hdr_msaa, new_hdr_msaa);
+        let old_depth_msaa = std::mem::replace(&mut self.depth_msaa, new_depth_msaa);
         let old_ba = std::mem::replace(&mut self.bloom_a, new_ba);
         let old_bb = std::mem::replace(&mut self.bloom_b, new_bb);
         let old_ui = std::mem::replace(&mut self.ui_backdrop, new_ui);
         let old_wd = std::mem::replace(&mut self.water_depth, new_wd);
         let old_sa = std::mem::replace(&mut self.ssao_a, new_sa);
         let old_sb = std::mem::replace(&mut self.ssao_b, new_sb);
+        let old_se = std::mem::replace(&mut self.smaa_edges, new_se);
+        let old_sw = std::mem::replace(&mut self.smaa_weights, new_sw);
+        let old_st = std::mem::replace(&mut self.smaa_temp, new_st);
         old_hdr.destroy(ctx);
+        if let Some(t) = old_hdr_msaa {
+            t.destroy(ctx);
+        }
+        if let Some(t) = old_depth_msaa {
+            t.destroy(ctx);
+        }
         old_ba.destroy(ctx);
         old_bb.destroy(ctx);
         old_ui.destroy(ctx);
         old_wd.destroy(ctx);
         old_sa.destroy(ctx);
         old_sb.destroy(ctx);
+        old_se.destroy(ctx);
+        old_sw.destroy(ctx);
+        old_st.destroy(ctx);
 
         self.depth_sample_view = depth_sample_view;
 
@@ -1023,6 +1453,269 @@ impl PostProcessPipeline {
             self.hdr_scene.view,
             self.nearest_sampler,
         );
+        // 3-pass SMAA 1x descriptors (edges reads hdr_scene; weights reads smaa_edges; blend reads hdr_scene + smaa_weights).
+        write_set(
+            self.set_smaa_edges,
+            self.hdr_scene.view,
+            sro,
+            self.bloom_a.view,
+            self.nearest_sampler,
+        );
+        write_set(
+            self.set_smaa_weights,
+            self.smaa_edges.view,
+            sro,
+            self.bloom_a.view,
+            self.nearest_sampler,
+        );
+        write_set(
+            self.set_smaa_blend,
+            self.hdr_scene.view,
+            sro,
+            self.smaa_weights.view,
+            self.linear_sampler,
+        );
+    }
+
+    /// Runs 3-pass SMAA 1x morphological anti-aliasing directly on the resolved 3D `hdr_scene`
+    /// (before 2D HUD/UI draws on top, so fonts & icons remain 100% razor-sharp while alpha-tested
+    /// fences, barbed wire, palm fronds, shadows, and specular edges are smoothed with zero blur).
+    /// Expects `hdr_scene` in `COLOR_ATTACHMENT_OPTIMAL` and leaves it in `COLOR_ATTACHMENT_OPTIMAL`.
+    pub fn apply_smaa(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+        settings: GraphicsSettings,
+    ) -> Result<()> {
+        if settings.mode == GraphicsMode::Classic || !settings.post_fx {
+            return Ok(());
+        }
+        let split_x_uv = if settings.mode == GraphicsMode::SplitScreen {
+            0.5
+        } else {
+            -1.0
+        };
+        let inv_w = 1.0 / (self.hdr_scene.width.max(1) as f32);
+        let inv_h = 1.0 / (self.hdr_scene.height.max(1) as f32);
+
+        let base_slot = frame_slot * SLOTS_PER_FRAME + 12;
+        let off_edges = (base_slot * self.slot_stride) as u32;
+        let off_weights = ((base_slot + 1) * self.slot_stride) as u32;
+        let off_blend = ((base_slot + 2) * self.slot_stride) as u32;
+
+        let p_edges = PostParams {
+            params0: [1.0, split_x_uv, inv_w, inv_h],
+            params1: [0.0, 0.0, 0.075, 1.0],
+            params2: [0.0; 4],
+        };
+        let p_weights = PostParams {
+            params0: [1.0, split_x_uv, inv_w, inv_h],
+            params1: [0.0; 4],
+            params2: [0.0; 4],
+        };
+        let p_blend = PostParams {
+            params0: [1.0, split_x_uv, inv_w, inv_h],
+            params1: [0.0; 4],
+            params2: [0.0; 4],
+        };
+        self.params_ubo
+            .write_bytes(off_edges as usize, bytemuck::bytes_of(&p_edges))?;
+        self.params_ubo
+            .write_bytes(off_weights as usize, bytemuck::bytes_of(&p_weights))?;
+        self.params_ubo
+            .write_bytes(off_blend as usize, bytemuck::bytes_of(&p_blend))?;
+
+        let full_extent = vk::Extent2D {
+            width: self.hdr_scene.width,
+            height: self.hdr_scene.height,
+        };
+
+        // 1. Transition hdr_scene -> SHADER_READ_ONLY_OPTIMAL.
+        cmd_barrier(
+            device,
+            cmd,
+            self.hdr_scene.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // 2. Pass 1: Edge Detection -> smaa_edges.
+        cmd_barrier(
+            device,
+            cmd,
+            self.smaa_edges.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.smaa_edges.view,
+            full_extent,
+            self.smaa_edges_pipeline,
+            self.pipeline_layout,
+            self.set_smaa_edges,
+            off_edges,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.smaa_edges.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // 3. Pass 2: Blending Weight Calculation -> smaa_weights.
+        cmd_barrier(
+            device,
+            cmd,
+            self.smaa_weights.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.smaa_weights.view,
+            full_extent,
+            self.smaa_weights_pipeline,
+            self.pipeline_layout,
+            self.set_smaa_weights,
+            off_weights,
+            false,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.smaa_weights.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+
+        // 4. Pass 3: Neighborhood Blending -> smaa_temp.
+        cmd_barrier(
+            device,
+            cmd,
+            self.smaa_temp.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::TRANSFER_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        draw_fullscreen_pass(
+            device,
+            cmd,
+            self.smaa_temp.view,
+            full_extent,
+            self.smaa_blend_pipeline,
+            self.pipeline_layout,
+            self.set_smaa_blend,
+            off_blend,
+            false,
+        );
+
+        // 5. Copy anti-aliased smaa_temp -> hdr_scene and restore layouts.
+        cmd_barrier(
+            device,
+            cmd,
+            self.smaa_temp.image,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.hdr_scene.image,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let region = [vk::ImageCopy::default()
+            .src_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .dst_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .extent(vk::Extent3D {
+                width: full_extent.width,
+                height: full_extent.height,
+                depth: 1,
+            })];
+        // SAFETY: Both images match format/extent and are in TRANSFER_SRC/TRANSFER_DST layouts.
+        unsafe {
+            device.cmd_copy_image(
+                cmd,
+                self.smaa_temp.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.hdr_scene.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region,
+            );
+        }
+        cmd_barrier(
+            device,
+            cmd,
+            self.smaa_temp.image,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        cmd_barrier(
+            device,
+            cmd,
+            self.hdr_scene.image,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+
+        Ok(())
     }
 
     /// Computes half-res depth-based bilateral SSAO and multiplies it directly into `hdr_scene`.
@@ -1803,12 +2496,21 @@ impl PostProcessPipeline {
 
     pub fn destroy(self, ctx: &mut VkContext) {
         self.hdr_scene.destroy(ctx);
+        if let Some(t) = self.hdr_msaa {
+            t.destroy(ctx);
+        }
+        if let Some(t) = self.depth_msaa {
+            t.destroy(ctx);
+        }
         self.bloom_a.destroy(ctx);
         self.bloom_b.destroy(ctx);
         self.ui_backdrop.destroy(ctx);
         self.water_depth.destroy(ctx);
         self.ssao_a.destroy(ctx);
         self.ssao_b.destroy(ctx);
+        self.smaa_edges.destroy(ctx);
+        self.smaa_weights.destroy(ctx);
+        self.smaa_temp.destroy(ctx);
         self.params_ubo.destroy(ctx);
         // SAFETY: Caller ensures GPU is idle.
         unsafe {
@@ -1821,6 +2523,10 @@ impl PostProcessPipeline {
             ctx.device.destroy_pipeline(self.ssao_raw_pipeline, None);
             ctx.device.destroy_pipeline(self.ssao_blur_pipeline, None);
             ctx.device.destroy_pipeline(self.ssao_apply_pipeline, None);
+            ctx.device.destroy_pipeline(self.smaa_edges_pipeline, None);
+            ctx.device
+                .destroy_pipeline(self.smaa_weights_pipeline, None);
+            ctx.device.destroy_pipeline(self.smaa_blend_pipeline, None);
             ctx.device.destroy_shader_module(self.vs_module, None);
             ctx.device
                 .destroy_shader_module(self.fs_water_depth_module, None);
@@ -1837,6 +2543,12 @@ impl PostProcessPipeline {
                 .destroy_shader_module(self.fs_ssao_blur_module, None);
             ctx.device
                 .destroy_shader_module(self.fs_ssao_apply_module, None);
+            ctx.device
+                .destroy_shader_module(self.fs_smaa_edges_module, None);
+            ctx.device
+                .destroy_shader_module(self.fs_smaa_weights_module, None);
+            ctx.device
+                .destroy_shader_module(self.fs_smaa_blend_module, None);
             ctx.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             ctx.device

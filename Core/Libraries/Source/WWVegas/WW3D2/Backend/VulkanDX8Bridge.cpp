@@ -5161,10 +5161,11 @@ private:
         std::snprintf(
             title,
             sizeof(title),
-            "%s  [%sVulkan 1.3 | %s | Mesh:%s | 2xTex:%s | PBR:%s | PostFX:%s | F7-F11 | Pause/Shift+P]",
+            "%s  [%sVulkan 1.3 | %s | AA:%s | Mesh:%s | 2xTex:%s | PBR:%s | PostFX:%s | F7-F11 | Pause/Shift+P]",
             m_base_window_title,
             sim_paused ? "PAUSED | " : "",
             mode_label,
+            (mode == 0u) ? "OFF" : (post_fx ? "4xMSAA+SMAA" : "4xMSAA"),
             (g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) && mode != 0u) ? "ON" : "OFF",
             (remaster_tex && mode != 0u) ? "ON" : "OFF",
             pbr ? "ON" : "OFF",

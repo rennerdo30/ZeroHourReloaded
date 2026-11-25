@@ -30,6 +30,10 @@ pub struct VkContext {
     pub fill_mode_non_solid: bool,
     pub swapchain_colorspace_supported: bool,
     pub hdr_metadata_supported: bool,
+    pub msaa_samples: vk::SampleCountFlags,
+    pub stencil_resolve_sample_zero: bool,
+    pub independent_resolve_none: bool,
+    pub smaa_enabled: bool,
     pub depth_format: vk::Format,
     pub allocator: Option<Allocator>,
     /// All enumerated Vulkan 1.3 capable GPUs (for `Renderer::Get_Render_Device_*`).
@@ -224,6 +228,39 @@ impl VkContext {
         };
         let depth_format = pick_depth_format(&instance, physical_device);
 
+        // Query hardware MSAA sample count & depth-stencil resolve capabilities (Vulkan 1.2+ core).
+        let mut ds_resolve_props = vk::PhysicalDeviceDepthStencilResolveProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut ds_resolve_props);
+        // SAFETY: `physical_device` is valid and `ds_resolve_props` outlives the call.
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+        let independent_resolve_none = ds_resolve_props.independent_resolve_none != 0;
+        let stencil_resolve_sample_zero = ds_resolve_props
+            .supported_stencil_resolve_modes
+            .contains(vk::ResolveModeFlags::SAMPLE_ZERO);
+        let depth_resolve_ok = ds_resolve_props
+            .supported_depth_resolve_modes
+            .contains(vk::ResolveModeFlags::SAMPLE_ZERO)
+            && (independent_resolve_none || stencil_resolve_sample_zero);
+
+        let supported_msaa = props.limits.framebuffer_color_sample_counts
+            & props.limits.framebuffer_depth_sample_counts;
+        let requested_msaa: u32 = std::env::var("ZHR_MSAA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let msaa_samples = if !depth_resolve_ok || requested_msaa <= 1 {
+            vk::SampleCountFlags::TYPE_1
+        } else if requested_msaa >= 4 && supported_msaa.contains(vk::SampleCountFlags::TYPE_4) {
+            vk::SampleCountFlags::TYPE_4
+        } else if supported_msaa.contains(vk::SampleCountFlags::TYPE_2) {
+            vk::SampleCountFlags::TYPE_2
+        } else {
+            vk::SampleCountFlags::TYPE_1
+        };
+        let smaa_enabled = std::env::var("ZHR_SMAA")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
         let queue_priority = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(graphics_queue_family)
@@ -285,10 +322,12 @@ impl VkContext {
         })?;
 
         log::info!(
-            "Vulkan 1.3 initialized on '{}' (discrete={}, validation={})",
+            "Vulkan 1.3 initialized on '{}' (discrete={}, validation={}, msaa={:?}, smaa={})",
             device_info.name,
             device_info.is_discrete,
-            validation_active
+            validation_active,
+            msaa_samples,
+            smaa_enabled
         );
 
         Ok(Self {
@@ -309,6 +348,10 @@ impl VkContext {
             fill_mode_non_solid,
             swapchain_colorspace_supported,
             hdr_metadata_supported,
+            msaa_samples,
+            stencil_resolve_sample_zero,
+            independent_resolve_none,
+            smaa_enabled,
             depth_format,
             allocator: Some(allocator),
             available_devices,

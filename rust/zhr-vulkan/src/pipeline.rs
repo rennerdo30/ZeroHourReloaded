@@ -16,6 +16,7 @@ struct PipelineLookupKey {
     color_format: vk::Format,
     depth_format: vk::Format,
     wireframe: bool,
+    samples: vk::SampleCountFlags,
 }
 
 /// Caches Vulkan 1.3 dynamic-rendering graphics pipelines keyed by `WW3D2::ShaderKey`.
@@ -80,6 +81,7 @@ impl PipelineCache {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn get_or_create(
         &mut self,
         device: &ash::Device,
@@ -88,6 +90,7 @@ impl PipelineCache {
         color_format: vk::Format,
         depth_format: vk::Format,
         wireframe: bool,
+        samples: vk::SampleCountFlags,
     ) -> Result<vk::Pipeline> {
         let key = PipelineLookupKey {
             shader: shader.pipeline_state_key(),
@@ -95,6 +98,7 @@ impl PipelineCache {
             color_format,
             depth_format,
             wireframe,
+            samples,
         };
         if let Some(&pso) = self.pipelines.get(&key) {
             return Ok(pso);
@@ -174,7 +178,7 @@ impl PipelineCache {
             .line_width(1.0);
 
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(key.samples);
 
         let depth_test = key.shader.depth_compare() != crate::shader::DepthCompare::Always
             || key.shader.depth_write();
