@@ -197,6 +197,21 @@ public:
 	virtual Real getCurrentFPS() = 0;	///< returns the current FPS.
 	virtual Int getLastFrameDrawCalls() = 0;  ///< returns the number of draw calls issued in the previous frame
 
+	// ZeroHourReloaded Vulkan 1.3 Remaster settings bridge
+	virtual Bool hasVulkanRemasterBackend() const { return FALSE; }
+	virtual void getVulkanRemasterSettings(UnsignedInt &mode, Bool &pbrWaterSsao, Bool &hdrPostFx, Bool &remasterTextures, Bool &meshSmoothing) const
+	{
+		mode = 0;
+		pbrWaterSsao = FALSE;
+		hdrPostFx = FALSE;
+		remasterTextures = FALSE;
+		meshSmoothing = FALSE;
+	}
+	virtual void setVulkanRemasterSettings(UnsignedInt mode, Bool pbrWaterSsao, Bool hdrPostFx, Bool remasterTextures, Bool meshSmoothing)
+	{
+		(void)mode; (void)pbrWaterSsao; (void)hdrPostFx; (void)remasterTextures; (void)meshSmoothing;
+	}
+
 protected:
 	virtual void onBeginBatch() { }
 	virtual void onEndBatch() { }

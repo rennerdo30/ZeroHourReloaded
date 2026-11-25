@@ -818,6 +818,25 @@ void MainMenuUpdate( WindowLayout *layout, void *userData )
 		else
 			initialGadgetDelay--;
 	}
+	else
+	{
+		static Bool s_zhrAutoOpenedOptions = FALSE;
+		if (!s_zhrAutoOpenedOptions && TheShell)
+		{
+			const char *autoOpt = getenv("ZHR_AUTO_OPEN_OPTIONS");
+			if (autoOpt && autoOpt[0] != '\0' && autoOpt[0] != '0')
+			{
+				s_zhrAutoOpenedOptions = TRUE;
+				WindowLayout *optLayout = TheShell->getOptionsLayout(TRUE);
+				if (optLayout)
+				{
+					optLayout->runInit();
+					optLayout->hide(FALSE);
+					optLayout->bringForward();
+				}
+			}
+		}
+	}
 
 	if(dontAllowTransitions && TheTransitionHandler->isFinished())
 		dontAllowTransitions = FALSE;

@@ -895,3 +895,58 @@ Real OptionPreferences::getGameWindowTransitionSpeedMultiplier() const
 	Real speed = (Real) atof(it->second.str());
 	return clamp(1.0f, speed, 1000.0f);
 }
+
+UnsignedInt OptionPreferences::getZhrGraphicsMode() const
+{
+	OptionPreferences::const_iterator it = find("ZhrGraphicsMode");
+	if (it == end())
+		return 1u; // Default: Remastered (Vulkan 1.3)
+
+	if (stricmp(it->second.str(), "classic") == 0)
+		return 0u;
+	if (stricmp(it->second.str(), "split") == 0)
+		return 2u;
+	if (stricmp(it->second.str(), "remastered") == 0)
+		return 1u;
+
+	Int mode = atoi(it->second.str());
+	if (mode < 0 || mode > 2)
+		mode = 1;
+	return (UnsignedInt)mode;
+}
+
+Bool OptionPreferences::getZhrPbrWaterSsaoEnabled() const
+{
+	OptionPreferences::const_iterator it = find("ZhrPbrWaterSsao");
+	if (it == end())
+		return TRUE;
+
+	return (stricmp(it->second.str(), "yes") == 0 || stricmp(it->second.str(), "true") == 0 || strcmp(it->second.str(), "1") == 0) ? TRUE : FALSE;
+}
+
+Bool OptionPreferences::getZhrHdrPostFxEnabled() const
+{
+	OptionPreferences::const_iterator it = find("ZhrHdrPostFx");
+	if (it == end())
+		return TRUE;
+
+	return (stricmp(it->second.str(), "yes") == 0 || stricmp(it->second.str(), "true") == 0 || strcmp(it->second.str(), "1") == 0) ? TRUE : FALSE;
+}
+
+Bool OptionPreferences::getZhrRemasterTexturesEnabled() const
+{
+	OptionPreferences::const_iterator it = find("ZhrRemasterTextures");
+	if (it == end())
+		return TRUE;
+
+	return (stricmp(it->second.str(), "yes") == 0 || stricmp(it->second.str(), "true") == 0 || strcmp(it->second.str(), "1") == 0) ? TRUE : FALSE;
+}
+
+Bool OptionPreferences::getZhrMeshSmoothingEnabled() const
+{
+	OptionPreferences::const_iterator it = find("ZhrMeshSmoothing");
+	if (it == end())
+		return TRUE;
+
+	return (stricmp(it->second.str(), "yes") == 0 || stricmp(it->second.str(), "true") == 0 || strcmp(it->second.str(), "1") == 0) ? TRUE : FALSE;
+}

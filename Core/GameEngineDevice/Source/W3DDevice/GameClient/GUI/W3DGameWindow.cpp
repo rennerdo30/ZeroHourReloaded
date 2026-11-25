@@ -126,7 +126,7 @@ static void initBorders()
 //=============================================================================
 void W3DGameWindow::blitBorderRect( Int x, Int y, Int width, Int height )
 {
-	if (ZhrMenuStyle::isActive())
+	if (ZhrMenuStyle::isStyledForWindow(this))
 	{
 		ZhrMenuStyle::drawPanelBorder(x, y, width, height);
 		return;
@@ -314,7 +314,7 @@ void W3DGameWinDefaultDraw( GameWindow *window, WinInstanceData *instData )
 	// get size of window
 	w3dWindow->winGetSize( &size.x, &size.y );
 
-	if (ZhrMenuStyle::isActive())
+	if (ZhrMenuStyle::isStyledForWindow(window))
 	{
 		if (ZhrMenuStyle::isShellRulerWindow(window, instData))
 		{
@@ -346,6 +346,16 @@ void W3DGameWinDefaultDraw( GameWindow *window, WinInstanceData *instData )
 			{
 				ZhrMenuStyle::drawShellBackdropFrame(FALSE);
 			}
+			return;
+		}
+		if (ZhrMenuStyle::isDividerLineWindow(window, instData))
+		{
+			ZhrMenuStyle::drawDividerLine(origin.x, origin.y, size.x, size.y);
+			return;
+		}
+		if (ZhrMenuStyle::isSubPanelWindow(window, instData))
+		{
+			ZhrMenuStyle::drawSubPanel(origin.x, origin.y, size.x, size.y);
 			return;
 		}
 		if (ZhrMenuStyle::shouldStyleShellPanel(window, instData))

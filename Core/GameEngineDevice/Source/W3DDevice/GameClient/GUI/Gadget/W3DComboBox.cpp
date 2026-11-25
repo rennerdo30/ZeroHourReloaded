@@ -53,6 +53,7 @@
 #include "GameClient/GadgetListBox.h"
 #include "W3DDevice/GameClient/W3DGadget.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 // DEFINES ////////////////////////////////////////////////////////////////////
 
@@ -78,6 +79,12 @@
 //=============================================================================
 void W3DGadgetComboBoxDraw( GameWindow *window, WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalComboBox(window, instData);
+		return;
+	}
+
 	Int width, height, fontHeight, x, y;
 	Color background, border, titleColor, titleBorder;
 //	ComboBoxData *combo = (ComboBoxData *)window->winGetUserData();
@@ -152,6 +159,12 @@ void W3DGadgetComboBoxDraw( GameWindow *window, WinInstanceData *instData )
 //=============================================================================
 void W3DGadgetComboBoxImageDraw( GameWindow *window, WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalComboBox(window, instData);
+		return;
+	}
+
 	Int width, height, x, y;
 	const Image *image;
 //	ComboBoxData *combo = (ComboBoxData *)window->winGetUserData();

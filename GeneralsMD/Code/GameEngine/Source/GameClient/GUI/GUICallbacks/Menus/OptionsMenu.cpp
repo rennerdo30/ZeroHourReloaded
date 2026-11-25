@@ -52,8 +52,11 @@
 #include "GameClient/GadgetStaticText.h"
 #include "GameClient/GadgetTextEntry.h"
 #include "GameClient/GadgetComboBox.h"
+#include "GameClient/GadgetListBox.h"
+#include "GameClient/GadgetPushButton.h"
 #include "GameClient/GadgetRadioButton.h"
 #include "GameClient/GadgetSlider.h"
+#include "GameClient/GameFont.h"
 #include "GameClient/HeaderTemplate.h"
 #include "GameClient/Shell.h"
 #include "GameClient/KeyDefs.h"
@@ -215,6 +218,1085 @@ WindowLayout *OptionsLayout = nullptr;
 
 static OptionPreferences *pref = nullptr;
 
+// -------------------------------------------------------------------------------------------------
+// ZeroHourReloaded Modern 4-Tabbed Settings Menu & Vulkan 1.3 Remaster Controls
+// -------------------------------------------------------------------------------------------------
+enum ZhrOptionsTab
+{
+	ZHR_TAB_GRAPHICS = 0,
+	ZHR_TAB_AUDIO,
+	ZHR_TAB_CONTROLS,
+	ZHR_TAB_NETWORK,
+	ZHR_TAB_COUNT
+};
+
+static Int s_zhrActiveTab = ZHR_TAB_GRAPHICS;
+
+// Snapshot of Vulkan Remaster settings on menu open (used to revert live previews on Cancel)
+static Bool s_zhrHasVulkan = FALSE;
+static UnsignedInt s_zhrSavedMode = 1u;
+static Bool s_zhrSavedPbr = TRUE;
+static Bool s_zhrSavedPostFx = TRUE;
+static Bool s_zhrSavedRemasterTex = TRUE;
+static Bool s_zhrSavedMeshSmooth = TRUE;
+
+static UnsignedInt s_zhrCurMode = 1u;
+static Bool s_zhrCurPbr = TRUE;
+static Bool s_zhrCurPostFx = TRUE;
+static Bool s_zhrCurRemasterTex = TRUE;
+static Bool s_zhrCurMeshSmooth = TRUE;
+
+// Dynamic ZHR controls (owned as children of OptionsMenuParent; destroyed with layout)
+static NameKeyType s_zhrTabIDs[ZHR_TAB_COUNT] = { NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID, NAMEKEY_INVALID };
+static GameWindow *s_zhrTabButtons[ZHR_TAB_COUNT] = { nullptr, nullptr, nullptr, nullptr };
+
+static GameWindow *s_zhrTitleLabel = nullptr;
+static GameWindow *s_zhrHeaderDivider = nullptr;
+static GameWindow *s_zhrFooterDivider = nullptr;
+
+// Graphics tab dynamic widgets
+static GameWindow *s_zhrCardDisplay = nullptr;
+static GameWindow *s_zhrCardVulkan = nullptr;
+static GameWindow *s_zhrLblDisplayHdr = nullptr;
+static GameWindow *s_zhrLblResolution = nullptr;
+static GameWindow *s_zhrLblDetail = nullptr;
+static GameWindow *s_zhrLblBrightness = nullptr;
+static NameKeyType s_zhrBtnCustomDetailID = NAMEKEY_INVALID;
+static GameWindow *s_zhrBtnCustomDetail = nullptr;
+
+static GameWindow *s_zhrLblVulkanHdr = nullptr;
+static GameWindow *s_zhrLblVisualMode = nullptr;
+static NameKeyType s_zhrComboVisualModeID = NAMEKEY_INVALID;
+static GameWindow *s_zhrComboVisualMode = nullptr;
+static NameKeyType s_zhrCheckPbrID = NAMEKEY_INVALID;
+static GameWindow *s_zhrCheckPbr = nullptr;
+static NameKeyType s_zhrCheckPostFxID = NAMEKEY_INVALID;
+static GameWindow *s_zhrCheckPostFx = nullptr;
+static NameKeyType s_zhrCheckRemasterTexID = NAMEKEY_INVALID;
+static GameWindow *s_zhrCheckRemasterTex = nullptr;
+static NameKeyType s_zhrCheckMeshSmoothID = NAMEKEY_INVALID;
+static GameWindow *s_zhrCheckMeshSmooth = nullptr;
+static GameWindow *s_zhrLblVulkanHint = nullptr;
+
+// Audio tab dynamic widgets
+static GameWindow *s_zhrCardAudio = nullptr;
+static GameWindow *s_zhrLblAudioHdr = nullptr;
+static GameWindow *s_zhrLblMusicVol = nullptr;
+static GameWindow *s_zhrLblSfxVol = nullptr;
+static GameWindow *s_zhrLblVoiceVol = nullptr;
+
+// Controls tab dynamic widgets
+static GameWindow *s_zhrCardControls = nullptr;
+static GameWindow *s_zhrLblControlsHdr = nullptr;
+static GameWindow *s_zhrLblScrollSpeed = nullptr;
+
+// Network tab dynamic widgets
+static GameWindow *s_zhrCardNetwork = nullptr;
+static GameWindow *s_zhrLblNetworkHdr = nullptr;
+static GameWindow *s_zhrLblOnlineIP = nullptr;
+static GameWindow *s_zhrLblLanIP = nullptr;
+static GameWindow *s_zhrLblFirewallPort = nullptr;
+static GameWindow *s_zhrTextEntryFirewallPort = nullptr;
+
+// Existing .wnd intermediate sub-containers (re-aligned to 0,0 inside OptionsMenuParentOld)
+static GameWindow *s_zhrModalBox = nullptr;
+static GameWindow *s_zhrVideoGroup = nullptr;
+static GameWindow *s_zhrAudioGroup = nullptr;
+static GameWindow *s_zhrControlsGroup = nullptr;
+static GameWindow *s_zhrNetworkGroup = nullptr;
+
+static void clearZhrOptionsWidgets()
+{
+	for (Int i = 0; i < ZHR_TAB_COUNT; ++i)
+		s_zhrTabButtons[i] = nullptr;
+
+	s_zhrTitleLabel = nullptr;
+	s_zhrHeaderDivider = nullptr;
+	s_zhrFooterDivider = nullptr;
+
+	s_zhrCardDisplay = nullptr;
+	s_zhrCardVulkan = nullptr;
+	s_zhrLblDisplayHdr = nullptr;
+	s_zhrLblResolution = nullptr;
+	s_zhrLblDetail = nullptr;
+	s_zhrLblBrightness = nullptr;
+	s_zhrBtnCustomDetail = nullptr;
+
+	s_zhrLblVulkanHdr = nullptr;
+	s_zhrLblVisualMode = nullptr;
+	s_zhrComboVisualMode = nullptr;
+	s_zhrCheckPbr = nullptr;
+	s_zhrCheckPostFx = nullptr;
+	s_zhrCheckRemasterTex = nullptr;
+	s_zhrCheckMeshSmooth = nullptr;
+	s_zhrLblVulkanHint = nullptr;
+
+	s_zhrCardAudio = nullptr;
+	s_zhrLblAudioHdr = nullptr;
+	s_zhrLblMusicVol = nullptr;
+	s_zhrLblSfxVol = nullptr;
+	s_zhrLblVoiceVol = nullptr;
+
+	s_zhrCardControls = nullptr;
+	s_zhrLblControlsHdr = nullptr;
+	s_zhrLblScrollSpeed = nullptr;
+
+	s_zhrCardNetwork = nullptr;
+	s_zhrLblNetworkHdr = nullptr;
+	s_zhrLblOnlineIP = nullptr;
+	s_zhrLblLanIP = nullptr;
+	s_zhrLblFirewallPort = nullptr;
+	s_zhrTextEntryFirewallPort = nullptr;
+
+	s_zhrModalBox = nullptr;
+	s_zhrVideoGroup = nullptr;
+	s_zhrAudioGroup = nullptr;
+	s_zhrControlsGroup = nullptr;
+	s_zhrNetworkGroup = nullptr;
+}
+
+static Int zhrModeToComboIdx(UnsignedInt mode)
+{
+	// Combo order: 0 = Remastered (Vulkan 1.3), 1 = Split-Screen A/B, 2 = Classic 2003
+	if (mode == 2u) return 1;
+	if (mode == 0u) return 2;
+	return 0;
+}
+
+static UnsignedInt zhrComboIdxToMode(Int idx)
+{
+	if (idx == 1) return 2u;
+	if (idx == 2) return 0u;
+	return 1u;
+}
+
+static void syncVulkanControlsFromState()
+{
+	if (!s_zhrHasVulkan)
+		return;
+	const Bool prevIgnore = ignoreSelected;
+	ignoreSelected = TRUE;
+	if (s_zhrComboVisualMode)
+		GadgetComboBoxSetSelectedPos(s_zhrComboVisualMode, zhrModeToComboIdx(s_zhrCurMode));
+	if (s_zhrCheckPbr)
+		GadgetCheckBoxSetChecked(s_zhrCheckPbr, s_zhrCurPbr);
+	if (s_zhrCheckPostFx)
+		GadgetCheckBoxSetChecked(s_zhrCheckPostFx, s_zhrCurPostFx);
+	if (s_zhrCheckRemasterTex)
+		GadgetCheckBoxSetChecked(s_zhrCheckRemasterTex, s_zhrCurRemasterTex);
+	if (s_zhrCheckMeshSmooth)
+		GadgetCheckBoxSetChecked(s_zhrCheckMeshSmooth, s_zhrCurMeshSmooth);
+	ignoreSelected = prevIgnore;
+}
+
+static void applyLiveVulkanRemasterSettings()
+{
+	if (!s_zhrHasVulkan || !TheDisplay)
+		return;
+	TheDisplay->setVulkanRemasterSettings(
+		s_zhrCurMode,
+		s_zhrCurPbr,
+		s_zhrCurPostFx,
+		s_zhrCurRemasterTex,
+		s_zhrCurMeshSmooth);
+}
+
+static void placeComboBox(GameWindow *combo, Int x, Int y, Int w, Int h)
+{
+	if (!combo)
+		return;
+	GadgetComboBoxHideList(combo);
+	combo->winSetPosition(x, y);
+	combo->winSetSize(w, h);
+
+	ComboBoxData *cb = static_cast<ComboBoxData *>(combo->winGetUserData());
+	if (cb)
+	{
+		const Int dropW = (h > 24) ? h : 24;
+		if (cb->dropDownButton)
+		{
+			cb->dropDownButton->winSetPosition(w - dropW, 0);
+			cb->dropDownButton->winSetSize(dropW, h);
+		}
+		if (cb->editBox)
+		{
+			cb->editBox->winSetPosition(0, 0);
+			cb->editBox->winSetSize(w - dropW, h);
+		}
+		if (cb->listBox)
+		{
+			cb->listBox->winSetPosition(0, h);
+			cb->listBox->winSetSize(w, h);
+		}
+	}
+}
+
+static void placeSlider(GameWindow *slider, Int x, Int y, Int w, Int h)
+{
+	if (!slider)
+		return;
+	const Int curPos = GadgetSliderGetPosition(slider);
+	slider->winSetPosition(x, y);
+	slider->winSetSize(w, h);
+	SliderData *s = static_cast<SliderData *>(slider->winGetUserData());
+	if (s && s->maxVal > s->minVal)
+	{
+		s->numTicks = static_cast<Real>(w - HORIZONTAL_SLIDER_THUMB_WIDTH) / static_cast<Real>(s->maxVal - s->minVal);
+	}
+	GadgetSliderSetPosition(slider, curPos);
+}
+
+static GameWindow *createZhrPanel(GameWindow *parent, const char *name, Int x, Int y, Int w, Int h)
+{
+	WinInstanceData inst;
+	inst.init();
+	inst.m_decoratedNameString = name;
+	inst.m_id = TheNameKeyGenerator->nameToKey(name);
+	inst.m_style = GWS_USER_WINDOW;
+	inst.m_enabledDrawData[0].color = GameMakeColor(8, 18, 33, 185);
+	inst.m_enabledDrawData[0].borderColor = GameMakeColor(82, 162, 234, 110);
+	GameWindow *win = TheWindowManager->winCreate(
+		parent,
+		WIN_STATUS_ENABLED | WIN_STATUS_NO_INPUT | WIN_STATUS_NO_FOCUS,
+		x, y, w, h,
+		nullptr,
+		&inst);
+	return win;
+}
+
+static GameWindow *createZhrLabel(
+	GameWindow *parent,
+	const char *name,
+	const UnicodeString &text,
+	Int x, Int y, Int w, Int h,
+	GameFont *font,
+	Color textColor,
+	Bool centered = FALSE)
+{
+	WinInstanceData inst;
+	inst.init();
+	inst.m_decoratedNameString = name;
+	inst.m_id = TheNameKeyGenerator->nameToKey(name);
+	inst.m_style = GWS_STATIC_TEXT;
+	inst.m_font = font;
+	inst.m_enabledText.color = textColor;
+	inst.m_enabledText.borderColor = GameMakeColor(0, 8, 18, 220);
+	inst.m_disabledText.color = GameMakeColor(136, 154, 174, 210);
+	inst.m_disabledText.borderColor = GameMakeColor(0, 6, 14, 180);
+	inst.m_hiliteText.color = textColor;
+	inst.m_hiliteText.borderColor = GameMakeColor(0, 8, 18, 220);
+
+	TextData tData;
+	tData.text = nullptr;
+	tData.centered = centered;
+	tData.centeredVertically = TRUE;
+	tData.leftMargin = 0;
+	tData.topMargin = 0;
+
+	GameWindow *lbl = TheWindowManager->gogoGadgetStaticText(
+		parent,
+		WIN_STATUS_ENABLED | WIN_STATUS_NO_INPUT | WIN_STATUS_NO_FOCUS,
+		x, y, w, h,
+		&inst,
+		&tData,
+		font,
+		FALSE);
+	if (lbl)
+	{
+		lbl->winSetEnabledColor(0, WIN_COLOR_UNDEFINED);
+		lbl->winSetEnabledBorderColor(0, WIN_COLOR_UNDEFINED);
+		lbl->winSetDisabledColor(0, WIN_COLOR_UNDEFINED);
+		lbl->winSetDisabledBorderColor(0, WIN_COLOR_UNDEFINED);
+		lbl->winSetHiliteColor(0, WIN_COLOR_UNDEFINED);
+		lbl->winSetHiliteBorderColor(0, WIN_COLOR_UNDEFINED);
+		lbl->winSetEnabledTextColors(textColor, GameMakeColor(0, 8, 18, 220));
+		GadgetStaticTextSetFont(lbl, font);
+		GadgetStaticTextSetText(lbl, text);
+	}
+	return lbl;
+}
+
+static GameWindow *createZhrButton(
+	GameWindow *parent,
+	const char *name,
+	const UnicodeString &text,
+	Int x, Int y, Int w, Int h,
+	GameFont *font,
+	NameKeyType &outId)
+{
+	WinInstanceData inst;
+	inst.init();
+	inst.m_decoratedNameString = name;
+	outId = TheNameKeyGenerator->nameToKey(name);
+	inst.m_id = outId;
+	inst.m_style = GWS_PUSH_BUTTON | GWS_MOUSE_TRACK;
+	inst.m_font = font;
+	inst.m_enabledText.color = GameMakeColor(232, 244, 255, 255);
+	inst.m_enabledText.borderColor = GameMakeColor(0, 8, 18, 220);
+	inst.m_hiliteText.color = GameMakeColor(255, 255, 255, 255);
+	inst.m_hiliteText.borderColor = GameMakeColor(0, 12, 26, 235);
+	inst.m_disabledText.color = GameMakeColor(136, 152, 170, 210);
+	inst.m_disabledText.borderColor = GameMakeColor(0, 6, 14, 150);
+
+	GameWindow *btn = TheWindowManager->gogoGadgetPushButton(
+		parent,
+		WIN_STATUS_ENABLED | WIN_STATUS_TAB_STOP,
+		x, y, w, h,
+		&inst,
+		font,
+		FALSE);
+	if (btn)
+	{
+		// Clean dark-navy classic fallback colors (used only when ZhrMenuStyle is OFF in Classic 2003 mode)
+		GadgetButtonSetEnabledColor(btn, GameMakeColor(14, 30, 54, 220));
+		GadgetButtonSetEnabledBorderColor(btn, GameMakeColor(72, 148, 220, 210));
+		GadgetButtonSetEnabledSelectedColor(btn, GameMakeColor(28, 76, 132, 240));
+		GadgetButtonSetEnabledSelectedBorderColor(btn, GameMakeColor(112, 206, 255, 245));
+		GadgetButtonSetHiliteColor(btn, GameMakeColor(24, 58, 102, 235));
+		GadgetButtonSetHiliteBorderColor(btn, GameMakeColor(110, 204, 255, 245));
+		GadgetButtonSetHiliteSelectedColor(btn, GameMakeColor(34, 88, 150, 245));
+		GadgetButtonSetHiliteSelectedBorderColor(btn, GameMakeColor(140, 224, 255, 255));
+		GadgetButtonSetDisabledColor(btn, GameMakeColor(18, 26, 38, 175));
+		GadgetButtonSetDisabledBorderColor(btn, GameMakeColor(64, 82, 104, 130));
+		btn->winSetFont(font);
+		GadgetButtonSetText(btn, text);
+	}
+	return btn;
+}
+
+static GameWindow *createZhrCheckBox(
+	GameWindow *parent,
+	const char *name,
+	const UnicodeString &text,
+	Int x, Int y, Int w, Int h,
+	GameFont *font,
+	NameKeyType &outId)
+{
+	WinInstanceData inst;
+	inst.init();
+	inst.m_decoratedNameString = name;
+	outId = TheNameKeyGenerator->nameToKey(name);
+	inst.m_id = outId;
+	inst.m_style = GWS_CHECK_BOX | GWS_MOUSE_TRACK;
+	inst.m_font = font;
+	inst.m_enabledText.color = GameMakeColor(226, 240, 252, 255);
+	inst.m_enabledText.borderColor = GameMakeColor(0, 8, 18, 220);
+	inst.m_hiliteText.color = GameMakeColor(255, 255, 255, 255);
+	inst.m_hiliteText.borderColor = GameMakeColor(0, 12, 26, 235);
+	inst.m_disabledText.color = GameMakeColor(136, 152, 170, 210);
+	inst.m_disabledText.borderColor = GameMakeColor(0, 6, 14, 150);
+
+	GameWindow *cb = TheWindowManager->gogoGadgetCheckbox(
+		parent,
+		WIN_STATUS_ENABLED | WIN_STATUS_TAB_STOP,
+		x, y, w, h,
+		&inst,
+		font,
+		FALSE);
+	if (cb)
+	{
+		// Clean classic dark-navy fallback colors (no red debug placeholder in Classic 2003 mode)
+		GadgetCheckBoxSetEnabledColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetEnabledBorderColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetEnabledUncheckedBoxColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetEnabledUncheckedBoxBorderColor(cb, GameMakeColor(82, 162, 234, 220));
+		GadgetCheckBoxSetEnabledCheckedBoxColor(cb, GameMakeColor(96, 214, 255, 255));
+		GadgetCheckBoxSetEnabledCheckedBoxBorderColor(cb, GameMakeColor(120, 222, 255, 255));
+		GadgetCheckBoxSetHiliteColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetHiliteBorderColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetHiliteUncheckedBoxColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetHiliteUncheckedBoxBorderColor(cb, GameMakeColor(140, 226, 255, 255));
+		GadgetCheckBoxSetHiliteCheckedBoxColor(cb, GameMakeColor(140, 236, 255, 255));
+		GadgetCheckBoxSetHiliteCheckedBoxBorderColor(cb, GameMakeColor(180, 244, 255, 255));
+		GadgetCheckBoxSetDisabledColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetDisabledBorderColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetDisabledUncheckedBoxColor(cb, WIN_COLOR_UNDEFINED);
+		GadgetCheckBoxSetDisabledUncheckedBoxBorderColor(cb, GameMakeColor(72, 92, 114, 140));
+		GadgetCheckBoxSetDisabledCheckedBoxColor(cb, GameMakeColor(92, 118, 142, 180));
+		GadgetCheckBoxSetDisabledCheckedBoxBorderColor(cb, GameMakeColor(92, 118, 142, 180));
+		cb->winSetFont(font);
+		GadgetCheckBoxSetText(cb, text);
+	}
+	return cb;
+}
+
+static GameWindow *createZhrComboBox(
+	GameWindow *parent,
+	const char *name,
+	Int x, Int y, Int w, Int h,
+	GameFont *font,
+	NameKeyType &outId)
+{
+	WinInstanceData inst;
+	inst.init();
+	inst.m_decoratedNameString = name;
+	outId = TheNameKeyGenerator->nameToKey(name);
+	inst.m_id = outId;
+	inst.m_style = GWS_COMBO_BOX | GWS_MOUSE_TRACK;
+	inst.m_font = font;
+	inst.m_enabledText.color = GameMakeColor(236, 246, 255, 255);
+	inst.m_enabledText.borderColor = GameMakeColor(0, 8, 18, 220);
+	inst.m_hiliteText.color = GameMakeColor(255, 255, 255, 255);
+	inst.m_hiliteText.borderColor = GameMakeColor(0, 12, 26, 235);
+	inst.m_disabledText.color = GameMakeColor(136, 154, 174, 210);
+	inst.m_disabledText.borderColor = GameMakeColor(0, 6, 14, 180);
+
+	ComboBoxData cbTemplate;
+	memset(&cbTemplate, 0, sizeof(cbTemplate));
+	cbTemplate.isEditable = FALSE;
+	cbTemplate.maxDisplay = 4;
+	cbTemplate.maxChars = 64;
+	cbTemplate.asciiOnly = FALSE;
+	cbTemplate.lettersAndNumbersOnly = FALSE;
+
+	// gogoGadgetComboBox deletes entryData and listboxData after copying them internally.
+	cbTemplate.entryData = NEW EntryData;
+	memset(cbTemplate.entryData, 0, sizeof(EntryData));
+	cbTemplate.entryData->maxTextLen = 64;
+	cbTemplate.entryData->drawTextFromStart = TRUE;
+
+	cbTemplate.listboxData = NEW ListboxData;
+	memset(cbTemplate.listboxData, 0, sizeof(ListboxData));
+	cbTemplate.listboxData->listLength = 8;
+	cbTemplate.listboxData->columns = 1;
+	cbTemplate.listboxData->scrollBar = FALSE;
+	cbTemplate.listboxData->multiSelect = FALSE;
+	cbTemplate.listboxData->forceSelect = TRUE;
+	cbTemplate.listboxData->audioFeedback = TRUE;
+
+	GameWindow *combo = TheWindowManager->gogoGadgetComboBox(
+		parent,
+		WIN_STATUS_ENABLED | WIN_STATUS_TAB_STOP,
+		x, y, w, h,
+		&inst,
+		&cbTemplate,
+		font,
+		FALSE);
+	if (combo)
+	{
+		GadgetComboBoxSetColors(
+			combo,
+			GameMakeColor(10, 22, 40, 235), GameMakeColor(72, 148, 220, 210),
+			GameMakeColor(28, 86, 148, 240), GameMakeColor(112, 206, 255, 240),
+			GameMakeColor(14, 22, 34, 185), GameMakeColor(64, 82, 104, 130),
+			GameMakeColor(24, 42, 64, 185), GameMakeColor(76, 98, 120, 140),
+			GameMakeColor(16, 36, 64, 240), GameMakeColor(110, 206, 255, 245),
+			GameMakeColor(34, 106, 178, 245), GameMakeColor(136, 224, 255, 255));
+		GadgetComboBoxSetFont(combo, font);
+		placeComboBox(combo, x, y, w, h);
+	}
+	return combo;
+}
+
+static void showZhrWidget(GameWindow *win, Bool show)
+{
+	if (win)
+		win->winHide(!show);
+}
+
+static void selectZhrOptionsTab(Int tabIndex)
+{
+	if (tabIndex < 0 || tabIndex >= ZHR_TAB_COUNT)
+		tabIndex = ZHR_TAB_GRAPHICS;
+	s_zhrActiveTab = tabIndex;
+
+	// Close any open dropdown list before switching tabs
+	if (comboBoxResolution) GadgetComboBoxHideList(comboBoxResolution);
+	if (comboBoxDetail) GadgetComboBoxHideList(comboBoxDetail);
+	if (s_zhrComboVisualMode) GadgetComboBoxHideList(s_zhrComboVisualMode);
+	if (comboBoxOnlineIP) GadgetComboBoxHideList(comboBoxOnlineIP);
+	if (comboBoxLANIP) GadgetComboBoxHideList(comboBoxLANIP);
+
+	for (Int i = 0; i < ZHR_TAB_COUNT; ++i)
+	{
+		if (s_zhrTabButtons[i])
+		{
+			WinInstanceData *inst = s_zhrTabButtons[i]->winGetInstanceData();
+			if (inst)
+			{
+				if (i == tabIndex)
+					BitSet(inst->m_state, WIN_STATE_SELECTED);
+				else
+					BitClear(inst->m_state, WIN_STATE_SELECTED);
+			}
+		}
+	}
+
+	const Bool isGfx = (tabIndex == ZHR_TAB_GRAPHICS);
+	const Bool isAud = (tabIndex == ZHR_TAB_AUDIO);
+	const Bool isCtl = (tabIndex == ZHR_TAB_CONTROLS);
+	const Bool isNet = (tabIndex == ZHR_TAB_NETWORK);
+
+	// Graphics tab
+	showZhrWidget(s_zhrVideoGroup, isGfx);
+	showZhrWidget(s_zhrCardDisplay, isGfx);
+	showZhrWidget(s_zhrCardVulkan, isGfx);
+	showZhrWidget(s_zhrLblDisplayHdr, isGfx);
+	showZhrWidget(s_zhrLblResolution, isGfx);
+	showZhrWidget(comboBoxResolution, isGfx);
+	showZhrWidget(s_zhrLblDetail, isGfx);
+	showZhrWidget(comboBoxDetail, isGfx);
+	showZhrWidget(s_zhrBtnCustomDetail, isGfx);
+	showZhrWidget(s_zhrLblBrightness, isGfx);
+	showZhrWidget(sliderGamma, isGfx);
+
+	showZhrWidget(s_zhrLblVulkanHdr, isGfx);
+	showZhrWidget(s_zhrLblVisualMode, isGfx);
+	showZhrWidget(s_zhrComboVisualMode, isGfx && s_zhrHasVulkan);
+	showZhrWidget(s_zhrCheckPbr, isGfx && s_zhrHasVulkan);
+	showZhrWidget(s_zhrCheckPostFx, isGfx && s_zhrHasVulkan);
+	showZhrWidget(s_zhrCheckRemasterTex, isGfx && s_zhrHasVulkan);
+	showZhrWidget(s_zhrCheckMeshSmooth, isGfx && s_zhrHasVulkan);
+	showZhrWidget(s_zhrLblVulkanHint, isGfx);
+
+	// Audio tab
+	showZhrWidget(s_zhrAudioGroup, isAud);
+	showZhrWidget(s_zhrCardAudio, isAud);
+	showZhrWidget(s_zhrLblAudioHdr, isAud);
+	showZhrWidget(s_zhrLblMusicVol, isAud);
+	showZhrWidget(sliderMusicVolume, isAud);
+	showZhrWidget(s_zhrLblSfxVol, isAud);
+	showZhrWidget(sliderSFXVolume, isAud);
+	showZhrWidget(s_zhrLblVoiceVol, isAud);
+	showZhrWidget(sliderVoiceVolume, isAud);
+
+	// Controls tab
+	showZhrWidget(s_zhrControlsGroup, isCtl);
+	showZhrWidget(s_zhrCardControls, isCtl);
+	showZhrWidget(s_zhrLblControlsHdr, isCtl);
+	showZhrWidget(checkAlternateMouse, isCtl);
+	showZhrWidget(checkDoubleClickAttackMove, isCtl);
+	showZhrWidget(checkRetaliation, isCtl);
+	showZhrWidget(s_zhrLblScrollSpeed, isCtl);
+	showZhrWidget(sliderScrollSpeed, isCtl);
+
+	// Network tab
+	showZhrWidget(s_zhrNetworkGroup, isNet);
+	showZhrWidget(s_zhrCardNetwork, isNet);
+	showZhrWidget(s_zhrLblNetworkHdr, isNet);
+	showZhrWidget(s_zhrLblOnlineIP, isNet);
+	showZhrWidget(comboBoxOnlineIP, isNet);
+	showZhrWidget(s_zhrLblLanIP, isNet);
+	showZhrWidget(comboBoxLANIP, isNet);
+	showZhrWidget(s_zhrLblFirewallPort, isNet);
+	showZhrWidget(s_zhrTextEntryFirewallPort, isNet);
+	showZhrWidget(buttonFirewallRefresh, isNet);
+}
+
+static void buildModernTabbedOptionsLayout(GameWindow *parent)
+{
+	if (!parent || !TheDisplay || !TheWindowManager || !TheFontLibrary)
+		return;
+
+	const Int screenW = static_cast<Int>(TheDisplay->getWidth());
+	const Int screenH = static_cast<Int>(TheDisplay->getHeight());
+
+	// Center a clean proportional modal card (balanced from 1280x720 up to 3840x2160)
+	Int cardW = static_cast<Int>(screenW * 0.84f);
+	const Int maxAspectW = static_cast<Int>(screenH * 1.50f);
+	if (cardW > maxAspectW) cardW = maxAspectW;
+	if (cardW < 780) cardW = (screenW > 780) ? 780 : (screenW - 24);
+
+	Int cardH = static_cast<Int>(screenH * 0.82f);
+	if (cardH < 520) cardH = (screenH > 520) ? 520 : (screenH - 24);
+
+	const Int cardX = (screenW - cardW) / 2;
+	const Int cardY = (screenH - cardH) / 2;
+
+	// Fetch footer buttons, version label, and intermediate .wnd containers
+	GameWindow *btnDefaults = TheWindowManager->winGetWindowFromId(nullptr, TheNameKeyGenerator->nameToKey("OptionsMenu.wnd:ButtonDefaults"));
+	GameWindow *btnAccept = TheWindowManager->winGetWindowFromId(nullptr, TheNameKeyGenerator->nameToKey("OptionsMenu.wnd:ButtonAccept"));
+	GameWindow *btnBack = TheWindowManager->winGetWindowFromId(nullptr, TheNameKeyGenerator->nameToKey("OptionsMenu.wnd:ButtonBack"));
+	GameWindow *lblVersion = TheWindowManager->winGetWindowFromId(nullptr, TheNameKeyGenerator->nameToKey("OptionsMenu.wnd:LabelVersion"));
+	s_zhrTextEntryFirewallPort = TheWindowManager->winGetWindowFromId(nullptr, TheNameKeyGenerator->nameToKey("OptionsMenu.wnd:TextEntryFirewallPortOverride"));
+
+	// OptionsMenuParentOld is the real modal container inside OptionsMenuParent
+	s_zhrModalBox = TheWindowManager->winGetWindowFromId(nullptr, TheNameKeyGenerator->nameToKey("OptionsMenu.wnd:OptionsMenuParentOld"));
+	if (!s_zhrModalBox)
+		s_zhrModalBox = (btnAccept && btnAccept->winGetParent()) ? btnAccept->winGetParent() : parent;
+
+	s_zhrVideoGroup = comboBoxResolution ? comboBoxResolution->winGetParent() : nullptr;
+	s_zhrAudioGroup = sliderVoiceVolume ? sliderVoiceVolume->winGetParent() : nullptr;
+	s_zhrControlsGroup = sliderScrollSpeed ? sliderScrollSpeed->winGetParent() : nullptr;
+	s_zhrNetworkGroup = comboBoxLANIP ? comboBoxLANIP->winGetParent() : nullptr;
+
+	// Never treat the modal container itself as a tab-toggleable sub-group!
+	if (s_zhrVideoGroup == s_zhrModalBox || s_zhrVideoGroup == parent) s_zhrVideoGroup = nullptr;
+	if (s_zhrAudioGroup == s_zhrModalBox || s_zhrAudioGroup == parent) s_zhrAudioGroup = nullptr;
+	if (s_zhrControlsGroup == s_zhrModalBox || s_zhrControlsGroup == parent) s_zhrControlsGroup = nullptr;
+	if (s_zhrNetworkGroup == s_zhrModalBox || s_zhrNetworkGroup == parent) s_zhrNetworkGroup = nullptr;
+
+	// Align OptionsMenuParent (outer) and OptionsMenuParentOld (frosted modal card)
+	parent->winSetPosition(cardX, cardY);
+	parent->winSetSize(cardW, cardH);
+
+	if (s_zhrModalBox && s_zhrModalBox != parent)
+	{
+		s_zhrModalBox->winSetPosition(0, 0);
+		s_zhrModalBox->winSetSize(cardW, cardH);
+		s_zhrModalBox->winSetEnabledColor(0, GameMakeColor(8, 17, 30, 232));
+		s_zhrModalBox->winSetEnabledBorderColor(0, GameMakeColor(72, 148, 220, 210));
+		s_zhrModalBox->winHide(FALSE);
+	}
+
+	GameWindow *host = s_zhrModalBox ? s_zhrModalBox : parent;
+
+	// Make the 4 legacy group containers full-card transparent coordinate-aligned overlays so
+	// every existing .wnd control inside them aligns cleanly to (0, 0) of `host`!
+	auto alignGroupContainer = [&](GameWindow *grp)
+	{
+		if (!grp || grp == host || grp == parent)
+			return;
+		grp->winSetPosition(0, 0);
+		grp->winSetSize(cardW, cardH);
+		grp->winSetStatus(WIN_STATUS_SEE_THRU);
+		grp->winHide(FALSE);
+	};
+	alignGroupContainer(s_zhrVideoGroup);
+	alignGroupContainer(s_zhrAudioGroup);
+	alignGroupContainer(s_zhrControlsGroup);
+	alignGroupContainer(s_zhrNetworkGroup);
+
+	// Borrow already-DPI-scaled fonts directly from loaded .wnd gadgets so text scales identically at 720p..4K
+	GameFont *bodyFont = checkAlternateMouse ? checkAlternateMouse->winGetFont() : nullptr;
+	GameFont *buttonFont = btnAccept ? btnAccept->winGetFont() : bodyFont;
+	GameFont *smallFont = lblVersion ? lblVersion->winGetFont() : bodyFont;
+	GameFont *titleFont = buttonFont;
+	GameFont *sectionFont = bodyFont;
+	if (buttonFont)
+	{
+		GameFont *fTitle = TheFontLibrary->getFont(buttonFont->nameString, buttonFont->pointSize + 4, TRUE);
+		if (fTitle) titleFont = fTitle;
+	}
+	if (bodyFont)
+	{
+		GameFont *fSec = TheFontLibrary->getFont(bodyFont->nameString, bodyFont->pointSize, TRUE);
+		if (fSec) sectionFont = fSec;
+	}
+
+	// Helper: hide legacy unnamed/unused decorative siblings inside a container while preserving active widgets
+	auto pruneLegacyChildren = [&](GameWindow *container)
+	{
+		if (!container)
+			return;
+		for (GameWindow *child = container->winGetChild(); child != nullptr; child = child->winGetNext())
+		{
+			const Bool keep =
+				child == s_zhrModalBox ||
+				child == s_zhrVideoGroup ||
+				child == s_zhrAudioGroup ||
+				child == s_zhrControlsGroup ||
+				child == s_zhrNetworkGroup ||
+				child == comboBoxResolution ||
+				child == comboBoxDetail ||
+				child == sliderGamma ||
+				child == sliderMusicVolume ||
+				child == sliderSFXVolume ||
+				child == sliderVoiceVolume ||
+				child == checkAlternateMouse ||
+				child == checkDoubleClickAttackMove ||
+				child == checkRetaliation ||
+				child == sliderScrollSpeed ||
+				child == comboBoxOnlineIP ||
+				child == comboBoxLANIP ||
+				child == s_zhrTextEntryFirewallPort ||
+				child == buttonFirewallRefresh ||
+				child == btnDefaults ||
+				child == btnAccept ||
+				child == btnBack ||
+				child == lblVersion ||
+				child == WinAdvancedDisplay;
+			if (!keep)
+			{
+				child->winHide(TRUE);
+			}
+		}
+	};
+	pruneLegacyChildren(host);
+	if (s_zhrVideoGroup && s_zhrVideoGroup != host) pruneLegacyChildren(s_zhrVideoGroup);
+	if (s_zhrAudioGroup && s_zhrAudioGroup != host) pruneLegacyChildren(s_zhrAudioGroup);
+	if (s_zhrControlsGroup && s_zhrControlsGroup != host) pruneLegacyChildren(s_zhrControlsGroup);
+	if (s_zhrNetworkGroup && s_zhrNetworkGroup != host) pruneLegacyChildren(s_zhrNetworkGroup);
+
+	// Layout metrics derived proportionally from modal card size
+	const Int padX = static_cast<Int>(cardW * 0.032f);
+	const Int padY = static_cast<Int>(cardH * 0.028f);
+	const Int innerW = cardW - padX * 2;
+
+	const Int headerH = static_cast<Int>(cardH * 0.072f);
+	const Int tabH = static_cast<Int>(cardH * 0.070f);
+	const Int footerH = static_cast<Int>(cardH * 0.080f);
+
+	const Int headerY = padY;
+	const Int tabY = headerY + headerH + static_cast<Int>(cardH * 0.014f);
+	const Int headerDivY = tabY + tabH + static_cast<Int>(cardH * 0.014f);
+	const Int footerY = cardH - padY - footerH;
+	const Int footerDivY = footerY - static_cast<Int>(cardH * 0.020f);
+	const Int bodyY = headerDivY + static_cast<Int>(cardH * 0.022f);
+	const Int bodyH = footerDivY - bodyY - static_cast<Int>(cardH * 0.016f);
+
+	const Color colTitle = GameMakeColor(242, 250, 255, 255);
+	const Color colAccent = GameMakeColor(102, 214, 255, 255);
+	const Color colLabel = GameMakeColor(208, 228, 246, 245);
+	const Color colMuted = GameMakeColor(148, 184, 214, 220);
+
+	// 1. Header bar: "OPTIONS" left, compact version badge right (inside card — never clipped!)
+	s_zhrTitleLabel = createZhrLabel(
+		host,
+		"OptionsMenu.wnd:ZhrTitleOptions",
+		UnicodeString(L"OPTIONS"),
+		padX, headerY, static_cast<Int>(innerW * 0.28f), headerH,
+		titleFont,
+		colTitle,
+		FALSE);
+
+	if (lblVersion)
+	{
+		const Int verX = padX + static_cast<Int>(innerW * 0.30f);
+		const Int verW = innerW - static_cast<Int>(innerW * 0.30f);
+		lblVersion->winSetPosition(verX, headerY);
+		lblVersion->winSetSize(verW, headerH);
+		lblVersion->winSetEnabledTextColors(colMuted, GameMakeColor(0, 8, 18, 200));
+		TextData *vData = static_cast<TextData *>(lblVersion->winGetUserData());
+		if (vData)
+		{
+			vData->centered = FALSE;
+			vData->centeredVertically = TRUE;
+		}
+		lblVersion->winHide(FALSE);
+	}
+
+	// 2. Tab Bar: GRAPHICS | AUDIO | CONTROLS | NETWORK
+	const char *tabNames[ZHR_TAB_COUNT] = {
+		"OptionsMenu.wnd:ZhrTabGraphics",
+		"OptionsMenu.wnd:ZhrTabAudio",
+		"OptionsMenu.wnd:ZhrTabControls",
+		"OptionsMenu.wnd:ZhrTabNetwork"
+	};
+	const WideChar *tabLabels[ZHR_TAB_COUNT] = {
+		L"GRAPHICS",
+		L"AUDIO",
+		L"CONTROLS",
+		L"NETWORK"
+	};
+	const Int tabGap = static_cast<Int>(cardW * 0.010f);
+	const Int tabW = (innerW - tabGap * (ZHR_TAB_COUNT - 1)) / ZHR_TAB_COUNT;
+	for (Int i = 0; i < ZHR_TAB_COUNT; ++i)
+	{
+		s_zhrTabButtons[i] = createZhrButton(
+			host,
+			tabNames[i],
+			UnicodeString(tabLabels[i]),
+			padX + i * (tabW + tabGap),
+			tabY,
+			tabW,
+			tabH,
+			buttonFont,
+			s_zhrTabIDs[i]);
+	}
+
+	// Horizontal dividers
+	s_zhrHeaderDivider = createZhrPanel(host, "OptionsMenu.wnd:ZhrDividerTop", padX, headerDivY, innerW, 2);
+	s_zhrFooterDivider = createZhrPanel(host, "OptionsMenu.wnd:ZhrDividerBottom", padX, footerDivY, innerW, 2);
+
+	// 3. TAB 0 — GRAPHICS (2 balanced cards: DISPLAY | VULKAN 1.3 REMASTER)
+	const Int colGap = static_cast<Int>(cardW * 0.022f);
+	const Int colW = (innerW - colGap) / 2;
+	const Int leftCardX = padX;
+	const Int rightCardX = padX + colW + colGap;
+	const Int cPadX = static_cast<Int>(colW * 0.050f);
+	const Int cPadY = static_cast<Int>(bodyH * 0.048f);
+	const Int ctrlW = colW - cPadX * 2;
+	const Int secHdrH = static_cast<Int>(bodyH * 0.075f);
+	const Int lblH = static_cast<Int>(bodyH * 0.060f);
+	const Int comboH = static_cast<Int>(bodyH * 0.090f);
+	const Int sliderH = static_cast<Int>(bodyH * 0.082f);
+	const Int checkH = static_cast<Int>(bodyH * 0.092f);
+	const Int rowGap = static_cast<Int>(bodyH * 0.034f);
+
+	// Sub-panel background cards created as children of `host` BEFORE the group containers in z-order
+	s_zhrCardDisplay = createZhrPanel(host, "OptionsMenu.wnd:ZhrSubPanelDisplay", leftCardX, bodyY, colW, bodyH);
+	s_zhrCardVulkan = createZhrPanel(host, "OptionsMenu.wnd:ZhrSubPanelVulkan", rightCardX, bodyY, colW, bodyH);
+
+	GameWindow *gfxParent = s_zhrVideoGroup ? s_zhrVideoGroup : host;
+	GameWindow *audParent = s_zhrAudioGroup ? s_zhrAudioGroup : host;
+	GameWindow *ctlParent = s_zhrControlsGroup ? s_zhrControlsGroup : host;
+	GameWindow *netParent = s_zhrNetworkGroup ? s_zhrNetworkGroup : host;
+
+	// Left card: DISPLAY
+	Int cy = bodyY + cPadY;
+	s_zhrLblDisplayHdr = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblDisplayHdr", UnicodeString(L"DISPLAY"),
+		leftCardX + cPadX, cy, ctrlW, secHdrH, sectionFont, colAccent);
+	cy += secHdrH + rowGap;
+
+	s_zhrLblResolution = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblResolution", UnicodeString(L"Resolution"),
+		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+	placeComboBox(comboBoxResolution, leftCardX + cPadX, cy, ctrlW, comboH);
+	cy += comboH + rowGap;
+
+	s_zhrLblDetail = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblDetail", UnicodeString(L"Detail Preset"),
+		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+	if (comboBoxDetail)
+		GadgetComboBoxSetMaxDisplay(comboBoxDetail, 5);
+	placeComboBox(comboBoxDetail, leftCardX + cPadX, cy, ctrlW, comboH);
+	cy += comboH + rowGap;
+
+	s_zhrBtnCustomDetail = createZhrButton(
+		gfxParent, "OptionsMenu.wnd:ZhrButtonCustomDetail", UnicodeString(L"Custom Detail Settings..."),
+		leftCardX + cPadX, cy, ctrlW, comboH, bodyFont, s_zhrBtnCustomDetailID);
+	if (s_zhrBtnCustomDetail && comboBoxDetail && !comboBoxDetail->winGetEnabled())
+		s_zhrBtnCustomDetail->winEnable(FALSE);
+	cy += comboH + rowGap;
+
+	s_zhrLblBrightness = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblBrightness", UnicodeString(L"Brightness"),
+		leftCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+	placeSlider(sliderGamma, leftCardX + cPadX, cy, ctrlW, sliderH);
+
+	// Right card: VULKAN 1.3 REMASTER
+	cy = bodyY + cPadY;
+	s_zhrLblVulkanHdr = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblVulkanHdr", UnicodeString(L"VULKAN 1.3 REMASTER"),
+		rightCardX + cPadX, cy, ctrlW, secHdrH, sectionFont, colAccent);
+	cy += secHdrH + rowGap;
+
+	s_zhrLblVisualMode = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblVisualMode", UnicodeString(L"Visual Mode  [F9]"),
+		rightCardX + cPadX, cy, ctrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+
+	s_zhrComboVisualMode = createZhrComboBox(
+		gfxParent, "OptionsMenu.wnd:ZhrComboVisualMode",
+		rightCardX + cPadX, cy, ctrlW, comboH, bodyFont, s_zhrComboVisualModeID);
+	if (s_zhrComboVisualMode)
+	{
+		const Color entryCol = GameMakeColor(236, 246, 255, 255);
+		GadgetComboBoxReset(s_zhrComboVisualMode);
+		GadgetComboBoxSetMaxDisplay(s_zhrComboVisualMode, 3);
+		GadgetComboBoxAddEntry(s_zhrComboVisualMode, UnicodeString(L"Remastered (Vulkan 1.3)"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboVisualMode, UnicodeString(L"Split-Screen A/B Compare"), entryCol);
+		GadgetComboBoxAddEntry(s_zhrComboVisualMode, UnicodeString(L"Classic 2003"), entryCol);
+	}
+	cy += comboH + rowGap;
+
+	const Int checkGap = static_cast<Int>(bodyH * 0.022f);
+	s_zhrCheckPbr = createZhrCheckBox(
+		gfxParent, "OptionsMenu.wnd:ZhrCheckPbrWaterSsao",
+		UnicodeString(L"PBR, Coastal Water & SSAO  [F10]"),
+		rightCardX + cPadX, cy, ctrlW, checkH, bodyFont, s_zhrCheckPbrID);
+	cy += checkH + checkGap;
+
+	s_zhrCheckPostFx = createZhrCheckBox(
+		gfxParent, "OptionsMenu.wnd:ZhrCheckHdrPostFx",
+		UnicodeString(L"HDR Bloom, ACES & CAS  [F11]"),
+		rightCardX + cPadX, cy, ctrlW, checkH, bodyFont, s_zhrCheckPostFxID);
+	cy += checkH + checkGap;
+
+	s_zhrCheckRemasterTex = createZhrCheckBox(
+		gfxParent, "OptionsMenu.wnd:ZhrCheckRemasterTex",
+		UnicodeString(L"2x Remastered 3D Textures  [F8]"),
+		rightCardX + cPadX, cy, ctrlW, checkH, bodyFont, s_zhrCheckRemasterTexID);
+	cy += checkH + checkGap;
+
+	s_zhrCheckMeshSmooth = createZhrCheckBox(
+		gfxParent, "OptionsMenu.wnd:ZhrCheckMeshSmoothing",
+		UnicodeString(L"Phong .W3D Mesh Smoothing  [F7]"),
+		rightCardX + cPadX, cy, ctrlW, checkH, bodyFont, s_zhrCheckMeshSmoothID);
+
+	const Int hintH = static_cast<Int>(bodyH * 0.065f);
+	s_zhrLblVulkanHint = createZhrLabel(
+		gfxParent, "OptionsMenu.wnd:ZhrLblVulkanHint",
+		s_zhrHasVulkan
+			? UnicodeString(L"Live preview active \u2022 Accept saves to Options.ini")
+			: UnicodeString(L"Vulkan 1.3 backend inactive in this build"),
+		rightCardX + cPadX, bodyY + bodyH - cPadY - hintH, ctrlW, hintH, smallFont, colMuted);
+
+	// 4. TAB 1 — AUDIO (centered spacious card)
+	const Int singleCardW = static_cast<Int>(innerW * 0.72f);
+	const Int singleCardX = padX + (innerW - singleCardW) / 2;
+	const Int scPadX = static_cast<Int>(singleCardW * 0.06f);
+	const Int scCtrlW = singleCardW - scPadX * 2;
+
+	s_zhrCardAudio = createZhrPanel(host, "OptionsMenu.wnd:ZhrSubPanelAudio", singleCardX, bodyY, singleCardW, bodyH);
+	cy = bodyY + cPadY;
+	s_zhrLblAudioHdr = createZhrLabel(
+		audParent, "OptionsMenu.wnd:ZhrLblAudioHdr", UnicodeString(L"AUDIO MIXER"),
+		singleCardX + scPadX, cy, scCtrlW, secHdrH, sectionFont, colAccent);
+	cy += secHdrH + rowGap * 2;
+
+	s_zhrLblMusicVol = createZhrLabel(
+		audParent, "OptionsMenu.wnd:ZhrLblMusicVol", UnicodeString(L"Music Volume"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 6;
+	placeSlider(sliderMusicVolume, singleCardX + scPadX, cy, scCtrlW, sliderH);
+	cy += sliderH + rowGap * 2;
+
+	s_zhrLblSfxVol = createZhrLabel(
+		audParent, "OptionsMenu.wnd:ZhrLblSfxVol", UnicodeString(L"Sound FX Volume"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 6;
+	placeSlider(sliderSFXVolume, singleCardX + scPadX, cy, scCtrlW, sliderH);
+	cy += sliderH + rowGap * 2;
+
+	s_zhrLblVoiceVol = createZhrLabel(
+		audParent, "OptionsMenu.wnd:ZhrLblVoiceVol", UnicodeString(L"Voice Volume"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 6;
+	placeSlider(sliderVoiceVolume, singleCardX + scPadX, cy, scCtrlW, sliderH);
+
+	// 5. TAB 2 — CONTROLS (centered spacious card)
+	s_zhrCardControls = createZhrPanel(host, "OptionsMenu.wnd:ZhrSubPanelControls", singleCardX, bodyY, singleCardW, bodyH);
+	cy = bodyY + cPadY;
+	s_zhrLblControlsHdr = createZhrLabel(
+		ctlParent, "OptionsMenu.wnd:ZhrLblControlsHdr", UnicodeString(L"MOUSE & CAMERA CONTROLS"),
+		singleCardX + scPadX, cy, scCtrlW, secHdrH, sectionFont, colAccent);
+	cy += secHdrH + rowGap * 2;
+
+	if (checkAlternateMouse)
+	{
+		checkAlternateMouse->winSetPosition(singleCardX + scPadX, cy);
+		checkAlternateMouse->winSetSize(scCtrlW, checkH);
+	}
+	cy += checkH + rowGap;
+
+	if (checkDoubleClickAttackMove)
+	{
+		checkDoubleClickAttackMove->winSetPosition(singleCardX + scPadX, cy);
+		checkDoubleClickAttackMove->winSetSize(scCtrlW, checkH);
+	}
+	cy += checkH + rowGap;
+
+	if (checkRetaliation)
+	{
+		checkRetaliation->winSetPosition(singleCardX + scPadX, cy);
+		checkRetaliation->winSetSize(scCtrlW, checkH);
+	}
+	cy += checkH + rowGap * 2;
+
+	s_zhrLblScrollSpeed = createZhrLabel(
+		ctlParent, "OptionsMenu.wnd:ZhrLblScrollSpeed", UnicodeString(L"Scroll Speed"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 6;
+	placeSlider(sliderScrollSpeed, singleCardX + scPadX, cy, scCtrlW, sliderH);
+
+	// 6. TAB 3 — NETWORK (centered spacious card)
+	s_zhrCardNetwork = createZhrPanel(host, "OptionsMenu.wnd:ZhrSubPanelNetwork", singleCardX, bodyY, singleCardW, bodyH);
+	cy = bodyY + cPadY;
+	s_zhrLblNetworkHdr = createZhrLabel(
+		netParent, "OptionsMenu.wnd:ZhrLblNetworkHdr", UnicodeString(L"MULTIPLAYER & NETWORK"),
+		singleCardX + scPadX, cy, scCtrlW, secHdrH, sectionFont, colAccent);
+	cy += secHdrH + rowGap * 2;
+
+	s_zhrLblOnlineIP = createZhrLabel(
+		netParent, "OptionsMenu.wnd:ZhrLblOnlineIP", UnicodeString(L"Online IP"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+	placeComboBox(comboBoxOnlineIP, singleCardX + scPadX, cy, scCtrlW, comboH);
+	cy += comboH + rowGap;
+
+	s_zhrLblLanIP = createZhrLabel(
+		netParent, "OptionsMenu.wnd:ZhrLblLanIP", UnicodeString(L"LAN IP"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+	placeComboBox(comboBoxLANIP, singleCardX + scPadX, cy, scCtrlW, comboH);
+	cy += comboH + rowGap;
+
+	s_zhrLblFirewallPort = createZhrLabel(
+		netParent, "OptionsMenu.wnd:ZhrLblFirewallPort", UnicodeString(L"Firewall Port Override"),
+		singleCardX + scPadX, cy, scCtrlW, lblH, bodyFont, colLabel);
+	cy += lblH + 4;
+	const Int natBtnW = static_cast<Int>(scCtrlW * 0.34f);
+	const Int portFieldW = scCtrlW - natBtnW - static_cast<Int>(scCtrlW * 0.04f);
+	if (s_zhrTextEntryFirewallPort)
+	{
+		s_zhrTextEntryFirewallPort->winSetPosition(singleCardX + scPadX, cy);
+		s_zhrTextEntryFirewallPort->winSetSize(portFieldW, comboH);
+	}
+	if (buttonFirewallRefresh)
+	{
+		buttonFirewallRefresh->winSetPosition(singleCardX + scPadX + scCtrlW - natBtnW, cy);
+		buttonFirewallRefresh->winSetSize(natBtnW, comboH);
+	}
+
+	// 7. Footer bar: DEFAULTS left, ACCEPT + CANCEL right
+	const Int btnGap = static_cast<Int>(cardW * 0.014f);
+	const Int defBtnW = static_cast<Int>(innerW * 0.22f);
+	const Int accBtnW = static_cast<Int>(innerW * 0.24f);
+	const Int canBtnW = static_cast<Int>(innerW * 0.22f);
+
+	if (btnDefaults)
+	{
+		btnDefaults->winSetPosition(padX, footerY);
+		btnDefaults->winSetSize(defBtnW, footerH);
+	}
+	if (btnBack)
+	{
+		btnBack->winSetPosition(padX + innerW - canBtnW, footerY);
+		btnBack->winSetSize(canBtnW, footerH);
+	}
+	if (btnAccept)
+	{
+		btnAccept->winSetPosition(padX + innerW - canBtnW - btnGap - accBtnW, footerY);
+		btnAccept->winSetSize(accBtnW, footerH);
+	}
+
+	// Ensure group containers and interactive controls sit cleanly ABOVE the ZhrSubPanel cards (and dropdowns on top!)
+	auto bringTop = [](GameWindow *w) { if (w) w->winBringToTop(); };
+	bringTop(s_zhrVideoGroup);
+	bringTop(s_zhrAudioGroup);
+	bringTop(s_zhrControlsGroup);
+	bringTop(s_zhrNetworkGroup);
+
+	bringTop(sliderGamma);
+	bringTop(s_zhrBtnCustomDetail);
+	bringTop(comboBoxDetail);
+	bringTop(comboBoxResolution);
+	bringTop(s_zhrCheckPbr);
+	bringTop(s_zhrCheckPostFx);
+	bringTop(s_zhrCheckRemasterTex);
+	bringTop(s_zhrCheckMeshSmooth);
+	bringTop(s_zhrComboVisualMode);
+
+	bringTop(sliderMusicVolume);
+	bringTop(sliderSFXVolume);
+	bringTop(sliderVoiceVolume);
+
+	bringTop(checkAlternateMouse);
+	bringTop(checkDoubleClickAttackMove);
+	bringTop(checkRetaliation);
+	bringTop(sliderScrollSpeed);
+
+	bringTop(s_zhrTextEntryFirewallPort);
+	bringTop(buttonFirewallRefresh);
+	bringTop(comboBoxLANIP);
+	bringTop(comboBoxOnlineIP);
+
+	bringTop(btnDefaults);
+	bringTop(btnAccept);
+	bringTop(btnBack);
+	bringTop(lblVersion);
+	bringTop(WinAdvancedDisplay);
+
+	// Sync Vulkan controls and choose starting tab (optionally driven by ZHR_AUTO_OPEN_OPTIONS)
+	syncVulkanControlsFromState();
+
+	Int initialTab = ZHR_TAB_GRAPHICS;
+	const char *autoOpt = getenv("ZHR_AUTO_OPEN_OPTIONS");
+	if (autoOpt)
+	{
+		if (_stricmp(autoOpt, "audio") == 0) initialTab = ZHR_TAB_AUDIO;
+		else if (_stricmp(autoOpt, "controls") == 0) initialTab = ZHR_TAB_CONTROLS;
+		else if (_stricmp(autoOpt, "network") == 0) initialTab = ZHR_TAB_NETWORK;
+	}
+	selectZhrOptionsTab(initialTab);
+}
+
 static void setDefaults()
 {
 	constexpr const Bool ModifyDisplaySettings = FALSE;
@@ -292,6 +1374,19 @@ static void setDefaults()
  	// slider Gamma
  	GadgetSliderGetMinMax(sliderGamma,&valMin, &valMax);
  	GadgetSliderSetPosition(sliderGamma, ((valMax - valMin) / 2 + valMin));
+
+	//-------------------------------------------------------------------------------------------------
+	// ZeroHourReloaded Vulkan 1.3 Remaster defaults (Remastered, all enhancements ON)
+	if (s_zhrHasVulkan)
+	{
+		s_zhrCurMode = 1u;
+		s_zhrCurPbr = TRUE;
+		s_zhrCurPostFx = TRUE;
+		s_zhrCurRemasterTex = TRUE;
+		s_zhrCurMeshSmooth = TRUE;
+		syncVulkanControlsFromState();
+		applyLiveVulkanRemasterSettings();
+	}
 
 	if constexpr (ModifyDisplaySettings)
 	{
@@ -836,6 +1931,27 @@ static void saveOptions()
 	}
 
 	//-------------------------------------------------------------------------------------------------
+	// ZeroHourReloaded Vulkan 1.3 Remaster settings
+	if (s_zhrHasVulkan && TheDisplay)
+	{
+		const char *modeStr =
+			(s_zhrCurMode == 0u) ? "classic" :
+			(s_zhrCurMode == 2u) ? "split" : "remastered";
+		(*pref)["ZhrGraphicsMode"] = modeStr;
+		(*pref)["ZhrPbrWaterSsao"] = s_zhrCurPbr ? "yes" : "no";
+		(*pref)["ZhrHdrPostFx"] = s_zhrCurPostFx ? "yes" : "no";
+		(*pref)["ZhrRemasterTextures"] = s_zhrCurRemasterTex ? "yes" : "no";
+		(*pref)["ZhrMeshSmoothing"] = s_zhrCurMeshSmooth ? "yes" : "no";
+
+		applyLiveVulkanRemasterSettings();
+		s_zhrSavedMode = s_zhrCurMode;
+		s_zhrSavedPbr = s_zhrCurPbr;
+		s_zhrSavedPostFx = s_zhrCurPostFx;
+		s_zhrSavedRemasterTex = s_zhrCurRemasterTex;
+		s_zhrSavedMeshSmooth = s_zhrCurMeshSmooth;
+	}
+
+	//-------------------------------------------------------------------------------------------------
 	// Resolution
 	//
 	// TheSuperHackers @bugfix xezon 12/06/2025 Now performs the resolution change at the very end of
@@ -889,13 +2005,25 @@ static void DestroyOptionsLayout() {
 
 	SignalUIInteraction(SHELL_SCRIPT_HOOK_OPTIONS_CLOSED);
 
+	clearZhrOptionsWidgets();
 	TheShell->destroyOptionsLayout();
 	OptionsLayout = nullptr;
 }
 
 static void showAdvancedOptions()
 {
+	if (!WinAdvancedDisplay)
+		return;
+	GameWindow *parent = WinAdvancedDisplay->winGetParent();
+	if (parent)
+	{
+		ICoord2D pSize, aSize;
+		parent->winGetSize(&pSize.x, &pSize.y);
+		WinAdvancedDisplay->winGetSize(&aSize.x, &aSize.y);
+		WinAdvancedDisplay->winSetPosition((pSize.x - aSize.x) / 2, (pSize.y - aSize.y) / 2);
+	}
 	WinAdvancedDisplay->winHide(FALSE);
+	WinAdvancedDisplay->winBringToTop();
 }
 
 static void acceptAdvancedOptions()
@@ -937,12 +2065,39 @@ static void initLabelVersion()
 void OptionsMenuInit( WindowLayout *layout, void *userData )
 {
 	ignoreSelected = TRUE;
+	clearZhrOptionsWidgets();
 	if (TheGameEngine->getQuitting())
 		return;
 	OptionsLayout = layout;
 	if (!pref)
 	{
 		pref = NEW OptionPreferences;
+	}
+
+	// Snapshot live Vulkan 1.3 Remaster settings for instant preview + Cancel revert
+	s_zhrHasVulkan = (TheDisplay && TheDisplay->hasVulkanRemasterBackend()) ? TRUE : FALSE;
+	if (s_zhrHasVulkan)
+	{
+		TheDisplay->getVulkanRemasterSettings(
+			s_zhrSavedMode,
+			s_zhrSavedPbr,
+			s_zhrSavedPostFx,
+			s_zhrSavedRemasterTex,
+			s_zhrSavedMeshSmooth);
+		// If currently in Classic 2003, initialize feature toggle checkboxes from saved preferences
+		// so switching back to Remastered preserves the user's feature choices.
+		if (s_zhrSavedMode == 0u)
+		{
+			s_zhrSavedPbr = pref->getZhrPbrWaterSsaoEnabled();
+			s_zhrSavedPostFx = pref->getZhrHdrPostFxEnabled();
+			s_zhrSavedRemasterTex = pref->getZhrRemasterTexturesEnabled();
+			s_zhrSavedMeshSmooth = pref->getZhrMeshSmoothingEnabled();
+		}
+		s_zhrCurMode = s_zhrSavedMode;
+		s_zhrCurPbr = s_zhrSavedPbr;
+		s_zhrCurPostFx = s_zhrSavedPostFx;
+		s_zhrCurRemasterTex = s_zhrSavedRemasterTex;
+		s_zhrCurMeshSmooth = s_zhrSavedMeshSmooth;
 	}
 
 	SignalUIInteraction(SHELL_SCRIPT_HOOK_OPTIONS_OPENED);
@@ -1422,6 +2577,7 @@ void OptionsMenuInit( WindowLayout *layout, void *userData )
 //			checkAudioHardware->winEnable(FALSE);
 	}
 
+	buildModernTabbedOptionsLayout(parent);
 
 	TheWindowManager->winSetModal(parent);
 	ignoreSelected = FALSE;
@@ -1543,7 +2699,7 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 		//---------------------------------------------------------------------------------------------
 		case GWM_DESTROY:
 		{
-
+			clearZhrOptionsWidgets();
 			break;
 
 		}
@@ -1577,6 +2733,13 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 
 					showAdvancedOptions();
 				}
+				else if (controlID == s_zhrComboVisualModeID && s_zhrHasVulkan)
+				{
+					Int index = 0;
+					GadgetComboBoxGetSelectedPos(s_zhrComboVisualMode, &index);
+					s_zhrCurMode = zhrComboIdxToMode(index);
+					applyLiveVulkanRemasterSettings();
+				}
 			break;
 		}
 
@@ -1590,8 +2753,16 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 
 			if( controlID == buttonBack )
 			{
-				// go back one screen
-				//TheShell->pop();
+				// Revert live Vulkan 1.3 Remaster preview back to the snapshot taken on open
+				if (s_zhrHasVulkan && TheDisplay)
+				{
+					TheDisplay->setVulkanRemasterSettings(
+						s_zhrSavedMode,
+						s_zhrSavedPbr,
+						s_zhrSavedPostFx,
+						s_zhrSavedRemasterTex,
+						s_zhrSavedMeshSmooth);
+				}
 
 				delete pref;
 				pref = nullptr;
@@ -1640,6 +2811,72 @@ WindowMsgHandledType OptionsMenuSystem( GameWindow *window, UnsignedInt msg,
 			else if (controlID == buttonDefaults )
 			{
 				setDefaults();
+			}
+			else if (controlID == s_zhrTabIDs[ZHR_TAB_GRAPHICS])
+			{
+				selectZhrOptionsTab(ZHR_TAB_GRAPHICS);
+			}
+			else if (controlID == s_zhrTabIDs[ZHR_TAB_AUDIO])
+			{
+				selectZhrOptionsTab(ZHR_TAB_AUDIO);
+			}
+			else if (controlID == s_zhrTabIDs[ZHR_TAB_CONTROLS])
+			{
+				selectZhrOptionsTab(ZHR_TAB_CONTROLS);
+			}
+			else if (controlID == s_zhrTabIDs[ZHR_TAB_NETWORK])
+			{
+				selectZhrOptionsTab(ZHR_TAB_NETWORK);
+			}
+			else if (controlID == s_zhrBtnCustomDetailID)
+			{
+				if (comboBoxDetail && comboBoxDetail->winGetEnabled())
+				{
+					ignoreSelected = TRUE;
+					GadgetComboBoxSetSelectedPos(comboBoxDetail, STATIC_GAME_LOD_CUSTOM);
+					ignoreSelected = FALSE;
+					showAdvancedOptions();
+				}
+			}
+			else if (controlID == s_zhrCheckPbrID && s_zhrHasVulkan)
+			{
+				s_zhrCurPbr = GadgetCheckBoxIsChecked(control);
+				if (s_zhrCurPbr && s_zhrCurMode == 0u)
+				{
+					s_zhrCurMode = 1u;
+					syncVulkanControlsFromState();
+				}
+				applyLiveVulkanRemasterSettings();
+			}
+			else if (controlID == s_zhrCheckPostFxID && s_zhrHasVulkan)
+			{
+				s_zhrCurPostFx = GadgetCheckBoxIsChecked(control);
+				if (s_zhrCurPostFx && s_zhrCurMode == 0u)
+				{
+					s_zhrCurMode = 1u;
+					syncVulkanControlsFromState();
+				}
+				applyLiveVulkanRemasterSettings();
+			}
+			else if (controlID == s_zhrCheckRemasterTexID && s_zhrHasVulkan)
+			{
+				s_zhrCurRemasterTex = GadgetCheckBoxIsChecked(control);
+				if (s_zhrCurRemasterTex && s_zhrCurMode == 0u)
+				{
+					s_zhrCurMode = 1u;
+					syncVulkanControlsFromState();
+				}
+				applyLiveVulkanRemasterSettings();
+			}
+			else if (controlID == s_zhrCheckMeshSmoothID && s_zhrHasVulkan)
+			{
+				s_zhrCurMeshSmooth = GadgetCheckBoxIsChecked(control);
+				if (s_zhrCurMeshSmooth && s_zhrCurMode == 0u)
+				{
+					s_zhrCurMode = 1u;
+					syncVulkanControlsFromState();
+				}
+				applyLiveVulkanRemasterSettings();
 			}
 			else if (controlID == ButtonAdvancedAcceptID )
 			{

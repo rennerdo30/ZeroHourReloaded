@@ -52,6 +52,7 @@
 #include "GameClient/IMEManager.h"
 #include "W3DDevice/GameClient/W3DGadget.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 
 // DEFINES ////////////////////////////////////////////////////////////////////
@@ -227,6 +228,21 @@ void W3DGadgetTextEntryDraw( GameWindow *window, WinInstanceData *instData )
 	window->winGetScreenPosition( &origin.x, &origin.y );
 	window->winGetSize( &size.x, &size.y );
 
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalTextEntryFrame(window, instData);
+		const Bool enabled = BitIsSet(window->winGetStatus(), WIN_STATUS_ENABLED);
+		const Color modernTextCol = enabled ? GameMakeColor(236, 246, 255, 255) : GameMakeColor(136, 154, 174, 210);
+		const Color modernDropCol = GameMakeColor(0, 8, 18, 210);
+		const Int fontHeight = TheWindowManager->winFontHeight(instData->getFont());
+		const Int startOffset = 8;
+		const Int width = size.x - (2 * startOffset);
+		start.x = origin.x + startOffset;
+		start.y = origin.y + (size.y - fontHeight) / 2;
+		drawTextEntryText(window, instData, modernTextCol, modernDropCol, modernTextCol, modernDropCol, start.x, start.y, width, fontHeight);
+		return;
+	}
+
 	// get the right colors
 	if( BitIsSet( window->winGetStatus(), WIN_STATUS_ENABLED ) == FALSE )
 	{
@@ -327,6 +343,21 @@ void W3DGadgetTextEntryImageDraw( GameWindow *window, WinInstanceData *instData 
 	// get size and position of window
 	window->winGetScreenPosition( &origin.x, &origin.y );
 	window->winGetSize( &size.x, &size.y );
+
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalTextEntryFrame(window, instData);
+		const Bool enabled = BitIsSet(window->winGetStatus(), WIN_STATUS_ENABLED);
+		const Color modernTextCol = enabled ? GameMakeColor(236, 246, 255, 255) : GameMakeColor(136, 154, 174, 210);
+		const Color modernDropCol = GameMakeColor(0, 8, 18, 210);
+		const Int fontHeight = TheWindowManager->winFontHeight(instData->getFont());
+		const Int startOffset = 8;
+		const Int width = size.x - (2 * startOffset);
+		start.x = origin.x + startOffset;
+		start.y = origin.y + (size.y - fontHeight) / 2;
+		drawTextEntryText(window, instData, modernTextCol, modernDropCol, modernTextCol, modernDropCol, start.x, start.y, width, fontHeight);
+		return;
+	}
 
 	// get image offset
 	xOffset = instData->m_imageOffset.x;

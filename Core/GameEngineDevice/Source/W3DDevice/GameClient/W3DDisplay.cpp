@@ -53,6 +53,7 @@ static void drawFramerateBar();
 #include "Common/PlayerList.h"
 #include "Common/ThingTemplate.h"
 #include "Common/GameLOD.h"
+#include "Common/OptionPreferences.h"
 #include "Common/DrawModule.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/Module/PhysicsUpdate.h"
@@ -113,6 +114,13 @@ static void drawFramerateBar();
 #endif
 
 #include "WinMain.h"
+
+#ifdef ZHR_VULKAN_BACKEND
+#include <zhr_ffi.h>
+extern "C" void zhr_vk_set_mesh_smoothing(bool enabled);
+extern "C" bool zhr_vk_get_mesh_smoothing(void);
+extern "C" void zhr_vk_mark_title_banner_dirty(void);
+#endif
 
 
 // DEFINE AND ENUMS ///////////////////////////////////////////////////////////
@@ -954,6 +962,21 @@ void W3DDisplay::init()
 
 		if (TheGlobalData->m_displayGamma != 1.0f)
 			setGamma(TheGlobalData->m_displayGamma,0.0f,1.0f,FALSE);
+
+#ifdef ZHR_VULKAN_BACKEND
+		// Apply persisted ZeroHourReloaded Vulkan 1.3 Remaster settings from Options.ini
+		// unless the user explicitly passed ZHR_GRAPHICS_MODE on the command line / environment.
+		if (std::getenv("ZHR_GRAPHICS_MODE") == nullptr)
+		{
+			OptionPreferences zhrPrefs;
+			setVulkanRemasterSettings(
+				zhrPrefs.getZhrGraphicsMode(),
+				zhrPrefs.getZhrPbrWaterSsaoEnabled(),
+				zhrPrefs.getZhrHdrPostFxEnabled(),
+				zhrPrefs.getZhrRemasterTexturesEnabled(),
+				zhrPrefs.getZhrMeshSmoothingEnabled());
+		}
+#endif
 	}
 
 	initAssets();
@@ -3404,4 +3427,48 @@ static void drawFramerateBar()
 
 	TheDisplay->drawFillRect(1, 1, width, 15, colorToUse);
 	prevTime = now;
+}
+
+Bool W3DDisplay::hasVulkanRemasterBackend() const
+{
+#ifdef ZHR_VULKAN_BACKEND
+	return TRUE;
+#else
+	return FALSE;
+#endif
+}
+
+void W3DDisplay::getVulkanRemasterSettings(UnsignedInt &mode, Bool &pbrWaterSsao, Bool &hdrPostFx, Bool &remasterTextures, Bool &meshSmoothing) const
+{
+#ifdef ZHR_VULKAN_BACKEND
+	const UnsignedInt packed = zhr_vk_get_graphics_mode();
+	mode = packed & 0x3u;
+	pbrWaterSsao = ((packed >> 2) & 0x1u) != 0u ? TRUE : FALSE;
+	hdrPostFx = ((packed >> 3) & 0x1u) != 0u ? TRUE : FALSE;
+	remasterTextures = ((packed >> 4) & 0x1u) != 0u ? TRUE : FALSE;
+	meshSmoothing = zhr_vk_get_mesh_smoothing() ? TRUE : FALSE;
+#else
+	mode = 0;
+	pbrWaterSsao = FALSE;
+	hdrPostFx = FALSE;
+	remasterTextures = FALSE;
+	meshSmoothing = FALSE;
+#endif
+}
+
+void W3DDisplay::setVulkanRemasterSettings(UnsignedInt mode, Bool pbrWaterSsao, Bool hdrPostFx, Bool remasterTextures, Bool meshSmoothing)
+{
+#ifdef ZHR_VULKAN_BACKEND
+	if (mode > 2u)
+		mode = 1u;
+	const bool pbr = (mode != 0u) && (pbrWaterSsao != FALSE);
+	const bool postFx = (mode != 0u) && (hdrPostFx != FALSE);
+	const bool remasterTex = (mode != 0u) && (remasterTextures != FALSE);
+	zhr_vk_set_graphics_mode(mode, pbr, postFx);
+	zhr_vk_set_remaster_textures(remasterTex);
+	zhr_vk_set_mesh_smoothing(meshSmoothing != FALSE);
+	zhr_vk_mark_title_banner_dirty();
+#else
+	(void)mode; (void)pbrWaterSsao; (void)hdrPostFx; (void)remasterTextures; (void)meshSmoothing;
+#endif
 }

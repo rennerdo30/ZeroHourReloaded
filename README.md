@@ -66,10 +66,10 @@ Legacy 32-bit `binkw32.dll` and `mss32.dll` cannot load in a 64-bit process. Zer
 
 ---
 
-### 5. Modern Frosted-Glass Main Menu, Shell UI & 8-Bit HD Typography (`F9`)
-Replaces the stretched 2003 full-screen blue grid border, blurry bitmap button frames, and 4-bit quantized (`A4R4G4B4`) fonts with a crisp, resolution-independent tactical UI — **live-toggleable via `F9`**:
+### 5. Modern Frosted-Glass Main Menu, Tabbed Options Menu & 8-Bit HD Typography (`F9`)
+Replaces the stretched 2003 full-screen blue grid border, blurry bitmap button frames, cramped single-page Options dialog, and 4-bit quantized (`A4R4G4B4`) fonts with a crisp, resolution-independent tactical UI — **live-toggleable via `F9`** and scaling cleanly from `1280×720` to `3840×2160` (4K):
 - **Real-Time Vulkan 1.3 Frosted Glass:** Quarter-resolution separable Gaussian blur of the live 3D shell battle (or 2D `-quickstart` backdrop) sampled directly behind menu panels (`PostProcessPipeline::capture_ui_backdrop` + `WW3D2_UBER_WGSL`).
-- **Crisp Tactical Buttons & Clean Widescreen Framing (`ZhrMenuStyle`):** Soft cinematic edge vignettes, minimal perimeter brackets, dark-slate translucent gradient buttons with luminous cyan/gold/crimson accent rails, and a live bottom-left engine/hotkey status pill.
+- **Reworked 4-Tabbed Settings Menu (`GRAPHICS`, `AUDIO`, `CONTROLS`, `NETWORK`):** Exposes all ZeroHourReloaded Vulkan 1.3 Remaster settings (**Visual Mode**, **PBR/Coastal Water/SSAO**, **HDR Bloom/ACES/CAS**, **2× Remastered 3D Textures**, **Phong `.W3D` Mesh Smoothing**) directly inside the `GRAPHICS` tab with live immediate preview, `Cancel` revert, `Defaults` restore, and automatic `Options.ini` persistence, alongside modern vector checkboxes, cyan gradient sliders, sleek dropdown chevrons, and crisp header version badges.
 - **Full 8-Bit Antialiased HD Fonts (`render2dsentence.cpp`, `render2d.cpp`):** Upgraded glyph atlases from 4-bit `A4R4G4B4` (16 alpha levels) to full 8-bit `A8R8G8B8` (256 alpha levels) using crisp military `Franklin Gothic Medium` typography, disabled the legacy D3D8 `-0.5` pixel UV bias on Vulkan so point-sampled glyphs land dead-center on texels with zero jagged distortion, and excluded 2D UI/font atlases from 2× texture upscaling — preserving 100% of original hitboxes, transitions, sub-menus, and in-game HUD cameos.
 
 ![Live 50/50 Split-Screen Main Menu — Classic 2003 (Left) vs. Modern Frosted-Glass UI (Right)](docs/screenshots/ab_menu_split.png)
@@ -79,6 +79,11 @@ Replaces the stretched 2003 full-screen blue grid border, blurry bitmap button f
 | ![Classic 2003 Main Menu](docs/screenshots/a_menu_classic.png) | ![ZeroHourReloaded Modern Main Menu](docs/screenshots/b_menu_remastered.png) |
 | ![Classic Menu Buttons](docs/screenshots/a_menu_buttons_classic.png) | ![Modern Frosted-Glass Buttons & 8-Bit Fonts](docs/screenshots/b_menu_buttons_remastered.png) |
 | *Stretched blue grid ruler, blurry bitmap outlines, flat opaque boxes* | *Clean widescreen framing, real-time Vulkan frosted glass, tactical accent rails, 8-bit antialiased HD typography, live status pill* |
+
+| Classic 2003 Controls Skin (Tabbed Layout) | ZeroHourReloaded Modern Frosted-Glass Options Menu |
+| :---: | :---: |
+| ![Classic Options Controls](docs/screenshots/a_options_classic.png) | ![Modern Frosted-Glass Options Menu with Vulkan 1.3 Settings](docs/screenshots/b_options_remastered.png) |
+| *Legacy 2003 segmented sliders & bitmap dropdowns* | *Frosted-glass modal over live 3D shell battle, 4-tab bar, modern vector gadgets & persistent Vulkan 1.3 Remaster controls* |
 
 ---
 

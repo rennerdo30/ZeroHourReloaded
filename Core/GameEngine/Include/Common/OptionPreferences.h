@@ -131,4 +131,11 @@ public:
 	Bool getShowMoneyPerMinute() const;
 
 	Real getGameWindowTransitionSpeedMultiplier() const;
+
+	// ZeroHourReloaded Vulkan 1.3 Remaster settings
+	UnsignedInt getZhrGraphicsMode() const;
+	Bool getZhrPbrWaterSsaoEnabled() const;
+	Bool getZhrHdrPostFxEnabled() const;
+	Bool getZhrRemasterTexturesEnabled() const;
+	Bool getZhrMeshSmoothingEnabled() const;
 };

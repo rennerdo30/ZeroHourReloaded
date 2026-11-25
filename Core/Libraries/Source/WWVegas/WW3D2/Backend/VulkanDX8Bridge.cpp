@@ -28,6 +28,9 @@
 
 namespace {
 
+std::atomic<bool> g_zhr_mesh_smoothing_enabled{true};
+std::atomic<bool> g_zhr_title_banner_dirty{true};
+
 // --- Helpers ---
 
 bool IsValidationRequested()
@@ -1833,6 +1836,9 @@ private:
         }
         m_render_states[D3DRS_LIGHTING] = TRUE;
         m_render_states[D3DRS_COLORVERTEX] = TRUE;
+        m_render_states[D3DRS_DIFFUSEMATERIALSOURCE] = D3DMCS_COLOR1;
+        m_render_states[D3DRS_AMBIENTMATERIALSOURCE] = D3DMCS_MATERIAL;
+        m_render_states[D3DRS_EMISSIVEMATERIALSOURCE] = D3DMCS_MATERIAL;
         m_render_states[D3DRS_COLORWRITEENABLE] = 0x0000000F;
         m_render_states[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFFu;
         m_render_states[D3DRS_STENCILENABLE] = FALSE;
@@ -2125,10 +2131,15 @@ private:
             if (tex_count >= 2) { uv1_off = off; }
         }
 
+        // D3D8 fixed-function lighting rule: when LIGHTING is enabled, use D3DMATERIAL8::Diffuse
+        // whenever vertices lack diffuse color, COLORVERTEX is FALSE, or DIFFUSEMATERIALSOURCE
+        // is D3DMCS_MATERIAL (skinned .W3D infantry meshes write diffuse=0 with D3DMCS_MATERIAL!).
         const bool use_material_color =
             !is_rhw &&
             (m_render_states[D3DRS_LIGHTING] != 0) &&
-            (!has_diffuse || m_render_states[D3DRS_COLORVERTEX] == 0);
+            (!has_diffuse ||
+             m_render_states[D3DRS_COLORVERTEX] == 0 ||
+             m_render_states[D3DRS_DIFFUSEMATERIALSOURCE] == D3DMCS_MATERIAL);
 
         const DWORD tci0 = m_tss[0][D3DTSS_TEXCOORDINDEX];
         const DWORD tci0_mode = tci0 & 0xFFFF0000u;
@@ -2327,7 +2338,7 @@ private:
         const uint32_t gfx_packed = zhr_vk_get_graphics_mode();
         const bool remaster_active = (gfx_packed & 0x3u) != 0u;
         const bool can_smooth_mesh =
-            m_mesh_smoothing_enabled &&
+            g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) &&
             remaster_active &&
             !is_rhw &&
             has_normal &&
@@ -2526,7 +2537,8 @@ private:
 
         if (f7_down && !m_f7_was_down)
         {
-            m_mesh_smoothing_enabled = !m_mesh_smoothing_enabled;
+            const bool next = !g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed);
+            g_zhr_mesh_smoothing_enabled.store(next, std::memory_order_relaxed);
             changed = true;
         }
         if (f8_down && !m_f8_was_down)
@@ -2585,6 +2597,11 @@ private:
         {
             zhr_vk_set_graphics_mode(mode, pbr, post_fx);
             zhr_vk_set_remaster_textures(remaster_tex);
+            g_zhr_title_banner_dirty.store(false, std::memory_order_relaxed);
+            UpdateGraphicsTitleBanner(mode, pbr, post_fx, remaster_tex);
+        }
+        else if (g_zhr_title_banner_dirty.exchange(false, std::memory_order_relaxed))
+        {
             UpdateGraphicsTitleBanner(mode, pbr, post_fx, remaster_tex);
         }
     }
@@ -2611,7 +2628,7 @@ private:
             "%s  [Vulkan 1.3 | %s | Mesh:%s | 2xTex:%s | PBR:%s | PostFX:%s | F7-F11]",
             m_base_window_title,
             mode_label,
-            (m_mesh_smoothing_enabled && mode != 0u) ? "ON" : "OFF",
+            (g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed) && mode != 0u) ? "ON" : "OFF",
             (remaster_tex && mode != 0u) ? "ON" : "OFF",
             pbr ? "ON" : "OFF",
             post_fx ? "ON" : "OFF");
@@ -2621,7 +2638,6 @@ private:
     std::atomic<ULONG> m_ref_count{1};
     IDirect3D8* m_parent_d3d;
     HWND m_hwnd;
-    bool m_mesh_smoothing_enabled{true};
     bool m_f7_was_down{false};
     bool m_f8_was_down{false};
     bool m_f9_was_down{false};
@@ -3072,4 +3088,20 @@ private:
 IDirect3D8* ZhrCreateVulkanD3D8()
 {
     return new ZhrVkD3D8();
+}
+
+extern "C" void zhr_vk_set_mesh_smoothing(bool enabled)
+{
+    g_zhr_mesh_smoothing_enabled.store(enabled, std::memory_order_relaxed);
+    g_zhr_title_banner_dirty.store(true, std::memory_order_relaxed);
+}
+
+extern "C" bool zhr_vk_get_mesh_smoothing(void)
+{
+    return g_zhr_mesh_smoothing_enabled.load(std::memory_order_relaxed);
+}
+
+extern "C" void zhr_vk_mark_title_banner_dirty(void)
+{
+    g_zhr_title_banner_dirty.store(true, std::memory_order_relaxed);
 }

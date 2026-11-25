@@ -53,6 +53,7 @@
 #include "GameClient/GadgetListBox.h"
 #include "W3DDevice/GameClient/W3DGadget.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 // DEFINES ////////////////////////////////////////////////////////////////////
 
@@ -257,8 +258,19 @@ static void drawListBoxText( GameWindow *window, WinInstanceData *instData,
 		// this item is selected, draw the selection color or image
 		if( selected )
 		{
-
-			if( useImages )
+			if (ZhrMenuStyle::shouldStyleShellGadget(window))
+			{
+				start.x = x;
+				start.y = drawY;
+				end.x = start.x + width;
+				end.y = start.y + listLineHeight;
+				if( end.y > clipRegion.hi.y )
+					end.y = clipRegion.hi.y;
+				if( start.y < clipRegion.lo.y )
+					start.y = clipRegion.lo.y;
+				ZhrMenuStyle::drawTacticalListSelectionBar(start.x + 2, start.y, end.x - 2, end.y);
+			}
+			else if( useImages )
 			{
 				const Image *left, *right, *center, *smallCenter;
 
@@ -553,6 +565,19 @@ void W3DGadgetListBoxDraw( GameWindow *window, WinInstanceData *instData )
 
 	}
 
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalListBoxFrame(x, y, width, height, BitIsSet(instData->getState(), WIN_STATE_HILITED));
+		if( list->slider && !list->slider->winIsHidden() )
+		{
+			ICoord2D sliderSize;
+			list->slider->winGetSize( &sliderSize.x, &sliderSize.y );
+			width -= (sliderSize.x + 3);
+		}
+		drawListBoxText( window, instData, x, y + 4, width, height - 4, FALSE );
+		return;
+	}
+
 	// draw the back border
 	if( border != WIN_COLOR_UNDEFINED )
 		TheWindowManager->winOpenRect( border, WIN_DRAW_LINE_WIDTH,
@@ -609,6 +634,13 @@ void W3DGadgetListBoxImageDraw( GameWindow *window, WinInstanceData *instData )
 		list->slider->winGetSize( &sliderSize.x, &sliderSize.y );
 		width -= sliderSize.x;
 
+	}
+
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalListBoxFrame(x, y, width, height, BitIsSet(instData->getState(), WIN_STATE_HILITED));
+		drawListBoxText( window, instData, x, y + 4, width, height - 4, FALSE );
+		return;
 	}
 
 	// get the image

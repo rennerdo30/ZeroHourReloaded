@@ -52,6 +52,7 @@
 #include "GameClient/GameWindowManager.h"
 #include "W3DDevice/GameClient/W3DGadget.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 // DEFINES ////////////////////////////////////////////////////////////////////
 
@@ -125,6 +126,12 @@ static void drawCheckBoxText( GameWindow *window, WinInstanceData *instData )
 //=============================================================================
 void W3DGadgetCheckBoxDraw( GameWindow *window, WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalCheckBox(window, instData);
+		return;
+	}
+
 	Int checkOffsetFromLeft;
 	Color backColor,
 				backBorder,
@@ -250,6 +257,12 @@ void W3DGadgetCheckBoxDraw( GameWindow *window, WinInstanceData *instData )
 //=============================================================================
 void W3DGadgetCheckBoxImageDraw( GameWindow *window, WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalCheckBox(window, instData);
+		return;
+	}
+
 	Int checkOffsetFromLeft;
 	const Image  *boxImage = nullptr;//*backgroundImage = nullptr,
 	ICoord2D origin, start, end, size;

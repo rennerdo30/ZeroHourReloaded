@@ -52,6 +52,7 @@
 #include "GameClient/GadgetSlider.h"
 #include "W3DDevice/GameClient/W3DGadget.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
+#include "W3DDevice/GameClient/ZhrMenuStyle.h"
 
 // DEFINES ////////////////////////////////////////////////////////////////////
 
@@ -74,6 +75,12 @@
 //=============================================================================
 void W3DGadgetHorizontalSliderDraw( GameWindow *window, WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalSlider(window, instData);
+		return;
+	}
+
 	Color backBorder, backColor;
 	ICoord2D origin, size, start, end;
 
@@ -137,6 +144,12 @@ void W3DGadgetHorizontalSliderDraw( GameWindow *window, WinInstanceData *instDat
 void W3DGadgetHorizontalSliderImageDraw( GameWindow *window,
 																				 WinInstanceData *instData )
 {
+	if (ZhrMenuStyle::shouldStyleShellGadget(window))
+	{
+		ZhrMenuStyle::drawTacticalSlider(window, instData);
+		return;
+	}
+
 	const Image *fillSquare, *blankSquare, *highlightSquare;
 	ICoord2D origin, size, start, end, highlightOffset;
 
